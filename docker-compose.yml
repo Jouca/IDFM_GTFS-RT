@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: gtfs_app
+    mem_limit: 12g
+    cpus: 8
+    env_file:
+      - .env
+    ports:
+      - "8507:8507"
+    volumes:
+      - .env:/app/.env
+    networks:
+      - gtfs_net
+
+networks:
+  gtfs_net:
+    driver: bridge
