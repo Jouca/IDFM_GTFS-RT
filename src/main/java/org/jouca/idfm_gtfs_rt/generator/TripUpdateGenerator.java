@@ -1,9 +1,12 @@
 package org.jouca.idfm_gtfs_rt.generator;
 
+import java.sql.SQLException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -12,11 +15,31 @@ import org.jouca.idfm_gtfs_rt.finders.TripFinder;
 import org.springframework.stereotype.Component;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.google.transit.realtime.GtfsRealtime;
 
 @Component
 public class TripUpdateGenerator {
     private static final ZoneId ZONE_ID = ZoneId.of("Europe/Paris");
+    private static final int PROGRESS_BAR_WIDTH = 40;
+
+    // Trip state keyed by stable theoretical tripId to handle changing vehicle identifiers in SIRI Lite
+    public static class TripState {
+        String tripId;
+        String vehicleId; // last observed realtime vehicle identifier
+        long lastUpdate;   // epoch seconds of last update
+
+        TripState(String tripId, String vehicleId, long lastUpdate) {
+            this.tripId = tripId;
+            this.vehicleId = vehicleId;
+            this.lastUpdate = lastUpdate;
+        }
+    }
+
+    public static Map<String, TripState> tripStates = new HashMap<>();
+    // Optional reverse map to quickly know current trip for a vehicle (not strictly required but useful)
+    public static Map<String, String> vehicleToTrip = new HashMap<>();
 
     public void generateGTFSRT() throws Exception {
         // Fetch SiriLite data
@@ -88,34 +111,54 @@ public class TripUpdateGenerator {
 
         System.out.println("Processing " + entities.size() + " entities...");
 
-        List<String> tripIds = new ArrayList<>();
+        HashMap<String, JsonNode> entitiesTrips = new HashMap<>();
     
         int count = 0;
         int total = entities.size();
+        renderProgressBar(0, total);
         for (JsonNode entity : entities) {
-            try {
-                processEntity(entity, feedMessage, 0, tripIds);
-                count++;
-                //System.out.println(count + " / " + total + " entities processed.");
-            } catch (Exception e) {
-                // Log or handle the exception if needed
-                System.err.println("Error processing entity: " + e.getMessage());
+            processEntity(entity, feedMessage, 0, entitiesTrips);
+            count++;
+            //System.out.println(count + " / " + total + " entities processed.");
+            renderProgressBar(count, total);
+        }
+
+        // Clear tripStates where timestamp is older than 15 minutes
+        long currentTime = Instant.now().atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
+        tripStates.entrySet().removeIf(entry -> currentTime - entry.getValue().lastUpdate > 15 * 60);
+        
+        // Clean vehicleToTrip entries referencing removed trip states
+        vehicleToTrip.entrySet().removeIf(e -> !tripStates.containsKey(e.getValue()));
+
+        System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
+
+        // Export entitiesTrips to a JSON file
+        try {
+            ObjectMapper objectMapper = new ObjectMapper();
+            JsonNodeFactory nodeFactory = JsonNodeFactory.instance;
+            com.fasterxml.jackson.databind.node.ObjectNode entitiesTripsJson = nodeFactory.objectNode();
+            for (String tripId : entitiesTrips.keySet()) {
+                entitiesTripsJson.set(tripId, entitiesTrips.get(tripId));
             }
+            objectMapper.writerWithDefaultPrettyPrinter().writeValue(new java.io.File("entities_trips.json"), entitiesTripsJson);
+            System.out.println("Entities trips written to entities_trips.json");
+        } catch (Exception e) {
+            System.err.println("Error writing entities trips to JSON: " + e.getMessage());
         }
     }
 
-    private void processEntity(JsonNode entity, GtfsRealtime.FeedMessage.Builder feedMessage, int index, List<String> tripIds) throws Exception {
+    private void processEntity(JsonNode entity, GtfsRealtime.FeedMessage.Builder feedMessage, int index, HashMap<String, JsonNode> entitiesTrips) {
         String lineId = "IDFM:" + entity.get("LineRef").get("value").asText().split(":")[3];
+    String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
+
         String destinationIdCode = entity.get("DestinationRef").get("value").asText().split(":")[3];
         String destinationId = TripFinder.resolveStopId(destinationIdCode);
 
         // If not found, try to find it from the stop_extensions table
         if (destinationId == null) return;
 
-        String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
-
-        int direction = determineDirection(entity);
-        if (direction == -1) return;
+        //int direction = determineDirection(entity);
+        //if (direction == -1) return;
 
         List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
 
@@ -137,43 +180,94 @@ public class TripUpdateGenerator {
             }
         }
 
-        if (lineId == null || lineId.isEmpty() || estimatedCallList.isEmpty() || direction == -1) {
+        if (lineId == null || lineId.isEmpty() || estimatedCallList.isEmpty()) {
             return;
         }
 
         // Use the new trip finder method
         boolean isArrivalTime = !estimatedCallList.isEmpty() && estimatedCalls.get(0).has("ExpectedArrivalTime");
-        String tripId = TripFinder.findTripIdFromEstimatedCalls(lineId, String.valueOf(direction), estimatedCallList, isArrivalTime, tripIds);
 
-        //if (lineId.equals("IDFM:C01063")) System.out.println("Processing entity with lineId: " + lineId + ", direction: " + direction + ", estimatedCalls: " + estimatedCallList + ", tripId: " + tripId);
-
-        if (tripId == null) {
-            return; // Skip this entity if no trip ID is found
+        // Get journey note
+        String journeyNote = null;
+        if (entity.has("JourneyNote") && entity.get("JourneyNote").size() > 0) {
+            journeyNote = entity.get("JourneyNote").get(0).get("value").asText();
         }
 
-        // Add trip ID to the list to avoid duplicates
-        tripIds.add(tripId);
+        // Find the trip ID using the TripFinder utility
+        final String tripId;
+        String tmpTripId = null;
+        try {
+            tmpTripId = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, destinationId, journeyNote);
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        tripId = tmpTripId;
 
-        GtfsRealtime.TripUpdate.Builder tripUpdate = feedMessage.addEntityBuilder().setId(vehicleId).getTripUpdateBuilder();
+        if (tripId == null || tripId.isEmpty()) {
+            return; // Cannot proceed without stable trip id
+        }
+
+        long now = Instant.now().atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
+        TripState state = tripStates.get(tripId);
+        if (state == null) {
+            state = new TripState(tripId, vehicleId, now);
+            tripStates.put(tripId, state);
+            vehicleToTrip.put(vehicleId, tripId);
+        } else {
+            // Update state timestamp and vehicle id if changed
+            state.lastUpdate = now;
+            if (!state.vehicleId.equals(vehicleId)) {
+                // Remove old vehicle mapping if still pointing to this trip
+                vehicleToTrip.entrySet().removeIf(e -> e.getValue().equals(tripId));
+                state.vehicleId = vehicleId;
+                vehicleToTrip.put(vehicleId, tripId);
+            }
+        }
+
+        // Either create or update feed entity keyed by tripId (stable, independent of changing vehicle IDs)
+        GtfsRealtime.FeedEntity.Builder entityBuilder = null;
+        int existingIndex = -1;
+        for (int i = 0; i < feedMessage.getEntityCount(); i++) {
+            if (feedMessage.getEntity(i).getId().equals(tripId)) {
+                existingIndex = i;
+                entityBuilder = feedMessage.getEntity(i).toBuilder();
+                break;
+            }
+        }
+        if (entityBuilder == null) {
+            entityBuilder = feedMessage.addEntityBuilder();
+            entityBuilder.setId(tripId);
+        } else {
+            // Clear existing stop time updates to rebuild them fresh
+            if (entityBuilder.hasTripUpdate()) {
+                entityBuilder.getTripUpdateBuilder().clearStopTimeUpdate();
+            }
+        }
+
+        GtfsRealtime.TripUpdate.Builder tripUpdate = entityBuilder.getTripUpdateBuilder();
         tripUpdate.getTripBuilder()
                 .setRouteId(lineId)
-                .setDirectionId(direction)
+                .setDirectionId(Integer.parseInt(TripFinder.getTripDirection(tripId)))
                 .setTripId(tripId);
-        tripUpdate.getVehicleBuilder().setId(vehicleId);
+        // Always set latest vehicle id observed
+        tripUpdate.getVehicleBuilder().setId(state.vehicleId);
 
         List<String> stopTimeUpdates = new ArrayList<>();
 
-        // Get status from the first estimated call
-        JsonNode entityEstimatedCalls = estimatedCalls.get(index);
-        String departureStatus = entityEstimatedCalls.has("DepartureStatus") ? entityEstimatedCalls.get("DepartureStatus").asText() : null;
-        String arrivalStatus = entityEstimatedCalls.has("ArrivalStatus") ? entityEstimatedCalls.get("ArrivalStatus").asText() : null;
-
-        // Handle cancellation
-        if (departureStatus != null && departureStatus.contains("CANCELLED")) {
-            tripUpdate.getTripBuilder().setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
-        } else if (arrivalStatus != null && arrivalStatus.contains("CANCELLED")) {
+        // Check if all estimated calls are cancelled
+        // Check if all estimated calls are cancelled (either by DepartureStatus or ArrivalStatus)
+        boolean allCancelled = estimatedCalls.stream().allMatch(call ->
+            (call.has("DepartureStatus") && call.get("DepartureStatus").asText().contains("CANCELLED")) ||
+            (call.has("ArrivalStatus") && call.get("ArrivalStatus").asText().contains("CANCELLED"))
+        );
+        if (allCancelled) {
             tripUpdate.getTripBuilder().setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
         } else {
+            // Ensure we are not carrying over a previous CANCELED relationship if situation recovered
+            if (tripUpdate.getTripBuilder().getScheduleRelationship() == GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED) {
+                // No direct clear method may exist; recreate trip descriptor fields except schedule relationship
+                // (If clearScheduleRelationship exists, we could call it. Keep safe by re-setting fields below.)
+            }
             for (JsonNode estimatedCall : estimatedCalls) {
                 processEstimatedCall(estimatedCall, tripUpdate, tripId, stopTimeUpdates);
                 verifyStopUpdatesIntegrity(tripUpdate);
@@ -249,17 +343,25 @@ public class TripUpdateGenerator {
             }
 
             int stopSeq = Integer.parseInt(stopSequenceCollected);
-            long offset = offsets.getOrDefault(stopSeq, 0L);
+            Long offset = offsets.get(stopSeq);
 
             GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stopTimeUpdate = tripUpdate.addStopTimeUpdateBuilder();
             stopTimeUpdate.setStopSequence(stopSeq);
             stopTimeUpdate.setStopId(stopIdCollected);
+
+            // Only apply offset if it was calculated for this stop
             if (arrivalTimeCollected != null) {
-                long arrivalTime = serviceDayEpoch + (Long.parseLong(arrivalTimeCollected) % 86400) + offset;
+                long arrivalTime = serviceDayEpoch + (Long.parseLong(arrivalTimeCollected) % 86400);
+                if (offset != null && offset != 0L) {
+                    arrivalTime += offset;
+                }
                 stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
             }
             if (departureTimeCollected != null) {
-                long departureTime = serviceDayEpoch + (Long.parseLong(departureTimeCollected) % 86400) + offset;
+                long departureTime = serviceDayEpoch + (Long.parseLong(departureTimeCollected) % 86400);
+                if (offset != null && offset != 0L) {
+                    departureTime += offset;
+                }
                 stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
             }
         }
@@ -289,12 +391,28 @@ public class TripUpdateGenerator {
                 }
                 lastTime = dep;
             }
+
+            // Check if it's a skipped stop
+            if (update.getScheduleRelationship() == GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED) {
+                // If the stop is skipped, we should not set arrival or departure times
+                builder.clearArrival();
+                builder.clearDeparture();
+            }
+            
             correctedUpdates.add(builder.build());
         }
 
         // Clear and rebuild the StopTimeUpdate list in the correct order
         tripUpdate.clearStopTimeUpdate();
         correctedUpdates.forEach(tripUpdate::addStopTimeUpdate);
+
+        // Add/Update the trip to entitiesTrips (store last processed realtime entity snapshot)
+        entitiesTrips.put(tripId, entity);
+
+        // If we updated an existing entity, replace it in feedMessage
+        if (existingIndex >= 0) {
+            feedMessage.setEntity(existingIndex, entityBuilder.build());
+        }
     }
 
     boolean checkStopIntegrity(JsonNode entity) {
@@ -307,38 +425,7 @@ public class TripUpdateGenerator {
         return false; // Default to false if the check fails
     }
 
-    private int determineDirection(JsonNode entity) {
-        if (entity.has("DirectionRef") && entity.get("DirectionRef").has("value")) {
-            String directionValue = entity.get("DirectionRef").get("value").asText();
-            if (directionValue.contains(":")) {
-                String[] directionParts = directionValue.split(":");
-                if (directionParts.length > 3) {
-                    String directionString = directionParts[3];
-                    if ("A".equals(directionString)) {
-                        return 1;
-                    } else if ("R".equals(directionString)) {
-                        return 0;
-                    }
-                }
-            } else {
-                if ("Aller".equals(directionValue) || "inbound".equals(directionValue) || "A".equals(directionValue)) {
-                    return 1;
-                } else if ("Retour".equals(directionValue) || "outbound".equals(directionValue) || "R".equals(directionValue)) {
-                    return 0;
-                }
-            }
-        } 
-        
-        if (entity.has("DirectionName") && entity.get("DirectionName").size() > 0) {
-            String directionName = entity.get("DirectionName").get(0).get("value").asText();
-            if (directionName.equals("Aller") || directionName.equals("A") || directionName.equals("inbound")) {
-                return 1;
-            } else if (directionName.equals("Retour") || directionName.equals("R") || directionName.equals("outbound")) {
-                return 0;
-            }
-        }
-        return -1; // Invalid direction
-    }
+    // Removed unused determineDirection method; direction retrieved from TripFinder.getTripDirection(tripId)
 
     private long parseTime(String timeStr) {
         java.time.Instant instant = java.time.Instant.parse(timeStr);
@@ -358,7 +445,7 @@ public class TripUpdateGenerator {
                 .collect(Collectors.toList());
     }
 
-    private void processEstimatedCall(JsonNode estimatedCall, GtfsRealtime.TripUpdate.Builder tripUpdate, String tripId, List<String> stopTimeUpdates) throws Exception {
+    private void processEstimatedCall(JsonNode estimatedCall, GtfsRealtime.TripUpdate.Builder tripUpdate, String tripId, List<String> stopTimeUpdates) {
         // Check if times are after or equal to the current time
         if (estimatedCall.has("ExpectedArrivalTime")) {
             long arrivalTime = parseTime(estimatedCall.get("ExpectedArrivalTime").asText());
@@ -389,6 +476,29 @@ public class TripUpdateGenerator {
         if (estimatedCall.has("ExpectedDepartureTime")) {
             long departureTime = parseTime(estimatedCall.get("ExpectedDepartureTime").asText());
             stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
+        }
+
+        // Check if skipped
+        if (estimatedCall.has("DepartureStatus") && estimatedCall.get("DepartureStatus").asText().contains("CANCELLED")) {
+            stopTimeUpdate.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
+
+            // Clear the arrival time if the departure is cancelled
+            if (stopTimeUpdate.hasArrival()) {
+                stopTimeUpdate.clearArrival();
+            }
+            if (stopTimeUpdate.hasDeparture()) {
+                stopTimeUpdate.clearDeparture();
+            }
+        } else if (estimatedCall.has("ArrivalStatus") && estimatedCall.get("ArrivalStatus").asText().contains("CANCELLED")) {
+            stopTimeUpdate.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
+
+            // Clear the departure time if the arrival is cancelled
+            if (stopTimeUpdate.hasDeparture()) {
+                stopTimeUpdate.clearDeparture();
+            }
+            if (stopTimeUpdate.hasArrival()) {
+                stopTimeUpdate.clearArrival();
+            }
         }
     
         // Reorder StopTimeUpdates by stop_sequence
@@ -430,6 +540,30 @@ public class TripUpdateGenerator {
         // Clear and replace the StopTimeUpdate list with valid updates
         tripUpdate.clearStopTimeUpdate();
         validUpdates.forEach(tripUpdate::addStopTimeUpdate);
+    }
+
+    private void renderProgressBar(int current, int total) {
+        if (total <= 0) {
+            return;
+        }
+
+        int safeCurrent = Math.min(Math.max(current, 0), total);
+        double progress = (double) safeCurrent / total;
+        int filledLength = (int) Math.round(progress * PROGRESS_BAR_WIDTH);
+        if (filledLength > PROGRESS_BAR_WIDTH) {
+            filledLength = PROGRESS_BAR_WIDTH;
+        }
+
+        String filled = "=".repeat(filledLength);
+        String empty = " ".repeat(PROGRESS_BAR_WIDTH - filledLength);
+        int percentage = (int) Math.round(progress * 100);
+
+        System.out.printf("\rProcessing entities: [%s%s] %3d%% (%d/%d)", filled, empty, percentage, safeCurrent, total);
+        System.out.flush();
+
+        if (safeCurrent >= total) {
+            System.out.println();
+        }
     }
 
     private void writeFeedToFile(GtfsRealtime.FeedMessage.Builder feedMessage, String filePath) {

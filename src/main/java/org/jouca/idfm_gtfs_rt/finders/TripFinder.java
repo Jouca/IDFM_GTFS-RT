@@ -36,15 +36,17 @@ public class TripFinder {
      * Recherche le trip_id correspondant à une séquence d'EstimatedCall, en essayant de matcher les horaires et arrêts sur le plus proche possible.
      * Cette version cherche le trip_id dont les horaires théoriques sont les plus proches des horaires temps réel (EstimatedCall).
      * On considère le trip avec la somme des différences horaires la plus faible.
+     * Ajout d'une fenêtre de recherche progressive sur les horaires (de -1/+1 à -5/+30 minutes).
+     * Retourne le trip_id le plus proche, ou null si aucun ne correspond.
      */
     public static String findTripIdFromEstimatedCalls(
         String routeId,
-        String directionId,
         List<EstimatedCall> estimatedCalls,
         boolean isArrivalTime,
-        List<String> tripIds
+        String destinationId,
+        String journeyNote
     ) throws SQLException {
-        if (routeId == null || directionId == null || estimatedCalls == null || estimatedCalls.isEmpty()) {
+        if (routeId == null || estimatedCalls == null || estimatedCalls.isEmpty()) {
             throw new IllegalArgumentException("Inputs cannot be null or empty.");
         }
 
@@ -74,13 +76,13 @@ public class TripFinder {
                 SELECT service_id FROM calendar
                 WHERE start_date <= ? AND end_date >= ?
                 AND (
-                (monday = 1 AND ? = '1') OR
-                (tuesday = 1 AND ? = '2') OR
-                (wednesday = 1 AND ? = '3') OR
-                (thursday = 1 AND ? = '4') OR
-                (friday = 1 AND ? = '5') OR
-                (saturday = 1 AND ? = '6') OR
-                (sunday = 1 AND ? = '0')
+                    (monday = 1 AND ? = '1') OR
+                    (tuesday = 1 AND ? = '2') OR
+                    (wednesday = 1 AND ? = '3') OR
+                    (thursday = 1 AND ? = '4') OR
+                    (friday = 1 AND ? = '5') OR
+                    (saturday = 1 AND ? = '6') OR
+                    (sunday = 1 AND ? = '0')
                 )
                 UNION
                 SELECT service_id FROM calendar_dates
@@ -93,16 +95,47 @@ public class TripFinder {
             SELECT st.trip_id, st.stop_id, st.stop_sequence, st.%s %% 86400 as stop_time
             FROM stop_times st
             JOIN trips t ON st.trip_id = t.trip_id
-            WHERE t.route_id = ? AND t.direction_id = ?
+            WHERE t.route_id = ?
             AND t.service_id IN (SELECT service_id FROM valid_services)
             AND t.service_id NOT IN (SELECT service_id FROM excluded_services)
-            AND t.trip_id NOT IN (%s)
-        """.formatted(timeColumn, tripIds.stream().map(id -> "?").collect(Collectors.joining(","))));
+        """.formatted(timeColumn));
 
-        // On ne filtre pas sur les horaires exacts ici, on récupère tous les horaires pour les stops concernés
         query.append("AND st.stop_id IN (")
              .append(allStopIds.stream().map(x -> "?").collect(Collectors.joining(",")))
              .append(")\n");
+
+        // Add destination constraint: last stop_id must match destinationId and be the last stop_sequence for the trip
+        query.append("""
+            AND (
+                st.trip_id NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM stop_times st2
+                    WHERE st2.trip_id = st.trip_id
+                    AND st2.stop_id = ?
+                    AND st2.stop_sequence = (
+                        SELECT MAX(st3.stop_sequence)
+                        FROM stop_times st3
+                        WHERE st3.trip_id = st.trip_id
+                    )
+                )
+            )
+        """);
+
+        if (journeyNote != null && journeyNote.length() == 4) {
+            query.append("AND t.trip_headsign = ?\n");
+        }
+
+        // Fenêtres de recherche en minutes (min, max)
+        int[][] windows = {
+            {-1, 1},
+            {-2, 2},
+            {-3, 5},
+            {-3, 10},
+            {-3, 20},
+            {-3, 30}
+        };
+
+        Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
 
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query.toString())) {
@@ -114,17 +147,17 @@ public class TripFinder {
             stmt.setString(i++, yyyymmdd);
             stmt.setString(i++, yyyymmdd);
             stmt.setString(i++, routeId);
-            stmt.setString(i++, directionId);
 
-            for (String tripId : tripIds) {
-                stmt.setString(i++, tripId);
-            }
             for (String stopId : allStopIds) {
                 stmt.setString(i++, stopId);
             }
+            // Set destinationId for the EXISTS clause
+            stmt.setString(i++, destinationId);
 
-            // Map<trip_id, Map<stop_id, List<theoretical_times>>>
-            Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
+            // Set trip headsign for the filter
+            if (journeyNote != null && journeyNote.length() == 4) {
+                stmt.setString(i++, journeyNote);
+            }
 
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
@@ -138,10 +171,15 @@ public class TripFinder {
                         .add(stopTime);
                 }
             }
+        }
 
-            String bestTripId = null;
-            long minTotalDiff = Long.MAX_VALUE;
+        List<TripMatch> allMatches = new ArrayList<>();
 
+        for (int[] window : windows) {
+            int minWindow = window[0] * 60;
+            int maxWindow = window[1] * 60;
+
+            // Pour chaque trip, calculer la somme des différences horaires
             for (Map.Entry<String, Map<String, List<Integer>>> entry : tripStopTimes.entrySet()) {
                 String tripId = entry.getKey();
                 Map<String, List<Integer>> tripStops = entry.getValue();
@@ -153,32 +191,68 @@ public class TripFinder {
                     String stopId = ec.stopId();
                     Instant inst = Instant.parse(ec.isoTime());
                     int realTime = (int) (inst.atZone(zone).toEpochSecond() - date.atStartOfDay(zone).toEpochSecond());
+                    realTime = ((realTime % 86400) + 86400) % 86400; // Normalize to 0-86399
 
                     List<Integer> theoreticalTimes = tripStops.get(stopId);
                     if (theoreticalTimes == null || theoreticalTimes.isEmpty()) {
                         allStopsMatched = false;
                         break;
                     }
-                    // Find the closest theoretical time for this stop
+                    // Find the closest theoretical time for this stop within the window
+                    Integer bestTheo = null;
                     int minDiff = Integer.MAX_VALUE;
                     for (Integer theoTime : theoreticalTimes) {
-                        int diff = Math.abs(theoTime - realTime);
-                        if (diff < minDiff) minDiff = diff;
+                        int normalizedTheoTime = ((theoTime % 86400) + 86400) % 86400; // Normalize to 0-86399
+                        int diff = normalizedTheoTime - realTime;
+
+                        // Handle wrap-around at midnight (difference should be in [-43200, 43200])
+                        if (diff > 43200) diff -= 86400;
+                        if (diff < -43200) diff += 86400;
+
+                        if (diff >= minWindow && diff <= maxWindow) {
+                            int absDiff = Math.abs(diff);
+                            if (absDiff < minDiff) {
+                                minDiff = absDiff;
+                                bestTheo = normalizedTheoTime;
+                            }
+                        }
+                    }
+                    if (bestTheo == null) {
+                        allStopsMatched = false;
+                        break;
                     }
                     totalDiff += minDiff;
                 }
 
-                if (allStopsMatched && totalDiff < minTotalDiff) {
-                    minTotalDiff = totalDiff;
-                    bestTripId = tripId;
+                if (allStopsMatched) {
+                    allMatches.add(new TripMatch(tripId, totalDiff));
                 }
             }
+        }
 
-            return bestTripId;
+        // Trier tous les matches trouvés par totalDiff croissant
+        allMatches.sort((a, b) -> Long.compare(a.totalDiff, b.totalDiff));
+
+        if (!allMatches.isEmpty()) {
+            // Retourner le trip_id avec la plus petite différence totale
+            return allMatches.get(0).tripId;
+        }
+
+        // Si aucun trip trouvé dans les fenêtres, retourner null
+        return null;
+    }
+
+    // Classe utilitaire pour trier les matches
+    private static class TripMatch {
+        String tripId;
+        long totalDiff;
+        TripMatch(String tripId, long totalDiff) {
+            this.tripId = tripId;
+            this.totalDiff = totalDiff;
         }
     }
 
-    public static List<String> getAllStopTimesFromTrip(String tripId) throws SQLException {
+    public static List<String> getAllStopTimesFromTrip(String tripId) {
         String query = "SELECT stop_id, arrival_timestamp, departure_timestamp, stop_sequence FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence;";
         List<String> results = new ArrayList<>();
 
@@ -204,7 +278,7 @@ public class TripFinder {
         return results;
     }
 
-    public static String findStopSequence(String tripId, String stopId, List<String> stopUpdates) throws Exception {
+    public static String findStopSequence(String tripId, String stopId, List<String> stopUpdates) {
         String query = """
             SELECT st.stop_sequence
             FROM stop_times st
@@ -240,6 +314,8 @@ public class TripFinder {
                     return rs.getString("stop_sequence");
                 }
             }
+        } catch (SQLException e) {
+            e.printStackTrace();
         }
         return null;
     }
@@ -303,11 +379,11 @@ public class TripFinder {
     }
 
     public static String findStopIdFromStopExtension(String stopExtension) {
-        String query = "SELECT object_id FROM stop_extensions WHERE object_code = ? LIMIT 1;";
+        String query = "SELECT object_id FROM stop_extensions WHERE object_code LIKE ? AND object_system LIKE 'netex_zder_quay' LIMIT 1;";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
 
-            stmt.setString(1, stopExtension);
+            stmt.setString(1, "%" + stopExtension);
 
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
@@ -372,6 +448,24 @@ public class TripFinder {
                     return serviceDayEpoch + (Long.parseLong(departureTimeCollected) % 86400);
                 }
             }
+        }
+        return null;
+    }
+
+    public static String getTripDirection(String tripId) {
+        String query = "SELECT direction_id FROM trips WHERE trip_id = ?;";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+
+            stmt.setString(1, tripId);
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("direction_id");
+                }
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
         }
         return null;
     }

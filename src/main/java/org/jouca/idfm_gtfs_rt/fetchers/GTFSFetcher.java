@@ -313,6 +313,91 @@ public class GTFSFetcher {
             throw new IOException("Index process was interrupted", e);
         }
 
+        System.out.println("Creating index idx_stop_times_trip_id_stop_sequence...");
+        String indexCommand11 = "sqlite3 " + outputFilePath + " \"CREATE INDEX idx_stop_times_trip_id_stop_sequence ON stop_times (trip_id, stop_sequence);\"";
+        ProcessBuilder indexProcessBuilder11 = new ProcessBuilder("/bin/sh", "-c", indexCommand11);
+        indexProcessBuilder11.redirectErrorStream(true);
+        Process indexProcess11 = indexProcessBuilder11.start();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(indexProcess11.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+        try {
+            int exitCode = indexProcess11.waitFor();
+            if (exitCode != 0) {
+                throw new IOException("Index command exited with code " + exitCode);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Index process was interrupted", e);
+        }
+
+        // --- Add the suggested indexes below ---
+        System.out.println("Creating index idx_stop_times_stop_id_trip_id_sequence...");
+        String indexCommand12 = "sqlite3 " + outputFilePath + " \"CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id_trip_id_sequence ON stop_times (stop_id, trip_id, stop_sequence);\"";
+        ProcessBuilder indexProcessBuilder12 = new ProcessBuilder("/bin/sh", "-c", indexCommand12);
+        indexProcessBuilder12.redirectErrorStream(true);
+        Process indexProcess12 = indexProcessBuilder12.start();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(indexProcess12.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+        try {
+            int exitCode = indexProcess12.waitFor();
+            if (exitCode != 0) {
+                throw new IOException("Index command exited with code " + exitCode);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Index process was interrupted", e);
+        }
+
+        System.out.println("Creating index idx_stop_times_trip_id_stop_id...");
+        String indexCommand13 = "sqlite3 " + outputFilePath + " \"CREATE INDEX IF NOT EXISTS idx_stop_times_trip_id_stop_id ON stop_times (trip_id, stop_id);\"";
+        ProcessBuilder indexProcessBuilder13 = new ProcessBuilder("/bin/sh", "-c", indexCommand13);
+        indexProcessBuilder13.redirectErrorStream(true);
+        Process indexProcess13 = indexProcessBuilder13.start();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(indexProcess13.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+        try {
+            int exitCode = indexProcess13.waitFor();
+            if (exitCode != 0) {
+                throw new IOException("Index command exited with code " + exitCode);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Index process was interrupted", e);
+        }
+
+        System.out.println("Creating index idx_stop_times_trip_id...");
+        String indexCommand14 = "sqlite3 " + outputFilePath + " \"CREATE INDEX IF NOT EXISTS idx_stop_times_trip_id ON stop_times (trip_id);\"";
+        ProcessBuilder indexProcessBuilder14 = new ProcessBuilder("/bin/sh", "-c", indexCommand14);
+        indexProcessBuilder14.redirectErrorStream(true);
+        Process indexProcess14 = indexProcessBuilder14.start();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(indexProcess14.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+        try {
+            int exitCode = indexProcess14.waitFor();
+            if (exitCode != 0) {
+                throw new IOException("Index command exited with code " + exitCode);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Index process was interrupted", e);
+        }
+
         System.out.println("GTFS data downloaded successfully to: " + outputFilePath);
     }
 }

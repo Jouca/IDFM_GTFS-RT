@@ -3,14 +3,22 @@ FROM openjdk:21-jdk-slim
 # Set the working directory
 WORKDIR /app
 
-# Install dependencies
+# Install system dependencies (maven, curl, bash, sqlite3, gnupg)
 RUN apt-get update && apt-get install -y \
     maven \
     curl \
     bash \
     sqlite3 \
-    npm \
+    gnupg \
     && apt-get clean
+
+# Install Node.js 22 + npm depuis NodeSource
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g npm@latest
+
+# Vérification des versions
+RUN java -version && node -v && npm -v
 
 # Install gtfs-import globally using npm
 RUN npm install -g gtfs

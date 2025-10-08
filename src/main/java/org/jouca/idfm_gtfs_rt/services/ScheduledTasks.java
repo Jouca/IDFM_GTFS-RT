@@ -99,7 +99,7 @@ public class ScheduledTasks {
         }
     }
 
-    @Scheduled(cron = "0 0 0 * * ?") // Every day at midnight
+    /*@Scheduled(cron = "0 0 0 * * ?") // Every day at midnight
     public void updateGTFSData() {
         System.out.println("Updating GTFS data...");
         try {
@@ -110,5 +110,5 @@ public class ScheduledTasks {
             System.err.println("Failed to update GTFS data:");
             e.printStackTrace();
         }
-    }
+    }*/
 }
