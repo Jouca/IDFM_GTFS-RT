@@ -13,6 +13,7 @@ import java.util.stream.Collectors;
 import org.jouca.idfm_gtfs_rt.fetchers.SiriLiteFetcher;
 import org.jouca.idfm_gtfs_rt.finders.TripFinder;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Value;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -23,6 +24,10 @@ import com.google.transit.realtime.GtfsRealtime;
 public class TripUpdateGenerator {
     private static final ZoneId ZONE_ID = ZoneId.of("Europe/Paris");
     private static final int PROGRESS_BAR_WIDTH = 40;
+
+    // Configurable window (in minutes) around now in which we add theoretical trips as canceled
+    @Value("${gtfsrt.cancellation.window.minutes:120}")
+    private int cancellationWindowMinutes;
 
     // Trip state keyed by stable theoretical tripId to handle changing vehicle identifiers in SIRI Lite
     public static class TripState {
@@ -111,7 +116,7 @@ public class TripUpdateGenerator {
 
         System.out.println("Processing " + entities.size() + " entities...");
 
-        HashMap<String, JsonNode> entitiesTrips = new HashMap<>();
+    HashMap<String, JsonNode> entitiesTrips = new HashMap<>();
     
         int count = 0;
         int total = entities.size();
@@ -129,6 +134,69 @@ public class TripUpdateGenerator {
         
         // Clean vehicleToTrip entries referencing removed trip states
         vehicleToTrip.entrySet().removeIf(e -> !tripStates.containsKey(e.getValue()));
+
+        // After processing realtime, add canceled TripUpdates for theoretical trips not selected,
+        // BUT only if at least one later realtime trip exists on the same route/direction
+        try {
+            // Determine all routeIds present in this SIRI batch to limit scope
+            List<String> routeIdsInBatch = entities.stream().map(e -> "IDFM:" + e.get("LineRef").get("value").asText().split(":")[3])
+                    .distinct().collect(Collectors.toList());
+
+            List<TripFinder.TripMeta> todaysTrips = TripFinder.getActiveTripsForRoutesToday(routeIdsInBatch);
+
+            // Build a set of tripIds already present in the feed
+            java.util.Set<String> presentInFeed = new java.util.HashSet<>();
+            // And compute the latest realtime firstTime per (routeId, directionId)
+            java.util.Map<String, Integer> latestRealtimeFirstByRouteDir = new java.util.HashMap<>();
+            long serviceDayEpoch = Instant.now().atZone(ZONE_ID).toLocalDate().atStartOfDay(ZONE_ID).toEpochSecond();
+            for (int i = 0; i < feedMessage.getEntityCount(); i++) {
+                GtfsRealtime.FeedEntity ent = feedMessage.getEntity(i);
+                presentInFeed.add(ent.getId());
+                if (ent.hasTripUpdate() && ent.getTripUpdate().hasTrip() && ent.getTripUpdate().getTrip().hasTripId()) {
+                    String tId = ent.getTripUpdate().getTrip().getTripId();
+                    TripFinder.TripMeta meta = TripFinder.getTripMeta(tId);
+                    if (meta != null) {
+                        String key = meta.routeId + "|" + meta.directionId;
+                        latestRealtimeFirstByRouteDir.merge(key, meta.firstTimeSecOfDay, Integer::max);
+                    }
+                }
+            }
+
+            // Time window filter: only add cancellations for trips within +/- 2 hours of now
+            long now = Instant.now().atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
+            long minTime = now - cancellationWindowMinutes * 60L;
+            long maxTime = now + cancellationWindowMinutes * 60L;
+
+            int addedCanceled = 0;
+            for (TripFinder.TripMeta meta : todaysTrips) {
+                if (presentInFeed.contains(meta.tripId)) continue; // already represented by realtime
+
+                long firstTimeEpoch = serviceDayEpoch + meta.firstTimeSecOfDay;
+                if (firstTimeEpoch < minTime || firstTimeEpoch > maxTime) continue; // outside window
+
+                // Require existence of a later realtime trip for same (route, direction)
+                String key = meta.routeId + "|" + meta.directionId;
+                Integer latestRT = latestRealtimeFirstByRouteDir.get(key);
+                if (latestRT == null) continue; // no realtime on this group; don't cancel
+                if (latestRT <= meta.firstTimeSecOfDay) continue; // no later realtime; don't cancel
+
+                // Append a canceled entity for this theoretical trip
+                GtfsRealtime.FeedEntity.Builder canceledEntity = feedMessage.addEntityBuilder();
+                canceledEntity.setId(meta.tripId);
+                GtfsRealtime.TripUpdate.Builder tu = canceledEntity.getTripUpdateBuilder();
+                tu.getTripBuilder()
+                    .setTripId(meta.tripId)
+                    .setRouteId(meta.routeId)
+                    .setDirectionId(meta.directionId)
+                    .setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
+                addedCanceled++;
+            }
+            if (addedCanceled > 0) {
+                System.out.println("Added " + addedCanceled + " canceled theoretical trips not present in realtime.");
+            }
+        } catch (Exception ex) {
+            System.err.println("Error while appending canceled trips: " + ex.getMessage());
+        }
 
         System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
 
@@ -277,43 +345,8 @@ public class TripUpdateGenerator {
         // Fill all others stop_time_updates from the trip (count also the realtime delay during the trip)
         List<String> stopTimes = TripFinder.getAllStopTimesFromTrip(tripId);
 
-        // Map : stop_sequence -> offset à appliquer (en secondes)
-        java.util.Map<Integer, Long> offsets = new java.util.HashMap<>();
-        long lastOffset = 0;
-        int lastSequence = -1;
-
-        // Construction de la map des offsets à partir des EstimatedCalls temps réel
-        for (JsonNode estimatedCall : estimatedCalls) {
-            String stopId = TripFinder.resolveStopId(estimatedCall.get("StopPointRef").get("value").asText().split(":")[3]);
-            if (stopId == null) continue;
-            String stopSequenceStr = TripFinder.findStopSequence(tripId, stopId, new ArrayList<>());
-            if (stopSequenceStr == null) continue;
-            int stopSequence = Integer.parseInt(stopSequenceStr);
-
-            Long scheduledTime = null;
-            Long realTime = null;
-            if (estimatedCall.has("ExpectedArrivalTime")) {
-                scheduledTime = TripFinder.getScheduledArrivalTime(stopTimes, stopId, stopSequenceStr, ZONE_ID);
-                realTime = parseTime(estimatedCall.get("ExpectedArrivalTime").asText());
-            } else if (estimatedCall.has("ExpectedDepartureTime")) {
-                scheduledTime = TripFinder.getScheduledDepartureTime(stopTimes, stopId, stopSequenceStr, ZONE_ID);
-                realTime = parseTime(estimatedCall.get("ExpectedDepartureTime").asText());
-            }
-            if (scheduledTime != null && realTime != null) {
-                long offset = realTime - scheduledTime;
-                // Appliquer l'offset à tous les arrêts jusqu'à ce point (y compris les précédents)
-                for (int seq = lastSequence + 1; seq <= stopSequence; seq++) {
-                    offsets.put(seq, offset);
-                }
-                lastOffset = offset;
-                lastSequence = stopSequence;
-            }
-        }
-        // Appliquer le dernier offset à tous les arrêts suivants
-        int maxSeq = stopTimes.size();
-        for (int seq = lastSequence + 1; seq <= maxSeq; seq++) {
-            offsets.put(seq, lastOffset);
-        }
+        // Map : stop_sequence -> offset (carry-forward du dernier retard/avance réel)
+        java.util.Map<Integer, Long> offsets = computeCarryForwardOffsets(estimatedCalls, stopTimes, tripId);
 
         // 2. Générer les StopTimeUpdate en appliquant l'offset correct
         for (String stopTime : stopTimes) {
@@ -367,26 +400,61 @@ public class TripUpdateGenerator {
         }
 
         // 3. Vérifier et corriger l'ordre des horaires pour éviter les NEGATIVE_HOP_TIME/DWELL_TIME
+        //    et garantir que les heures synthétiques respectent (horaire théorique + offset appliqué)
+        //    afin d'éviter des plateaux.
+        //    On construit donc un "plancher" (baseline) par stop_sequence.
+        java.util.Map<Integer, Long> baselineArrival = new java.util.HashMap<>();
+        java.util.Map<Integer, Long> baselineDeparture = new java.util.HashMap<>();
+        long serviceDayEpochForBaseline = Instant.now().atZone(ZONE_ID)
+                .toLocalDateTime()
+                .toLocalDate()
+                .atStartOfDay(ZONE_ID)
+                .toEpochSecond();
+        for (String st : stopTimes) {
+            String[] parts = st.split(",");
+            int seq = Integer.parseInt(parts[3]);
+            Long off = offsets.get(seq);
+            if (off == null) off = 0L;
+            if (parts[1] != null && !parts[1].isEmpty()) {
+                long baseArr = serviceDayEpochForBaseline + (Long.parseLong(parts[1]) % 86400) + off;
+                baselineArrival.put(seq, baseArr);
+            }
+            if (parts[2] != null && !parts[2].isEmpty()) {
+                long baseDep = serviceDayEpochForBaseline + (Long.parseLong(parts[2]) % 86400) + off;
+                baselineDeparture.put(seq, baseDep);
+            }
+        }
         List<GtfsRealtime.TripUpdate.StopTimeUpdate> sortedStopTimeUpdates = tripUpdate.getStopTimeUpdateList().stream()
                 .sorted(Comparator.comparingInt(GtfsRealtime.TripUpdate.StopTimeUpdate::getStopSequence))
                 .collect(Collectors.toList());
 
         long lastTime = 0;
+        final int MIN_INCREMENT_SECONDS = 1; // progression minimale pour éviter plusieurs arrêts avec la même heure
         List<GtfsRealtime.TripUpdate.StopTimeUpdate> correctedUpdates = new ArrayList<>();
         for (GtfsRealtime.TripUpdate.StopTimeUpdate update : sortedStopTimeUpdates) {
             GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = update.toBuilder();
             if (update.hasArrival()) {
                 long arr = update.getArrival().getTime();
-                if (arr < lastTime) {
-                    arr = lastTime;
+                // imposer plancher = baseline arrival si dispo
+                Long base = baselineArrival.get(update.getStopSequence());
+                if (base != null && arr < base) {
+                    arr = base;
+                }
+                if (arr <= lastTime) {
+                    arr = lastTime + MIN_INCREMENT_SECONDS;
                     builder.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arr).build());
                 }
                 lastTime = arr;
             }
             if (update.hasDeparture()) {
                 long dep = update.getDeparture().getTime();
-                if (dep < lastTime) {
-                    dep = lastTime;
+                // imposer plancher = baseline departure si dispo
+                Long base = baselineDeparture.get(update.getStopSequence());
+                if (base != null && dep < base) {
+                    dep = base;
+                }
+                if (dep <= lastTime) {
+                    dep = lastTime + MIN_INCREMENT_SECONDS;
                     builder.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(dep).build());
                 }
                 lastTime = dep;
@@ -573,5 +641,66 @@ public class TripUpdateGenerator {
         } catch (java.io.IOException e) {
             System.err.println("Error writing GTFS-RT feed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Logique demandée : pour chaque arrêt sans temps réel, on applique le dernier offset connu.
+     * (scheduled time + dernier retard/avance observé). Pas d'interpolation progressive.
+     */
+    private java.util.Map<Integer, Long> computeCarryForwardOffsets(List<JsonNode> estimatedCalls, List<String> scheduledStopTimes, String tripId) {
+        java.util.Map<Integer, Long> offsets = new java.util.HashMap<>();
+
+        long currentOffset = 0L; // défaut si aucun temps réel encore
+
+        // Pré-indexation des stopTimes par (stop_id, seq) pour éviter recalculs
+        java.util.Map<String, String> stopIdBySeq = new java.util.HashMap<>();
+        for (String st : scheduledStopTimes) {
+            String[] parts = st.split(",");
+            stopIdBySeq.put(parts[3], parts[0]);
+        }
+
+        // Récupère les sequences triées pour itération finale
+        java.util.List<Integer> allSequences = scheduledStopTimes.stream()
+                .map(s -> Integer.parseInt(s.split(",")[3]))
+                .sorted()
+                .collect(java.util.stream.Collectors.toList());
+
+        // Map sequence -> offset réel calculé (points d'ancrage)
+        java.util.Map<Integer, Long> anchorOffsets = new java.util.HashMap<>();
+
+        for (JsonNode ec : estimatedCalls) {
+            boolean cancelled = (ec.has("DepartureStatus") && ec.get("DepartureStatus").asText().contains("CANCELLED")) ||
+                                (ec.has("ArrivalStatus") && ec.get("ArrivalStatus").asText().contains("CANCELLED"));
+            if (cancelled) continue;
+
+            String stopId = TripFinder.resolveStopId(ec.get("StopPointRef").get("value").asText().split(":")[3]);
+            if (stopId == null) continue;
+            String seqStr = TripFinder.findStopSequence(tripId, stopId, new java.util.ArrayList<>());
+            if (seqStr == null) continue;
+            int seq = Integer.parseInt(seqStr);
+
+            Long scheduled = null; Long realtime = null;
+            if (ec.has("ExpectedArrivalTime")) {
+                scheduled = TripFinder.getScheduledArrivalTime(scheduledStopTimes, stopId, seqStr, ZONE_ID);
+                realtime = parseTime(ec.get("ExpectedArrivalTime").asText());
+            } else if (ec.has("ExpectedDepartureTime")) {
+                scheduled = TripFinder.getScheduledDepartureTime(scheduledStopTimes, stopId, seqStr, ZONE_ID);
+                realtime = parseTime(ec.get("ExpectedDepartureTime").asText());
+            }
+            if (scheduled != null && realtime != null) {
+                long offset = realtime - scheduled;
+                anchorOffsets.put(seq, offset);
+            }
+        }
+
+        // Itération dans l'ordre des séquences : on propage le dernier offset connu
+        for (Integer seq : allSequences) {
+            if (anchorOffsets.containsKey(seq)) {
+                currentOffset = anchorOffsets.get(seq);
+            }
+            offsets.put(seq, currentOffset);
+        }
+
+        return offsets;
     }
 }

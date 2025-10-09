@@ -24,12 +24,30 @@ public class TripFinder {
 
     static {
         dataSource.setUrl(DB_URL);
-        dataSource.setMinIdle(4); // Increase min idle connections
-        dataSource.setMaxIdle(10); // Increase max idle connections
-        dataSource.setMaxTotal(20); // Allow more total connections
-        dataSource.setMaxOpenPreparedStatements(50); // Allow more prepared statements
-        dataSource.setInitialSize(4); // Pre-initialize connections
+        dataSource.setMinIdle(8); // Increase min idle connections
+        dataSource.setMaxIdle(20); // Increase max idle connections
+        dataSource.setMaxTotal(40); // Allow more total connections
+        dataSource.setMaxOpenPreparedStatements(100); // Allow more prepared statements
+        dataSource.setInitialSize(8); // Pre-initialize connections
         dataSource.setPoolPreparedStatements(true); // Enable prepared statement pooling
+    }
+
+    /**
+     * Lightweight container for trip metadata needed to build GTFS-RT TripDescriptor
+     */
+    public static class TripMeta {
+        public final String tripId;
+        public final String routeId;
+        public final int directionId;
+        /** first stop time in seconds since start of service day (0-86399) */
+        public final int firstTimeSecOfDay;
+
+        public TripMeta(String tripId, String routeId, int directionId, int firstTimeSecOfDay) {
+            this.tripId = tripId;
+            this.routeId = routeId;
+            this.directionId = directionId;
+            this.firstTimeSecOfDay = firstTimeSecOfDay;
+        }
     }
 
     /**
@@ -462,6 +480,101 @@ public class TripFinder {
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
                     return rs.getString("direction_id");
+                }
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    /**
+     * Returns all trips (with minimal metadata) that are active today for the given route ids.
+     * This uses calendar and calendar_dates to determine service validity and aggregates the
+     * earliest time (arrival or departure) for each trip to allow filtering by time window.
+     */
+    public static List<TripMeta> getActiveTripsForRoutesToday(List<String> routeIds) {
+        if (routeIds == null || routeIds.isEmpty()) return java.util.Collections.emptyList();
+
+        ZoneId zone = ZoneId.of("Europe/Paris");
+        LocalDate date = LocalDate.now(zone);
+        String yyyymmdd = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        int dayOfWeek = date.getDayOfWeek().getValue();
+        String weekday = String.valueOf(dayOfWeek == 7 ? 0 : dayOfWeek);
+
+        String inClause = routeIds.stream().map(r -> "?").collect(Collectors.joining(","));
+
+        String sql = (
+            "WITH valid_services AS (\n" +
+            "    SELECT service_id FROM calendar\n" +
+            "    WHERE start_date <= ? AND end_date >= ?\n" +
+            "    AND (\n" +
+            "        (monday = 1 AND ? = '1') OR\n" +
+            "        (tuesday = 1 AND ? = '2') OR\n" +
+            "        (wednesday = 1 AND ? = '3') OR\n" +
+            "        (thursday = 1 AND ? = '4') OR\n" +
+            "        (friday = 1 AND ? = '5') OR\n" +
+            "        (saturday = 1 AND ? = '6') OR\n" +
+            "        (sunday = 1 AND ? = '0')\n" +
+            "    )\n" +
+            "    UNION\n" +
+            "    SELECT service_id FROM calendar_dates\n" +
+            "    WHERE date = ? AND exception_type = 1\n" +
+            "),\n" +
+            "excluded_services AS (\n" +
+            "    SELECT service_id FROM calendar_dates\n" +
+            "    WHERE date = ? AND exception_type = 2\n" +
+            ")\n" +
+            "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time\n" +
+            "FROM trips t\n" +
+            "JOIN stop_times st ON st.trip_id = t.trip_id\n" +
+            "WHERE t.route_id IN (" + inClause + ")\n" +
+            "AND t.service_id IN (SELECT service_id FROM valid_services)\n" +
+            "AND t.service_id NOT IN (SELECT service_id FROM excluded_services)\n" +
+            "GROUP BY t.trip_id, t.route_id, t.direction_id\n"
+        );
+
+        List<TripMeta> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            int i = 1;
+            stmt.setString(i++, yyyymmdd);
+            stmt.setString(i++, yyyymmdd);
+            for (int j = 0; j < 7; j++) stmt.setString(i++, weekday);
+            stmt.setString(i++, yyyymmdd);
+            stmt.setString(i++, yyyymmdd);
+            for (String r : routeIds) stmt.setString(i++, r);
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String tripId = rs.getString("trip_id");
+                    String routeId = rs.getString("route_id");
+                    int dir = rs.getInt("direction_id");
+                    int first = rs.getInt("first_time");
+                    result.add(new TripMeta(tripId, routeId, dir, ((first % 86400) + 86400) % 86400));
+                }
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return result;
+    }
+
+    /**
+     * Returns TripMeta for a given trip id, including routeId, directionId and the trip's first time of day.
+     */
+    public static TripMeta getTripMeta(String tripId) {
+        String sql = "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time " +
+                "FROM trips t JOIN stop_times st ON st.trip_id = t.trip_id WHERE t.trip_id = ? GROUP BY t.trip_id, t.route_id, t.direction_id";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, tripId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    String routeId = rs.getString("route_id");
+                    int dir = rs.getInt("direction_id");
+                    int first = rs.getInt("first_time");
+                    return new TripMeta(tripId, routeId, dir, ((first % 86400) + 86400) % 86400);
                 }
             }
         } catch (SQLException e) {
