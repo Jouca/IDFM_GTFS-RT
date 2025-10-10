@@ -19,10 +19,17 @@ public class SiriLiteFetcher {
         URL url = new URL(API_URL);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("GET");
-        conn.setRequestProperty("Accept-Encoding", "application/json");
+        conn.setConnectTimeout(5_000);
+        conn.setReadTimeout(20_000);
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("Accept-Encoding", "gzip");
         conn.setRequestProperty("apiKey", API_KEY);
 
         InputStream responseStream = conn.getInputStream();
+        String encoding = conn.getContentEncoding();
+        if (encoding != null && encoding.equalsIgnoreCase("gzip")) {
+            responseStream = new java.util.zip.GZIPInputStream(responseStream);
+        }
         Scanner scanner = new Scanner(responseStream).useDelimiter("\\A");
         String response = scanner.hasNext() ? scanner.next() : "";
         scanner.close();

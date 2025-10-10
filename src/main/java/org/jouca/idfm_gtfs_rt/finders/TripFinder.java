@@ -4,15 +4,18 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 import org.apache.commons.dbcp2.BasicDataSource;
@@ -24,12 +27,20 @@ public class TripFinder {
 
     static {
         dataSource.setUrl(DB_URL);
-        dataSource.setMinIdle(8); // Increase min idle connections
-        dataSource.setMaxIdle(20); // Increase max idle connections
-        dataSource.setMaxTotal(40); // Allow more total connections
-        dataSource.setMaxOpenPreparedStatements(100); // Allow more prepared statements
-        dataSource.setInitialSize(8); // Pre-initialize connections
+        dataSource.setMinIdle(12); // Increase min idle connections
+        dataSource.setMaxIdle(36); // Increase max idle connections
+        dataSource.setMaxTotal(72); // Allow more total connections
+        dataSource.setMaxOpenPreparedStatements(256); // Allow more prepared statements
+        dataSource.setInitialSize(12); // Pre-initialize connections
         dataSource.setPoolPreparedStatements(true); // Enable prepared statement pooling
+        dataSource.setDefaultQueryTimeout(Duration.ofSeconds(45));
+        dataSource.setConnectionInitSqls(Arrays.asList(
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA cache_size=-131072",
+            "PRAGMA mmap_size=268435456"
+        ));
     }
 
     /**
@@ -153,10 +164,22 @@ public class TripFinder {
             {-3, 30}
         };
 
-        Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
+    Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement stmt = conn.prepareStatement(query.toString())) {
+        // Build cache key for this query to avoid repeating heavy DB work for identical inputs
+        StringBuilder keyBuilder = new StringBuilder();
+        keyBuilder.append(routeId).append('|').append(isArrivalTime ? 'A' : 'D').append('|').append(destinationId).append('|');
+        if (journeyNote != null) keyBuilder.append(journeyNote).append('|');
+        for (EstimatedCall ec : estimatedCalls) {
+            keyBuilder.append(ec.stopId()).append('@').append(ec.isoTime()).append('|');
+        }
+        String cacheKey = keyBuilder.toString();
+        if (findTripCache.containsKey(cacheKey)) {
+            return findTripCache.get(cacheKey);
+        }
+
+       try (Connection conn = dataSource.getConnection();
+           PreparedStatement stmt = conn.prepareStatement(query.toString())) {
 
             int i = 1;
             stmt.setString(i++, yyyymmdd);
@@ -209,7 +232,7 @@ public class TripFinder {
                     String stopId = ec.stopId();
                     Instant inst = Instant.parse(ec.isoTime());
                     int realTime = (int) (inst.atZone(zone).toEpochSecond() - date.atStartOfDay(zone).toEpochSecond());
-                    realTime = ((realTime % 86400) + 86400) % 86400; // Normalize to 0-86399
+                    // Keep realTime as seconds since service day's start; do not wrap modulo 86400
 
                     List<Integer> theoreticalTimes = tripStops.get(stopId);
                     if (theoreticalTimes == null || theoreticalTimes.isEmpty()) {
@@ -220,12 +243,9 @@ public class TripFinder {
                     Integer bestTheo = null;
                     int minDiff = Integer.MAX_VALUE;
                     for (Integer theoTime : theoreticalTimes) {
-                        int normalizedTheoTime = ((theoTime % 86400) + 86400) % 86400; // Normalize to 0-86399
+                        // theoTime may be >= 86400 for trips continuing after midnight; keep as-is
+                        int normalizedTheoTime = theoTime;
                         int diff = normalizedTheoTime - realTime;
-
-                        // Handle wrap-around at midnight (difference should be in [-43200, 43200])
-                        if (diff > 43200) diff -= 86400;
-                        if (diff < -43200) diff += 86400;
 
                         if (diff >= minWindow && diff <= maxWindow) {
                             int absDiff = Math.abs(diff);
@@ -253,10 +273,13 @@ public class TripFinder {
 
         if (!allMatches.isEmpty()) {
             // Retourner le trip_id avec la plus petite différence totale
-            return allMatches.get(0).tripId;
+            String result = allMatches.get(0).tripId;
+            findTripCache.put(cacheKey, result);
+            return result;
         }
 
         // Si aucun trip trouvé dans les fenêtres, retourner null
+        findTripCache.put(cacheKey, null);
         return null;
     }
 
@@ -271,6 +294,10 @@ public class TripFinder {
     }
 
     public static List<String> getAllStopTimesFromTrip(String tripId) {
+        // Try cache first
+        List<String> cached = allStopTimesCache.get(tripId);
+        if (cached != null) return cached;
+
         String query = "SELECT stop_id, arrival_timestamp, departure_timestamp, stop_sequence FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence;";
         List<String> results = new ArrayList<>();
 
@@ -289,6 +316,8 @@ public class TripFinder {
                     results.add(String.format("%s,%s,%s,%d", stopId, arrivalTime, departureTime, stopSequence));
                 }
             }
+            // populate cache
+            allStopTimesCache.put(tripId, results);
         } catch (SQLException e) {
             e.printStackTrace();
         }
@@ -297,43 +326,34 @@ public class TripFinder {
     }
 
     public static String findStopSequence(String tripId, String stopId, List<String> stopUpdates) {
-        String query = """
-            SELECT st.stop_sequence
-            FROM stop_times st
-            WHERE st.trip_id = ? AND st.stop_id = ?
-            AND st.stop_sequence NOT IN (%s)
-            LIMIT 1;
-        """;
-
-        // Build the NOT IN clause dynamically
-        StringBuilder notInClause = new StringBuilder();
-        for (int i = 0; i < stopUpdates.size(); i++) {
-            notInClause.append("?");
-            if (i < stopUpdates.size() - 1) {
-                notInClause.append(",");
+        // Use cached mapping tripId -> (stopId -> list of sequences) if available
+        Map<String, List<String>> seqMap = stopSequencesCache.get(tripId);
+        if (seqMap == null) {
+            // Build mapping from DB and cache it
+            seqMap = new HashMap<>();
+            String query = "SELECT stop_id, stop_sequence FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence;";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
+                stmt.setString(1, tripId);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        String sId = rs.getString("stop_id");
+                        String seq = rs.getString("stop_sequence");
+                        seqMap.computeIfAbsent(sId, k -> new ArrayList<>()).add(seq);
+                    }
+                }
+            } catch (SQLException e) {
+                e.printStackTrace();
             }
+            stopSequencesCache.put(tripId, seqMap);
         }
 
-        query = query.replace("%s", notInClause.toString());
+        List<String> seqs = seqMap.get(stopId);
+        if (seqs == null || seqs.isEmpty()) return null;
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement stmt = conn.prepareStatement(query)) {
-
-            stmt.setString(1, tripId);
-            stmt.setString(2, stopId);
-
-            int index = 3;
-            for (String stopUpdate : stopUpdates) {
-                stmt.setString(index++, stopUpdate);
-            }
-
-            try (ResultSet rs = stmt.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getString("stop_sequence");
-                }
-            }
-        } catch (SQLException e) {
-            e.printStackTrace();
+        // Return first sequence that's not in stopUpdates
+        for (String s : seqs) {
+            if (!stopUpdates.contains(s)) return s;
         }
         return null;
     }
@@ -414,17 +434,39 @@ public class TripFinder {
         return null;
     }
 
-    public static final Map<String, String> stopCodeCache = new HashMap<>();
+    private static final String EMPTY_MARKER = "__NULL__";
+    public static final Map<String, String> stopCodeCache = new ConcurrentHashMap<>();
+
+    // Caches to reduce DB access during a processing run
+    private static final ConcurrentHashMap<String, TripMeta> tripMetaCache = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, List<String>> allStopTimesCache = new ConcurrentHashMap<>();
+    /** tripId -> (stopId -> list of sequences as strings) */
+    private static final ConcurrentHashMap<String, Map<String, List<String>>> stopSequencesCache = new ConcurrentHashMap<>();
+    
+    // Simple LRU cache for findTripIdFromEstimatedCalls results to avoid repeated heavy DB queries
+    private static final int FIND_TRIP_CACHE_SIZE = 5000;
+    private static final java.util.Map<String, String> findTripCache = java.util.Collections.synchronizedMap(
+        new java.util.LinkedHashMap<String, String>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(java.util.Map.Entry<String, String> eldest) {
+                return size() > FIND_TRIP_CACHE_SIZE;
+            }
+        }
+    );
+
 
     public static String resolveStopId(String stopCode) {
-        if (stopCodeCache.containsKey(stopCode)) {
-            return stopCodeCache.get(stopCode);
+        String cached = stopCodeCache.get(stopCode);
+        if (cached != null) {
+            return EMPTY_MARKER.equals(cached) ? null : cached;
         }
+
         String stopId = TripFinder.findStopIdFromCode(stopCode);
         if (stopId == null) {
             stopId = TripFinder.findStopIdFromStopExtension(stopCode);
         }
-        stopCodeCache.put(stopCode, stopId);
+
+        stopCodeCache.put(stopCode, stopId == null ? EMPTY_MARKER : stopId);
         return stopId;
     }
 
@@ -437,12 +479,13 @@ public class TripFinder {
             if (parts[0].equals(stopId) && parts[3].equals(stopSequence)) {
                 String arrivalTimeCollected = parts[1];
                 if (arrivalTimeCollected != null && !arrivalTimeCollected.isEmpty()) {
-                    long serviceDayEpoch = Instant.now().atZone(zoneId)
-                            .toLocalDateTime()
-                            .toLocalDate()
-                            .atStartOfDay(zoneId)
-                            .toEpochSecond();
-                    return serviceDayEpoch + (Long.parseLong(arrivalTimeCollected) % 86400);
+            long serviceDayEpoch = Instant.now().atZone(zoneId)
+                .toLocalDateTime()
+                .toLocalDate()
+                .atStartOfDay(zoneId)
+                .toEpochSecond();
+            // arrivalTimeCollected is seconds since service day's start and may be >= 86400
+            return serviceDayEpoch + Long.parseLong(arrivalTimeCollected);
                 }
             }
         }
@@ -458,12 +501,13 @@ public class TripFinder {
             if (parts[0].equals(stopId) && parts[3].equals(stopSequence)) {
                 String departureTimeCollected = parts[2];
                 if (departureTimeCollected != null && !departureTimeCollected.isEmpty()) {
-                    long serviceDayEpoch = Instant.now().atZone(zoneId)
-                            .toLocalDateTime()
-                            .toLocalDate()
-                            .atStartOfDay(zoneId)
-                            .toEpochSecond();
-                    return serviceDayEpoch + (Long.parseLong(departureTimeCollected) % 86400);
+            long serviceDayEpoch = Instant.now().atZone(zoneId)
+                .toLocalDateTime()
+                .toLocalDate()
+                .atStartOfDay(zoneId)
+                .toEpochSecond();
+            // departureTimeCollected is seconds since service day's start and may be >= 86400
+            return serviceDayEpoch + Long.parseLong(departureTimeCollected);
                 }
             }
         }
@@ -471,6 +515,9 @@ public class TripFinder {
     }
 
     public static String getTripDirection(String tripId) {
+        TripMeta cached = tripMetaCache.get(tripId);
+        if (cached != null) return String.valueOf(cached.directionId);
+
         String query = "SELECT direction_id FROM trips WHERE trip_id = ?;";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
@@ -479,7 +526,11 @@ public class TripFinder {
 
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
-                    return rs.getString("direction_id");
+                    String dir = rs.getString("direction_id");
+                    // no full TripMeta constructed here because cost is small; but we can populate tripMetaCache via getTripMeta
+                    TripMeta meta = getTripMeta(tripId);
+                    if (meta != null) tripMetaCache.put(tripId, meta);
+                    return dir;
                 }
             }
         } catch (SQLException e) {
@@ -551,7 +602,8 @@ public class TripFinder {
                     String routeId = rs.getString("route_id");
                     int dir = rs.getInt("direction_id");
                     int first = rs.getInt("first_time");
-                    result.add(new TripMeta(tripId, routeId, dir, ((first % 86400) + 86400) % 86400));
+                    // first may already be seconds since service day; keep raw value but cast into 0..int range
+                    result.add(new TripMeta(tripId, routeId, dir, first));
                 }
             }
         } catch (SQLException e) {
@@ -564,6 +616,9 @@ public class TripFinder {
      * Returns TripMeta for a given trip id, including routeId, directionId and the trip's first time of day.
      */
     public static TripMeta getTripMeta(String tripId) {
+        TripMeta cached = tripMetaCache.get(tripId);
+        if (cached != null) return cached;
+
         String sql = "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time " +
                 "FROM trips t JOIN stop_times st ON st.trip_id = t.trip_id WHERE t.trip_id = ? GROUP BY t.trip_id, t.route_id, t.direction_id";
         try (Connection conn = dataSource.getConnection();
@@ -574,7 +629,9 @@ public class TripFinder {
                     String routeId = rs.getString("route_id");
                     int dir = rs.getInt("direction_id");
                     int first = rs.getInt("first_time");
-                    return new TripMeta(tripId, routeId, dir, ((first % 86400) + 86400) % 86400);
+                    TripMeta meta = new TripMeta(tripId, routeId, dir, first);
+                    tripMetaCache.put(tripId, meta);
+                    return meta;
                 }
             }
         } catch (SQLException e) {

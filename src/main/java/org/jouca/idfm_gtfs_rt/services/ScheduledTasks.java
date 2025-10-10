@@ -61,8 +61,6 @@ public class ScheduledTasks {
         if (lockAlertUpdate.tryLock()) {
             try {
                 System.out.println("[Alerts] Génération du GTFS-RT en cours...");
-                lockAlertUpdate.lock();
-
                 alertGenerator.generateAlert();
                 System.out.println("[Alerts] GTFS-RT généré avec succès !");
             } catch (Exception e) {
@@ -85,8 +83,6 @@ public class ScheduledTasks {
                 }
 
                 System.out.println("[Trips] Génération du GTFS-RT en cours...");
-                lockTripUpdate.lock();
-
                 gtfsrtGenerator.generateGTFSRT();
                 System.out.println("[Trips] GTFS-RT généré avec succès !");
             } catch (Exception e) {
