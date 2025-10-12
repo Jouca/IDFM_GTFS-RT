@@ -85,9 +85,7 @@ public class TripUpdateGenerator {
         // Fetch SiriLite data
         JsonNode siriLiteData = SiriLiteFetcher.fetchSiriLiteData();
 
-        if (dumpDebugFiles) {
-            saveSiriLiteDataToFile(siriLiteData, "sirilite_data.json");
-        }
+        saveSiriLiteDataToFile(siriLiteData, "sirilite_data.json");
 
         // Check if stop_extensions table exists in SQLite database
         if (!TripFinder.checkIfStopExtensionsTableExists()) {
@@ -106,10 +104,11 @@ public class TripUpdateGenerator {
         // Parse SiriLite data and add it to the GTFS-RT feed
         processSiriLiteData(siriLiteData, feedMessage, context);
 
+        // Append canceled trips based on theoretical schedule
         appendCanceledTrips(feedMessage, context);
 
         // Write the GTFS-RT feed to a file
-    writeFeedToFile(feedMessage, "gtfs-rt-trips-idfm.pb");
+        writeFeedToFile(feedMessage, "gtfs-rt-trips-idfm.pb");
     }
 
     private void saveSiriLiteDataToFile(JsonNode siriLiteData, String filePath) {
@@ -304,8 +303,9 @@ public class TripUpdateGenerator {
         // If not found, try to find it from the stop_extensions table
         if (destinationId == null) return null;
 
-        //int direction = determineDirection(entity);
-        //if (direction == -1) return;
+        // Determine direction from SIRI Lite data
+        int direction = determineDirection(entity);
+        Integer directionIdForMatching = (direction != -1) ? direction : null;
 
         List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
 
@@ -321,6 +321,10 @@ public class TripUpdateGenerator {
                 isoTime = call.get("ExpectedArrivalTime").asText();
             } else if (call.has("ExpectedDepartureTime")) {
                 isoTime = call.get("ExpectedDepartureTime").asText();
+            } else if (call.has("AimedArrivalTime")) {
+                isoTime = call.get("AimedArrivalTime").asText();
+            } else if (call.has("AimedDepartureTime")) {
+                isoTime = call.get("AimedDepartureTime").asText();
             }
             if (isoTime != null) {
                 estimatedCallList.add(new org.jouca.idfm_gtfs_rt.records.EstimatedCall(stopId, isoTime));
@@ -332,7 +336,7 @@ public class TripUpdateGenerator {
         }
 
         // Use the new trip finder method
-        boolean isArrivalTime = !estimatedCallList.isEmpty() && estimatedCalls.get(0).has("ExpectedArrivalTime");
+        boolean isArrivalTime = !estimatedCallList.isEmpty() && (estimatedCalls.get(0).has("ExpectedArrivalTime") || estimatedCalls.get(0).has("AimedArrivalTime"));
 
         // Get journey note
         String journeyNote = null;
@@ -344,7 +348,7 @@ public class TripUpdateGenerator {
         final String tripId;
         String tmpTripId = null;
         try {
-            tmpTripId = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, destinationId, journeyNote);
+            tmpTripId = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, destinationId, journeyNote, directionIdForMatching);
         } catch (SQLException e) {
             e.printStackTrace();
         }
@@ -389,11 +393,15 @@ public class TripUpdateGenerator {
         int directionId = 0;
         if (tripMeta != null) {
             directionId = tripMeta.directionId;
+        } else if (directionIdForMatching != null) {
+            // Use the direction determined from SIRI Lite if available
+            directionId = directionIdForMatching;
         } else {
-            String direction = TripFinder.getTripDirection(tripId);
-            if (direction != null && !direction.isEmpty()) {
+            // Fallback: query from database
+            String directionStr = TripFinder.getTripDirection(tripId);
+            if (directionStr != null && !directionStr.isEmpty()) {
                 try {
-                    directionId = Integer.parseInt(direction);
+                    directionId = Integer.parseInt(directionStr);
                 } catch (NumberFormatException ignored) {
                 }
             }
@@ -430,6 +438,48 @@ public class TripUpdateGenerator {
         return new IndexedEntity(index, entityBuilder.build());
     }
 
+    private int determineDirection(JsonNode entity) {
+        if (entity.has("DirectionRef") && entity.get("DirectionRef").has("value")) {
+            String directionValue = entity.get("DirectionRef").get("value").asText();
+            if (directionValue.contains(":")) {
+                String[] directionParts = directionValue.split(":");
+                if (directionParts.length > 3) {
+                    String directionString = directionParts[3];
+                    if ("A".equals(directionString)) {
+                        return 1;
+                    } else if ("R".equals(directionString)) {
+                        return 0;
+                    }
+                }
+            } else {
+                if ("Aller".equals(directionValue) || "inbound".equals(directionValue) || "A".equals(directionValue)) {
+                    return 1;
+                } else if ("Retour".equals(directionValue) || "outbound".equals(directionValue) || "R".equals(directionValue)) {
+                    return 0;
+                }
+            }
+        } 
+        
+        if (entity.has("DirectionName") && entity.get("DirectionName").size() > 0) {
+            String directionName = entity.get("DirectionName").get(0).get("value").asText();
+
+            // IDFM cases
+            if (directionName.equals("A")) {
+                return 0;
+            } else if (directionName.equals("R")) {
+                return 1;
+            }
+
+            if (directionName.equals("Aller") || directionName.equals("inbound")) {
+                return 1;
+            } else if (directionName.equals("Retour") || directionName.equals("outbound")) {
+                return 0;
+            }
+        }
+
+        return -1; // Invalid direction
+    }
+
     boolean checkStopIntegrity(JsonNode entity) {
         // Check if the stop is a integer
         if (entity.has("StopPointRef") && entity.get("StopPointRef").has("value")) {
@@ -457,7 +507,9 @@ public class TripUpdateGenerator {
         return estimatedCalls.stream()
                 .sorted(Comparator.comparingLong(call -> {
                     String callTime = call.has("ExpectedArrivalTime") ? call.get("ExpectedArrivalTime").asText()
-                            : call.has("ExpectedDepartureTime") ? call.get("ExpectedDepartureTime").asText() : null;
+                            : call.has("ExpectedDepartureTime") ? call.get("ExpectedDepartureTime").asText() : 
+                            call.has("AimedArrivalTime") ? call.get("AimedArrivalTime").asText() :
+                            call.has("AimedDepartureTime") ? call.get("AimedDepartureTime").asText() : null;
                     return callTime != null ? Instant.parse(callTime).atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond() : Long.MAX_VALUE;
                 }))
                 .collect(Collectors.toList());
@@ -468,9 +520,16 @@ public class TripUpdateGenerator {
         if (estimatedCall.has("ExpectedArrivalTime")) {
             long arrivalTime = parseTime(estimatedCall.get("ExpectedArrivalTime").asText());
             if (arrivalTime < currentEpochSecond) return;
+        } else if (estimatedCall.has("AimedArrivalTime")) {
+            long arrivalTime = parseTime(estimatedCall.get("AimedArrivalTime").asText());
+            if (arrivalTime < currentEpochSecond) return;
         }
+
         if (estimatedCall.has("ExpectedDepartureTime")) {
             long departureTime = parseTime(estimatedCall.get("ExpectedDepartureTime").asText());
+            if (departureTime < currentEpochSecond) return;
+        } else if (estimatedCall.has("AimedDepartureTime")) {
+            long departureTime = parseTime(estimatedCall.get("AimedDepartureTime").asText());
             if (departureTime < currentEpochSecond) return;
         }
 
@@ -489,10 +548,16 @@ public class TripUpdateGenerator {
         if (estimatedCall.has("ExpectedArrivalTime")) {
             long arrivalTime = parseTime(estimatedCall.get("ExpectedArrivalTime").asText());
             stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
+        } else if (estimatedCall.has("AimedArrivalTime")) {
+            long arrivalTime = parseTime(estimatedCall.get("AimedArrivalTime").asText());
+            stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
         }
 
         if (estimatedCall.has("ExpectedDepartureTime")) {
             long departureTime = parseTime(estimatedCall.get("ExpectedDepartureTime").asText());
+            stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
+        } else if (estimatedCall.has("AimedDepartureTime")) {
+            long departureTime = parseTime(estimatedCall.get("AimedDepartureTime").asText());
             stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
         }
 
@@ -553,69 +618,5 @@ public class TripUpdateGenerator {
         } catch (java.io.IOException e) {
             System.err.println("Error writing GTFS-RT feed: " + e.getMessage());
         }
-    }
-
-    /**
-     * Logique demandée : pour chaque arrêt sans temps réel, on applique le dernier offset connu.
-     * (scheduled time + dernier retard/avance observé). Pas d'interpolation progressive.
-     */
-    @SuppressWarnings("unused")
-    private java.util.Map<Integer, Long> computeCarryForwardOffsets(List<JsonNode> estimatedCalls, List<String> scheduledStopTimes, String tripId) {
-        java.util.Map<Integer, Long> offsets = new java.util.HashMap<>();
-
-        long currentOffset = 0L; // défaut si aucun temps réel encore
-
-        // Pré-indexation des stopTimes par (stop_id, seq) pour éviter recalculs
-        // Optimisation : parser une seule fois au lieu de split() répétés
-        java.util.Map<String, String> stopIdBySeq = new java.util.HashMap<>();
-        java.util.List<Integer> allSequences = new java.util.ArrayList<>();
-        
-        for (String st : scheduledStopTimes) {
-            String[] parts = st.split(",");
-            String seq = parts[3];
-            stopIdBySeq.put(seq, parts[0]);
-            allSequences.add(Integer.parseInt(seq));
-        }
-        
-        // Trier les séquences
-        allSequences.sort(Integer::compareTo);
-
-        // Map sequence -> offset réel calculé (points d'ancrage)
-        java.util.Map<Integer, Long> anchorOffsets = new java.util.HashMap<>();
-
-        for (JsonNode ec : estimatedCalls) {
-            boolean cancelled = (ec.has("DepartureStatus") && ec.get("DepartureStatus").asText().contains("CANCELLED")) ||
-                                (ec.has("ArrivalStatus") && ec.get("ArrivalStatus").asText().contains("CANCELLED"));
-            if (cancelled) continue;
-
-            String stopId = TripFinder.resolveStopId(ec.get("StopPointRef").get("value").asText().split(":")[3]);
-            if (stopId == null) continue;
-            String seqStr = TripFinder.findStopSequence(tripId, stopId, new java.util.ArrayList<>());
-            if (seqStr == null) continue;
-            int seq = Integer.parseInt(seqStr);
-
-            Long scheduled = null; Long realtime = null;
-            if (ec.has("ExpectedArrivalTime")) {
-                scheduled = TripFinder.getScheduledArrivalTime(scheduledStopTimes, stopId, seqStr, ZONE_ID);
-                realtime = parseTime(ec.get("ExpectedArrivalTime").asText());
-            } else if (ec.has("ExpectedDepartureTime")) {
-                scheduled = TripFinder.getScheduledDepartureTime(scheduledStopTimes, stopId, seqStr, ZONE_ID);
-                realtime = parseTime(ec.get("ExpectedDepartureTime").asText());
-            }
-            if (scheduled != null && realtime != null) {
-                long offset = realtime - scheduled;
-                anchorOffsets.put(seq, offset);
-            }
-        }
-
-        // Itération dans l'ordre des séquences : on propage le dernier offset connu
-        for (Integer seq : allSequences) {
-            if (anchorOffsets.containsKey(seq)) {
-                currentOffset = anchorOffsets.get(seq);
-            }
-            offsets.put(seq, currentOffset);
-        }
-
-        return offsets;
     }
 }

@@ -73,7 +73,8 @@ public class TripFinder {
         List<EstimatedCall> estimatedCalls,
         boolean isArrivalTime,
         String destinationId,
-        String journeyNote
+        String journeyNote,
+        Integer directionId
     ) throws SQLException {
         if (routeId == null || estimatedCalls == null || estimatedCalls.isEmpty()) {
             throw new IllegalArgumentException("Inputs cannot be null or empty.");
@@ -133,6 +134,11 @@ public class TripFinder {
              .append(allStopIds.stream().map(x -> "?").collect(Collectors.joining(",")))
              .append(")\n");
 
+        // Add direction constraint if provided
+        if (directionId != null) {
+            query.append("AND t.direction_id = ?\n");
+        }
+
         // Add destination constraint: last stop_id must match destinationId and be the last stop_sequence for the trip
         query.append("""
             AND (
@@ -170,6 +176,7 @@ public class TripFinder {
         StringBuilder keyBuilder = new StringBuilder();
         keyBuilder.append(routeId).append('|').append(isArrivalTime ? 'A' : 'D').append('|').append(destinationId).append('|');
         if (journeyNote != null) keyBuilder.append(journeyNote).append('|');
+        if (directionId != null) keyBuilder.append(directionId).append('|');
         for (EstimatedCall ec : estimatedCalls) {
             keyBuilder.append(ec.stopId()).append('@').append(ec.isoTime()).append('|');
         }
@@ -192,6 +199,12 @@ public class TripFinder {
             for (String stopId : allStopIds) {
                 stmt.setString(i++, stopId);
             }
+            
+            // Set directionId if provided
+            if (directionId != null) {
+                stmt.setInt(i++, directionId);
+            }
+            
             // Set destinationId for the EXISTS clause
             stmt.setString(i++, destinationId);
 
