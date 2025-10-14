@@ -24,9 +24,9 @@ This service fetches real-time transit information from the IDFM network and con
 
 If you want to **directly get feeds messages online**, you can use my **own HTTP links containing the GTFS-RT feeds** !
 
-#### GTFS-RT Trip Updates : http://gtfsidfm.clarifygdps.com/gtfs-rt-trips-idfm
+> #### GTFS-RT Trip Updates : http://gtfsidfm.clarifygdps.com/gtfs-rt-trips-idfm
 
-#### GTFS-RT Alerts : http://gtfsidfm.clarifygdps.com/gtfs-rt-alerts-idfm
+> #### GTFS-RT Alerts : http://gtfsidfm.clarifygdps.com/gtfs-rt-alerts-idfm
 
 ## ✨ Features
 
