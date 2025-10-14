@@ -24,6 +24,12 @@ import org.jouca.idfm_gtfs_rt.records.EstimatedCall;
 public class TripFinder {
     private static final String DB_URL = "jdbc:sqlite:./gtfs.db";
     private static final BasicDataSource dataSource = new BasicDataSource();
+    
+    // Store the program start time to determine service day consistently
+    // This ensures that a trip running at 00:30 AM is matched against the previous day's service
+    // if the program started before midnight
+    private static final ZonedDateTime PROGRAM_START_TIME = ZonedDateTime.now(ZoneId.of("Europe/Paris"));
+    private static final int MIDNIGHT_CROSSING_THRESHOLD_HOURS = 3; // Consider times before 3 AM as potentially previous day's service
 
     static {
         dataSource.setUrl(DB_URL);
@@ -62,6 +68,38 @@ public class TripFinder {
     }
 
     /**
+     * Determines the service day for a given timestamp, accounting for trips that cross midnight.
+     * GTFS allows times >= 24:00:00 to represent trips continuing past midnight on the same service day.
+     * 
+     * Logic:
+     * - If the timestamp is in early morning hours (before MIDNIGHT_CROSSING_THRESHOLD_HOURS, e.g., 3 AM)
+     *   AND the program started before midnight, the service day is the previous calendar day.
+     * - Otherwise, the service day is the calendar day of the timestamp.
+     * 
+     * @param timestamp The real-time timestamp to determine service day for
+     * @param zone The timezone to use
+     * @return The service day (may be different from calendar day for early morning times)
+     */
+    private static LocalDate determineServiceDay(ZonedDateTime timestamp, ZoneId zone) {
+        LocalDate calendarDate = timestamp.toLocalDate();
+        int hour = timestamp.getHour();
+        
+        // If we're in early morning hours (00:00 - 03:00), this might be part of previous day's service
+        if (hour < MIDNIGHT_CROSSING_THRESHOLD_HOURS) {
+            // Check if program started on the previous day
+            LocalDate programStartDate = PROGRAM_START_TIME.toLocalDate();
+            
+            // If program started yesterday and we're now in early morning of next day,
+            // OR if the current time is in early morning, assume it's part of previous day's service
+            if (calendarDate.isAfter(programStartDate) || hour < MIDNIGHT_CROSSING_THRESHOLD_HOURS) {
+                return calendarDate.minusDays(1);
+            }
+        }
+        
+        return calendarDate;
+    }
+
+    /**
      * Recherche le trip_id correspondant à une séquence d'EstimatedCall, en essayant de matcher les horaires et arrêts sur le plus proche possible.
      * Cette version cherche le trip_id dont les horaires théoriques sont les plus proches des horaires temps réel (EstimatedCall).
      * On considère le trip avec la somme des différences horaires la plus faible.
@@ -84,19 +122,28 @@ public class TripFinder {
         ZoneId zone = ZoneId.of("Europe/Paris");
 
         Map<String, List<Integer>> stopTimes = new HashMap<>();
-        LocalDate date = null;
+        LocalDate serviceDay = null;
 
         for (EstimatedCall ec : estimatedCalls) {
             Instant instant = Instant.parse(ec.isoTime());
             ZonedDateTime zdt = instant.atZone(zone);
-            date = zdt.toLocalDate();
-
-            int seconds = (int) (zdt.toEpochSecond() - date.atStartOfDay(zone).toEpochSecond());
+            
+            // Determine the service day (accounting for midnight-crossing trips)
+            LocalDate determinedServiceDay = determineServiceDay(zdt, zone);
+            if (serviceDay == null) {
+                serviceDay = determinedServiceDay;
+            }
+            
+            // Calculate seconds since the start of the SERVICE day (not calendar day)
+            // For trips crossing midnight, this allows matching times like 24:33:00
+            long serviceDayStartEpoch = serviceDay.atStartOfDay(zone).toEpochSecond();
+            int seconds = (int) (zdt.toEpochSecond() - serviceDayStartEpoch);
+            
             stopTimes.computeIfAbsent(ec.stopId(), k -> new ArrayList<>()).add(seconds);
         }
 
-        String yyyymmdd = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-        int dayOfWeek = date.getDayOfWeek().getValue();
+        String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        int dayOfWeek = serviceDay.getDayOfWeek().getValue();
         String weekday = String.valueOf(dayOfWeek == 7 ? 0 : dayOfWeek);
 
         List<String> allStopIds = estimatedCalls.stream().map(EstimatedCall::stopId).distinct().collect(Collectors.toList());
@@ -122,7 +169,7 @@ public class TripFinder {
                 SELECT service_id FROM calendar_dates
                 WHERE date = ? AND exception_type = 2
             )
-            SELECT st.trip_id, st.stop_id, st.stop_sequence, st.%s %% 86400 as stop_time
+            SELECT st.trip_id, st.stop_id, st.stop_sequence, st.%s as stop_time
             FROM stop_times st
             JOIN trips t ON st.trip_id = t.trip_id
             WHERE t.route_id = ?
@@ -244,8 +291,10 @@ public class TripFinder {
                 for (EstimatedCall ec : estimatedCalls) {
                     String stopId = ec.stopId();
                     Instant inst = Instant.parse(ec.isoTime());
-                    int realTime = (int) (inst.atZone(zone).toEpochSecond() - date.atStartOfDay(zone).toEpochSecond());
-                    // Keep realTime as seconds since service day's start; do not wrap modulo 86400
+                    ZonedDateTime zdtEc = inst.atZone(zone);
+                    LocalDate serviceDayForEc = determineServiceDay(zdtEc, zone);
+                    int realTime = (int) (zdtEc.toEpochSecond() - serviceDayForEc.atStartOfDay(zone).toEpochSecond());
+                    // Keep realTime as seconds since service day's start; may be >= 86400 for midnight-crossing trips
 
                     List<Integer> theoreticalTimes = tripStops.get(stopId);
                     if (theoreticalTimes == null || theoreticalTimes.isEmpty()) {
