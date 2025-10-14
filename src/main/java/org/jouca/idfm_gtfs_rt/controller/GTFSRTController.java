@@ -179,12 +179,16 @@ public class GTFSRTController {
      * 
      * <p>The response includes appropriate headers for JSON content and file download.</p>
      * 
+     * <p><b>Note:</b> This endpoint is only available when the application is running
+     * in the "debug" Spring profile.</p>
+     * 
      * @return ResponseEntity containing the formatted JSON content of the SIRI-Lite data file with
      *         HTTP status 200 (OK), or HTTP status 404 (NOT_FOUND) if the file doesn't exist or
      *         is empty, or HTTP status 500 (INTERNAL_SERVER_ERROR) if there's an error reading
      *         or formatting the data
      * @throws Exception if there's an error during file operations or JSON processing
      */
+    @org.springframework.context.annotation.Profile("debug")
     @GetMapping("/siri-lite")
     public ResponseEntity<byte[]> getSiriLiteFile() throws Exception {
         Path filePath = Paths.get("sirilite_data.json");
@@ -218,4 +222,5 @@ public class GTFSRTController {
             return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
+
 }
