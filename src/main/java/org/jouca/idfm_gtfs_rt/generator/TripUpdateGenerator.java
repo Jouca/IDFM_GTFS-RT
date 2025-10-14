@@ -297,15 +297,15 @@ public class TripUpdateGenerator {
         String lineId = "IDFM:" + entity.get("LineRef").get("value").asText().split(":")[3];
         String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
 
+        // Determine direction from SIRI Lite data
+        int direction = determineDirection(entity);
+        Integer directionIdForMatching = (direction != -1) ? direction : null;
+
         String destinationIdCode = entity.get("DestinationRef").get("value").asText().split(":")[3];
         String destinationId = TripFinder.resolveStopId(destinationIdCode);
 
         // If not found, try to find it from the stop_extensions table
         if (destinationId == null) return null;
-
-        // Determine direction from SIRI Lite data
-        int direction = determineDirection(entity);
-        Integer directionIdForMatching = (direction != -1) ? direction : null;
 
         List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
 
