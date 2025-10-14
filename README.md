@@ -281,9 +281,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [GTFS-Realtime Specification](https://gtfs.org/realtime/)
 - [SIRI-Lite Documentation](https://www.siri-cen.eu/)
 - [Spring Boot Documentation](https://spring.io/projects/spring-boot)
-<br>
-- [API for GTFS-RT Trips: Next Departures (Île-de-France Mobilités platform) - global query](https://prim.iledefrance-mobilites.fr/en/apis/idfm-ivtr-requete_globale)
-- [API for GTFS-RT Alerts: Traffic Info Messages - Global Query](https://prim.iledefrance-mobilites.fr/en/apis/idfm-disruptions_bulk)
+- [API for GTFS-RT Trips: Next Departures (Île-de-France Mobilités platform) – Global Query](https://prim.iledefrance-mobilites.fr/en/apis/idfm-ivtr-requete_globale)
+- [API for GTFS-RT Alerts: Traffic Info Messages – Global Query](https://prim.iledefrance-mobilites.fr/en/apis/idfm-disruptions_bulk)
 
 ## 🐛 Issues
 
