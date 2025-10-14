@@ -2,7 +2,6 @@
   <img src="logo.png" alt="IDFM GTFS-RT Bridge Logo" width="400"/>
 </div>
 
-<img src="https://img.shields.io/github/downloads/Jouca/IDFM_GTFS-RT/total?style=for-the-badge" style="text-align: center;"></img>
 <img src="https://img.shields.io/github/last-commit/Jouca/IDFM_GTFS-RT?display_timestamp=committer&style=for-the-badge&color=ffA500" style="text-align: center;"></img>
 <img src="https://img.shields.io/github/commit-activity/w/Jouca/IDFM_GTFS-RT?style=for-the-badge" style="text-align: center;"></img>
 <img src="https://img.shields.io/github/commits-since/Jouca/IDFM_GTFS-RT/latest?style=for-the-badge" style="text-align: center;"></img>
