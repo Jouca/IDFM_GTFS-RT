@@ -33,6 +33,5 @@ build/
 .vscode/
 
 .env
-/src_backup/
 gtfs.db
 gtfs.db

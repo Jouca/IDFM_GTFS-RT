@@ -27,24 +27,70 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.google.transit.realtime.GtfsRealtime;
 
+/**
+ * Generator for GTFS Realtime TripUpdate feeds from SIRI Lite data.
+ * 
+ * <p>This component is responsible for:
+ * <ul>
+ *   <li>Fetching real-time transit data from SIRI Lite API</li>
+ *   <li>Matching real-time data with theoretical GTFS trips</li>
+ *   <li>Generating GTFS-RT TripUpdate messages with stop time predictions</li>
+ *   <li>Detecting and marking canceled trips</li>
+ *   <li>Managing vehicle-to-trip associations across updates</li>
+ * </ul>
+ * 
+ * <p>The generator uses parallel processing to handle large volumes of real-time data
+ * efficiently and maintains state to track vehicle assignments across feed updates.
+ * 
+ * @author Jouca
+ * @since 1.0
+ * 
+ * @see SiriLiteFetcher
+ * @see TripFinder
+ */
 @Component
 public class TripUpdateGenerator {
+    /** Time zone for Paris, used for all time conversions */
     private static final ZoneId ZONE_ID = ZoneId.of("Europe/Paris");
+    
+    /** Width of the progress bar displayed during processing */
     private static final int PROGRESS_BAR_WIDTH = 40;
 
+    /** Flag to enable debug file output (configured via application properties) */
     @Value("${gtfsrt.debug.dump:false}")
     private boolean dumpDebugFiles;
 
-    // Cache pour les temps parsés
+    /** Cache for parsed ISO 8601 timestamps to avoid repeated parsing operations */
     private final Map<String, Long> parsedTimeCache = new ConcurrentHashMap<>();
+    
+    /** Current epoch second, initialized at the start of each feed generation */
     private long currentEpochSecond = 0;
 
-    // Trip state keyed by stable theoretical tripId to handle changing vehicle identifiers in SIRI Lite
+    /**
+     * Represents the current state of a trip in the real-time system.
+     * 
+     * <p>Trip state is keyed by stable theoretical trip ID to handle cases where
+     * the vehicle identifier changes between updates (common in SIRI Lite data).
+     * This allows the system to maintain continuity for the same trip even when
+     * the vehicle assignment changes.
+     */
     public static class TripState {
+        /** GTFS trip ID (theoretical/scheduled trip identifier) */
         String tripId;
-        String vehicleId; // last observed realtime vehicle identifier
-        long lastUpdate;   // epoch seconds of last update
+        
+        /** Current real-time vehicle identifier from SIRI Lite */
+        String vehicleId;
+        
+        /** Timestamp of last update (epoch seconds) */
+        long lastUpdate;
 
+        /**
+         * Constructs a new TripState.
+         * 
+         * @param tripId the GTFS trip identifier
+         * @param vehicleId the real-time vehicle identifier
+         * @param lastUpdate the timestamp of this update (epoch seconds)
+         */
         TripState(String tripId, String vehicleId, long lastUpdate) {
             this.tripId = tripId;
             this.vehicleId = vehicleId;
@@ -52,20 +98,56 @@ public class TripUpdateGenerator {
         }
     }
 
+    /**
+     * Global map of trip states indexed by trip ID.
+     * Thread-safe for concurrent updates during parallel processing.
+     */
     public static Map<String, TripState> tripStates = new ConcurrentHashMap<>();
-    // Optional reverse map to quickly know current trip for a vehicle (not strictly required but useful)
+    
+    /**
+     * Reverse mapping from vehicle ID to trip ID for quick lookups.
+     * Useful for determining which trip a vehicle is currently serving.
+     */
     public static Map<String, String> vehicleToTrip = new ConcurrentHashMap<>();
 
+    /**
+     * Internal record to maintain the original processing order of entities.
+     * Used to preserve the sorted order after parallel processing.
+     */
     private record IndexedEntity(int index, GtfsRealtime.FeedEntity entity) {}
 
+    /**
+     * Context object for collecting statistics during feed processing.
+     * Used to identify which trips are present in real-time data for each route/direction
+     * combination, enabling detection of canceled trips.
+     */
     static class ProcessingContext {
+        /** Statistics indexed by route ID and direction ID */
         final ConcurrentMap<String, ConcurrentMap<Integer, RealtimeDirectionStats>> statsByRouteDirection = new ConcurrentHashMap<>();
     }
 
+    /**
+     * Statistics for a specific route and direction in the real-time data.
+     * Tracks which trips have been observed and the latest start time,
+     * used to determine which theoretical trips should be marked as canceled.
+     */
     static class RealtimeDirectionStats {
+        /** Set of trip IDs observed in real-time data */
         final Set<String> tripIds = ConcurrentHashMap.newKeySet();
+        
+        /** Maximum start time observed for trips in this direction (seconds of day) */
         volatile long maxStartTime = Long.MIN_VALUE;
 
+        /**
+         * Adds a trip to the statistics.
+         * 
+         * @param meta the trip metadata containing trip ID and start time
+         */
+        /**
+         * Adds a trip to the statistics.
+         * 
+         * @param meta the trip metadata containing trip ID and start time
+         */
         void addTrip(TripFinder.TripMeta meta) {
             if (meta == null) {
                 return;
@@ -77,8 +159,23 @@ public class TripUpdateGenerator {
         }
     }
 
+    /**
+     * Main entry point for generating GTFS-RT feed.
+     * 
+     * <p>This method orchestrates the entire feed generation process:
+     * <ol>
+     *   <li>Fetches real-time SIRI Lite data from the transit agency API</li>
+     *   <li>Validates that required database tables exist</li>
+     *   <li>Creates a GTFS-RT FeedMessage with appropriate headers</li>
+     *   <li>Processes all real-time vehicle journeys in parallel</li>
+     *   <li>Identifies and marks canceled trips</li>
+     *   <li>Writes the completed feed to a Protocol Buffer file</li>
+     * </ol>
+     * 
+     * @throws Exception if data fetching, processing, or file I/O fails
+     */
     public void generateGTFSRT() throws Exception {
-        // Initialiser le cache de temps au début de chaque génération
+        // Initialize the time cache at the start of each generation
         parsedTimeCache.clear();
         currentEpochSecond = Instant.now().atZone(ZONE_ID).toEpochSecond();
         
@@ -111,6 +208,12 @@ public class TripUpdateGenerator {
         writeFeedToFile(feedMessage, "gtfs-rt-trips-idfm.pb");
     }
 
+    /**
+     * Saves SIRI Lite data to a JSON file for debugging purposes.
+     * 
+     * @param siriLiteData the JSON node containing SIRI Lite data
+     * @param filePath the output file path
+     */
     private void saveSiriLiteDataToFile(JsonNode siriLiteData, String filePath) {
         try (java.io.FileOutputStream outputStream = new java.io.FileOutputStream(filePath)) {
             outputStream.write(siriLiteData.toString().getBytes());
@@ -120,6 +223,23 @@ public class TripUpdateGenerator {
         }
     }
 
+    /**
+     * Processes SIRI Lite data and converts it to GTFS-RT TripUpdate entities.
+     * 
+     * <p>This method performs the following operations:
+     * <ul>
+     *   <li>Extracts EstimatedVehicleJourney entities from SIRI Lite data</li>
+     *   <li>Sorts entities by earliest departure/arrival time</li>
+     *   <li>Processes entities in parallel using a thread pool</li>
+     *   <li>Maintains original order in the output feed</li>
+     *   <li>Cleans up stale trip states (older than 15 minutes)</li>
+     *   <li>Optionally exports debug information</li>
+     * </ul>
+     * 
+     * @param siriLiteData the JSON data from SIRI Lite API
+     * @param feedMessage the GTFS-RT feed message builder to populate
+     * @param context processing context for tracking trip statistics
+     */
     private void processSiriLiteData(JsonNode siriLiteData, GtfsRealtime.FeedMessage.Builder feedMessage, ProcessingContext context) {
         List<JsonNode> entities = new ArrayList<>();
         siriLiteData.get("Siri").get("ServiceDelivery").get("EstimatedTimetableDelivery").get(0)
@@ -222,6 +342,22 @@ public class TripUpdateGenerator {
         }
     }
 
+    /**
+     * Appends canceled trip entities to the GTFS-RT feed.
+     * 
+     * <p>This method identifies theoretical trips that should be running based on the
+     * schedule but are missing from the real-time data. For each route and direction
+     * with real-time data, it:
+     * <ol>
+     *   <li>Retrieves all theoretical trips scheduled for today</li>
+     *   <li>Compares with trips observed in real-time data</li>
+     *   <li>Marks trips as CANCELED if they start before the latest observed trip
+     *       but are not present in real-time data</li>
+     * </ol>
+     * 
+     * @param feedMessage the GTFS-RT feed message builder to append canceled trips
+     * @param context processing context containing real-time trip statistics
+     */
     void appendCanceledTrips(GtfsRealtime.FeedMessage.Builder feedMessage, ProcessingContext context) {
         if (context == null || context.statsByRouteDirection.isEmpty()) {
             return;
@@ -279,6 +415,12 @@ public class TripUpdateGenerator {
         }
     }
 
+    /**
+     * Builds a GTFS-RT entity for a canceled trip.
+     * 
+     * @param meta the trip metadata from the theoretical schedule
+     * @return a FeedEntity with CANCELED schedule relationship
+     */
     private GtfsRealtime.FeedEntity buildCanceledEntity(TripFinder.TripMeta meta) {
         GtfsRealtime.FeedEntity.Builder entityBuilder = GtfsRealtime.FeedEntity.newBuilder();
         entityBuilder.setId(meta.tripId);
@@ -293,6 +435,25 @@ public class TripUpdateGenerator {
         return entityBuilder.build();
     }
 
+    /**
+     * Processes a single EstimatedVehicleJourney entity from SIRI Lite data.
+     * 
+     * <p>This method performs the core trip matching and entity building:
+     * <ol>
+     *   <li>Extracts line, vehicle, destination, and direction information</li>
+     *   <li>Builds a list of estimated calls (stop predictions)</li>
+     *   <li>Matches the real-time data to a theoretical GTFS trip</li>
+     *   <li>Updates trip state and vehicle associations</li>
+     *   <li>Builds a GTFS-RT TripUpdate entity with stop time predictions</li>
+     *   <li>Handles canceled trips and skipped stops</li>
+     * </ol>
+     * 
+     * @param entity the SIRI Lite EstimatedVehicleJourney JSON node
+     * @param index the original position in the input list (for ordering)
+     * @param entitiesTrips optional map for debug output
+     * @param context processing context for tracking statistics
+     * @return an IndexedEntity containing the built GTFS-RT entity, or null if processing fails
+     */
     private IndexedEntity processEntity(JsonNode entity, int index, Map<String, JsonNode> entitiesTrips, ProcessingContext context) {
         String lineId = "IDFM:" + entity.get("LineRef").get("value").asText().split(":")[3];
         String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
@@ -438,6 +599,24 @@ public class TripUpdateGenerator {
         return new IndexedEntity(index, entityBuilder.build());
     }
 
+    /**
+     * Determines the direction ID from SIRI Lite entity data.
+     * 
+     * <p>Attempts to extract direction from:
+     * <ul>
+     *   <li>DirectionRef field (parsing IDFM format codes)</li>
+     *   <li>DirectionName field (French and English labels)</li>
+     * </ul>
+     * 
+     * <p>Direction mapping:
+     * <ul>
+     *   <li>0: Outbound/Retour (R)</li>
+     *   <li>1: Inbound/Aller (A)</li>
+     * </ul>
+     * 
+     * @param entity the SIRI Lite EstimatedVehicleJourney JSON node
+     * @return 0 or 1 for valid directions, -1 if direction cannot be determined
+     */
     private int determineDirection(JsonNode entity) {
         if (entity.has("DirectionRef") && entity.get("DirectionRef").has("value")) {
             String directionValue = entity.get("DirectionRef").get("value").asText();
@@ -480,6 +659,14 @@ public class TripUpdateGenerator {
         return -1; // Invalid direction
     }
 
+    /**
+     * Validates that a stop point reference contains a valid integer ID.
+     * 
+     * <p>IDFM stop IDs should be numeric after the colon separators.
+     * 
+     * @param entity the JSON node containing StopPointRef
+     * @return true if the stop ID is a valid integer, false otherwise
+     */
     boolean checkStopIntegrity(JsonNode entity) {
         // Check if the stop is a integer
         if (entity.has("StopPointRef") && entity.get("StopPointRef").has("value")) {
@@ -490,16 +677,40 @@ public class TripUpdateGenerator {
         return false; // Default to false if the check fails
     }
 
-    // Removed unused determineDirection method; direction retrieved from TripFinder.getTripDirection(tripId)
-
+    /**
+     * Parses an ISO 8601 timestamp string and converts it to epoch seconds.
+     * 
+     * <p>Uses a cache to avoid repeated parsing of the same timestamps,
+     * which significantly improves performance when processing many entities
+     * with recurring time values.
+     * 
+     * @param timeStr the ISO 8601 timestamp string
+     * @return epoch seconds in the Paris timezone
+     */
     private long parseTime(String timeStr) {
-        // Utiliser le cache pour éviter de parser plusieurs fois le même timestamp
+        // Use the cache to avoid parsing the same timestamp multiple times
         return parsedTimeCache.computeIfAbsent(timeStr, ts -> {
             java.time.Instant instant = java.time.Instant.parse(ts);
             return instant.atZone(ZONE_ID).toEpochSecond();
         });
     }
 
+    /**
+     * Extracts and sorts estimated calls from a SIRI Lite vehicle journey.
+     * 
+     * <p>Estimated calls are sorted by time to ensure they appear in chronological
+     * order, which is required for GTFS-RT stop time updates. The method checks
+     * multiple time fields in order of preference:
+     * <ol>
+     *   <li>ExpectedArrivalTime</li>
+     *   <li>ExpectedDepartureTime</li>
+     *   <li>AimedArrivalTime</li>
+     *   <li>AimedDepartureTime</li>
+     * </ol>
+     * 
+     * @param entity the SIRI Lite EstimatedVehicleJourney JSON node
+     * @return a sorted list of EstimatedCall JSON nodes
+     */
     private List<JsonNode> getSortedEstimatedCalls(JsonNode entity) {
         List<JsonNode> estimatedCalls = new ArrayList<>();
         entity.get("EstimatedCalls").get("EstimatedCall").forEach(estimatedCalls::add);
@@ -515,6 +726,26 @@ public class TripUpdateGenerator {
                 .collect(Collectors.toList());
     }
 
+    /**
+     * Processes a single estimated call and adds it to the trip update.
+     * 
+     * <p>This method:
+     * <ul>
+     *   <li>Filters out past stop times (before current time)</li>
+     *   <li>Resolves stop IDs and finds the correct stop sequence</li>
+     *   <li>Extracts arrival and departure predictions</li>
+     *   <li>Handles skipped stops (marked as CANCELLED in SIRI Lite)</li>
+     * </ul>
+     * 
+     * <p><strong>Note:</strong> Stop time updates are added in the order processed.
+     * Sorting is performed once at the end of processing all EstimatedCalls to ensure
+     * chronological order in the GTFS-RT feed.
+     * 
+     * @param estimatedCall the SIRI Lite EstimatedCall JSON node
+     * @param tripUpdate the GTFS-RT TripUpdate builder to add stop time update
+     * @param tripId the GTFS trip ID for stop sequence lookup
+     * @param stopTimeUpdates list tracking which stop sequences have been processed
+     */
     private void processEstimatedCall(JsonNode estimatedCall, GtfsRealtime.TripUpdate.Builder tripUpdate, String tripId, List<String> stopTimeUpdates) {
         // Check if times are after or equal to the current time (utiliser le cache)
         if (estimatedCall.has("ExpectedArrivalTime")) {
@@ -583,10 +814,17 @@ public class TripUpdateGenerator {
                 stopTimeUpdate.clearArrival();
             }
         }
-    
-        // Note: Le tri sera fait une seule fois à la fin du traitement de toutes les EstimatedCalls
     }
 
+    /**
+     * Renders a progress bar in the console to track entity processing.
+     * 
+     * <p>Displays a text-based progress bar with percentage and count.
+     * The progress bar is updated in-place using carriage return.
+     * 
+     * @param current the number of entities processed so far
+     * @param total the total number of entities to process
+     */
     private void renderProgressBar(int current, int total) {
         if (total <= 0) {
             return;
@@ -611,6 +849,12 @@ public class TripUpdateGenerator {
         }
     }
 
+    /**
+     * Writes the completed GTFS-RT feed to a Protocol Buffer file.
+     * 
+     * @param feedMessage the GTFS-RT feed message builder containing all entities
+     * @param filePath the output file path for the .pb file
+     */
     private void writeFeedToFile(GtfsRealtime.FeedMessage.Builder feedMessage, String filePath) {
         try (java.io.FileOutputStream outputStream = new java.io.FileOutputStream(filePath)) {
             feedMessage.build().writeTo(outputStream);

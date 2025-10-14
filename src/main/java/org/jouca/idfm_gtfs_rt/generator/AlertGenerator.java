@@ -12,8 +12,47 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.google.transit.realtime.GtfsRealtime;
 
+/**
+ * Generator component responsible for creating GTFS-Realtime alert feeds from IDFM disruption data.
+ * 
+ * <p>This class fetches disruption information from the IDFM (Île-de-France Mobilités) API,
+ * processes the data, and generates a GTFS-Realtime compliant Protocol Buffer file containing
+ * service alerts. The alerts include information about service disruptions, construction work,
+ * and other incidents affecting transit services.</p>
+ * 
+ * <p>The generated alerts include:</p>
+ * <ul>
+ *   <li>Active time periods for each disruption</li>
+ *   <li>Affected routes and stops (informed entities)</li>
+ *   <li>Cause and effect of the disruption</li>
+ *   <li>Severity level and descriptive text</li>
+ * </ul>
+ * 
+ * @author Jouca
+ * @since 1.0
+ */
 @Component
 public class AlertGenerator {
+    
+    /**
+     * Generates a GTFS-Realtime alert feed from IDFM disruption data.
+     * 
+     * <p>This method performs the following operations:</p>
+     * <ol>
+     *   <li>Fetches alert data from the IDFM API using {@link AlertFetcher}</li>
+     *   <li>Parses disruptions and affected lines from the JSON response</li>
+     *   <li>Creates GTFS-Realtime alert entities for each disruption and application period</li>
+     *   <li>Maps IDFM-specific fields (cause, severity, effect) to GTFS-Realtime enums</li>
+     *   <li>Associates alerts with affected routes and stops</li>
+     *   <li>Writes the complete feed to a Protocol Buffer file (gtfs-rt-alerts-idfm.pb)</li>
+     * </ol>
+     * 
+     * <p>The method creates separate alert entities for each combination of disruption and
+     * application period to ensure proper time-based filtering by consumers.</p>
+     * 
+     * @throws Exception if there is an error fetching alert data, parsing JSON, or writing the output file
+     * @see AlertFetcher#fetchAlertData()
+     */
     public void generateAlert() throws Exception {
         System.out.println("Fetching alerts from online data...");
         JsonNode siriData = AlertFetcher.fetchAlertData();
@@ -142,6 +181,16 @@ public class AlertGenerator {
         System.out.println("Alerts generated successfully!");
     }
 
+    /**
+     * Converts a date-time string to Unix epoch time (seconds since January 1, 1970).
+     * 
+     * <p>The input string must be in the format "yyyyMMdd'T'HHmmss" (e.g., "20231225T143000").
+     * The conversion is performed using the Europe/Paris timezone to match IDFM's local time.</p>
+     * 
+     * @param dateTimeStr the date-time string to convert, formatted as "yyyyMMdd'T'HHmmss"
+     * @return the Unix epoch timestamp in seconds
+     * @throws java.time.format.DateTimeParseException if the date-time string cannot be parsed
+     */
     private long convertToEpoch(String dateTimeStr) {
         // Update the formatter to match the date string format
         java.time.format.DateTimeFormatter formatter = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss");
@@ -150,6 +199,27 @@ public class AlertGenerator {
         return dateTime.atZone(zoneId).toEpochSecond();
     }
 
+    /**
+     * Parses disruption data from the IDFM API response into a structured map.
+     * 
+     * <p>Each disruption is converted into a map containing the following fields:</p>
+     * <ul>
+     *   <li><b>id</b>: Unique identifier for the disruption</li>
+     *   <li><b>applicationPeriods</b>: Array of time periods when the disruption is active</li>
+     *   <li><b>lastUpdate</b>: Timestamp of the last update to this disruption</li>
+     *   <li><b>cause</b>: Cause of the disruption (e.g., "TRAVAUX", "PERTURBATION")</li>
+     *   <li><b>severity</b>: Severity level (e.g., "BLOQUANTE", "PERTURBEE")</li>
+     *   <li><b>tags</b>: Additional classification tags</li>
+     *   <li><b>title</b>: Short title/headline for the alert</li>
+     *   <li><b>message</b>: Detailed description of the disruption</li>
+     * </ul>
+     * 
+     * <p>Disruptions missing mandatory fields (id or applicationPeriods) are skipped
+     * and a warning is logged to stderr.</p>
+     * 
+     * @param disruptions JSON array node containing disruption objects from the IDFM API
+     * @return a map where keys are disruption IDs and values are maps containing disruption details
+     */
     public Map<String, Object> parseDisruptions(JsonNode disruptions) {
         Map<String, Object> alertDict = new HashMap<>();
     
@@ -185,6 +255,25 @@ public class AlertGenerator {
         return alertDict;
     }
 
+    /**
+     * Parses transit line data from the IDFM API response into a structured map.
+     * 
+     * <p>Each line is converted into a map containing the following fields:</p>
+     * <ul>
+     *   <li><b>id</b>: Unique identifier for the transit line</li>
+     *   <li><b>name</b>: Full name of the line</li>
+     *   <li><b>shortName</b>: Short name or number of the line (e.g., "1", "A", "RER A")</li>
+     *   <li><b>mode</b>: Transit mode (e.g., "metro", "bus", "rer", "tramway")</li>
+     *   <li><b>networkId</b>: Identifier of the network this line belongs to</li>
+     *   <li><b>impactedObjects</b>: Array of objects (stops, routes, etc.) impacted by disruptions on this line</li>
+     * </ul>
+     * 
+     * <p>The impactedObjects array contains references to disruption IDs, allowing the generator
+     * to create informed entity selectors that specify which routes and stops are affected by each alert.</p>
+     * 
+     * @param lines JSON array node containing line objects from the IDFM API
+     * @return a map where keys are line IDs and values are maps containing line details and impacted objects
+     */
     public Map<String, Object> parseLines(JsonNode lines) {
         Map<String, Object> linesDict = new HashMap<>();
 

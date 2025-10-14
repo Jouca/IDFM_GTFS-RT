@@ -21,16 +21,66 @@ import java.util.stream.Collectors;
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.jouca.idfm_gtfs_rt.records.EstimatedCall;
 
+/**
+ * TripFinder is responsible for matching real-time transit data to scheduled GTFS trips.
+ * 
+ * <p>This class provides various methods to:
+ * <ul>
+ *   <li>Find trip IDs based on real-time estimated calls and scheduled data</li>
+ *   <li>Resolve stop IDs from various identifiers (codes, extensions)</li>
+ *   <li>Retrieve trip metadata, stop sequences, and scheduled times</li>
+ *   <li>Handle midnight-crossing trips (trips that continue past midnight on the same service day)</li>
+ * </ul>
+ * 
+ * <p>The class uses a SQLite database connection pool for efficient database access and implements
+ * various caching strategies to minimize database queries during processing.
+ * 
+ * <p><b>Service Day Handling:</b> GTFS allows times >= 24:00:00 to represent trips continuing past
+ * midnight on the same service day. This class determines the appropriate service day by considering:
+ * <ul>
+ *   <li>The program start time</li>
+ *   <li>Whether the current time is in early morning hours (before 3 AM)</li>
+ *   <li>The relationship between calendar day and service day</li>
+ * </ul>
+ * 
+ * @author Jouca
+ * @since 1.0
+ * 
+ * @see EstimatedCall
+ * @see TripMeta
+ */
 public class TripFinder {
+    /** JDBC connection URL for the SQLite GTFS database */
     private static final String DB_URL = "jdbc:sqlite:./gtfs.db";
+    
+    /** Connection pool for database access with optimized settings for concurrent operations */
     private static final BasicDataSource dataSource = new BasicDataSource();
     
-    // Store the program start time to determine service day consistently
-    // This ensures that a trip running at 00:30 AM is matched against the previous day's service
-    // if the program started before midnight
+    /**
+     * Stores the program start time to determine service day consistently.
+     * This ensures that a trip running at 00:30 AM is matched against the previous day's service
+     * if the program started before midnight.
+     */
     private static final ZonedDateTime PROGRAM_START_TIME = ZonedDateTime.now(ZoneId.of("Europe/Paris"));
-    private static final int MIDNIGHT_CROSSING_THRESHOLD_HOURS = 3; // Consider times before 3 AM as potentially previous day's service
+    
+    /**
+     * Threshold for considering times as potentially belonging to the previous day's service.
+     * Times before 3 AM are considered as potentially part of the previous day's service for
+     * midnight-crossing trips.
+     */
+    private static final int MIDNIGHT_CROSSING_THRESHOLD_HOURS = 3;
 
+    /**
+     * Static initializer block that configures the database connection pool.
+     * Sets up connection pooling parameters and SQLite pragmas for optimal performance:
+     * <ul>
+     *   <li>WAL (Write-Ahead Logging) mode for better concurrency</li>
+     *   <li>NORMAL synchronous mode for better performance with minimal safety trade-off</li>
+     *   <li>Memory-based temporary storage</li>
+     *   <li>Large cache size for frequently accessed data</li>
+     *   <li>Memory-mapped I/O for faster reads</li>
+     * </ul>
+     */
     static {
         dataSource.setUrl(DB_URL);
         dataSource.setMinIdle(12); // Increase min idle connections
@@ -50,15 +100,41 @@ public class TripFinder {
     }
 
     /**
-     * Lightweight container for trip metadata needed to build GTFS-RT TripDescriptor
+     * Lightweight container for trip metadata needed to build GTFS-RT TripDescriptor.
+     * 
+     * <p>This class holds essential information about a scheduled trip that is needed
+     * for creating GTFS Realtime trip descriptors and for matching real-time data to
+     * scheduled trips.
+     * 
+     * @see <a href="https://gtfs.org/realtime/reference/#message-tripdescriptor">GTFS Realtime TripDescriptor</a>
      */
     public static class TripMeta {
+        /** The unique identifier for this trip from the GTFS trips.txt file */
         public final String tripId;
+        
+        /** The route identifier this trip belongs to from the GTFS routes.txt file */
         public final String routeId;
+        
+        /** 
+         * The direction of travel for this trip (typically 0 or 1).
+         * Convention is usually 0 for outbound and 1 for inbound, but varies by agency.
+         */
         public final int directionId;
-        /** first stop time in seconds since start of service day (0-86399) */
+        
+        /** 
+         * First stop time in seconds since start of service day (0-86399 for same-day trips,
+         * may be >= 86400 for trips continuing past midnight on the same service day).
+         */
         public final int firstTimeSecOfDay;
 
+        /**
+         * Constructs a new TripMeta instance.
+         * 
+         * @param tripId The unique trip identifier
+         * @param routeId The route identifier
+         * @param directionId The direction of travel (0 or 1)
+         * @param firstTimeSecOfDay First stop time in seconds since service day start
+         */
         public TripMeta(String tripId, String routeId, int directionId, int firstTimeSecOfDay) {
             this.tripId = tripId;
             this.routeId = routeId;
@@ -100,11 +176,34 @@ public class TripFinder {
     }
 
     /**
-     * Recherche le trip_id correspondant à une séquence d'EstimatedCall, en essayant de matcher les horaires et arrêts sur le plus proche possible.
-     * Cette version cherche le trip_id dont les horaires théoriques sont les plus proches des horaires temps réel (EstimatedCall).
-     * On considère le trip avec la somme des différences horaires la plus faible.
-     * Ajout d'une fenêtre de recherche progressive sur les horaires (de -1/+1 à -5/+30 minutes).
-     * Retourne le trip_id le plus proche, ou null si aucun ne correspond.
+     * Finds the trip ID that best matches a sequence of real-time estimated calls.
+     * 
+     * <p>This method attempts to match real-time stop data (EstimatedCalls) to scheduled trips
+     * by comparing theoretical stop times with real-time estimates. It uses a progressive time
+     * window approach, starting with strict matching (-1/+1 minutes) and gradually expanding
+     * to more lenient windows (up to -3/+30 minutes) until a match is found.
+     * 
+     * <p><b>Matching Algorithm:</b>
+     * <ol>
+     *   <li>Converts real-time timestamps to seconds since service day start</li>
+     *   <li>Queries the database for candidate trips matching the route, service day, direction, and destination</li>
+     *   <li>For each time window, calculates the total time difference for all stops</li>
+     *   <li>Returns the trip with the smallest total time difference</li>
+     * </ol>
+     * 
+     * <p><b>Time Windows (in minutes):</b> [-1,+1], [-2,+2], [-3,+5], [-3,+10], [-3,+20], [-3,+30]
+     * 
+     * <p>Results are cached to avoid repeated heavy database queries for identical inputs.
+     * 
+     * @param routeId The GTFS route ID to search within
+     * @param estimatedCalls List of real-time stop estimates with stop IDs and timestamps
+     * @param isArrivalTime If true, match on arrival times; if false, match on departure times
+     * @param destinationId The final stop ID that the trip must reach
+     * @param journeyNote Optional trip headsign filter (4 characters), or null
+     * @param directionId Optional direction filter (0 or 1), or null to match both directions
+     * @return The matching trip ID, or null if no suitable match is found
+     * @throws SQLException If a database error occurs
+     * @throws IllegalArgumentException If routeId or estimatedCalls is null or empty
      */
     public static String findTripIdFromEstimatedCalls(
         String routeId,
@@ -345,16 +444,40 @@ public class TripFinder {
         return null;
     }
 
-    // Classe utilitaire pour trier les matches
+    /**
+     * Utility class for sorting trip matches based on time difference.
+     * Used internally by {@link #findTripIdFromEstimatedCalls} to rank potential matches.
+     */
     private static class TripMatch {
+        /** The trip identifier */
         String tripId;
+        
+        /** Total time difference in seconds between scheduled and real-time stops */
         long totalDiff;
+        
+        /**
+         * Constructs a new TripMatch.
+         * 
+         * @param tripId The trip identifier
+         * @param totalDiff Total time difference in seconds
+         */
         TripMatch(String tripId, long totalDiff) {
             this.tripId = tripId;
             this.totalDiff = totalDiff;
         }
     }
 
+    /**
+     * Retrieves all stop times for a given trip in sequential order.
+     * 
+     * <p>Returns a list of strings where each string contains:
+     * stop_id, arrival_timestamp, departure_timestamp, and stop_sequence (comma-separated).
+     * 
+     * <p>Results are cached to avoid repeated database queries for the same trip.
+     * 
+     * @param tripId The trip identifier to retrieve stop times for
+     * @return List of comma-separated stop time data (format: "stopId,arrivalTime,departureTime,stopSequence")
+     */
     public static List<String> getAllStopTimesFromTrip(String tripId) {
         // Try cache first
         List<String> cached = allStopTimesCache.get(tripId);
@@ -387,6 +510,20 @@ public class TripFinder {
         return results;
     }
 
+    /**
+     * Finds the stop sequence number for a given stop within a trip.
+     * 
+     * <p>This method retrieves the stop sequence for a specific stop on a trip,
+     * excluding any sequences that are already present in the stopUpdates list.
+     * This is useful when building incremental trip updates to avoid duplicate entries.
+     * 
+     * <p>Results are cached to improve performance for repeated queries.
+     * 
+     * @param tripId The trip identifier
+     * @param stopId The stop identifier
+     * @param stopUpdates List of stop sequence numbers to exclude from results
+     * @return The stop sequence number as a string, or null if not found
+     */
     public static String findStopSequence(String tripId, String stopId, List<String> stopUpdates) {
         // Use cached mapping tripId -> (stopId -> list of sequences) if available
         Map<String, List<String>> seqMap = stopSequencesCache.get(tripId);
@@ -420,6 +557,17 @@ public class TripFinder {
         return null;
     }
 
+    /**
+     * Finds a child stop ID from the stop_extensions table for a given parent stop and trip.
+     * 
+     * <p>Some GTFS feeds have hierarchical stop structures where a parent stop (like a station)
+     * has multiple child stops (like platforms). This method finds the specific child stop
+     * that is used in a particular trip.
+     * 
+     * @param stopId The parent stop identifier (object_code in stop_extensions)
+     * @param tripId The trip identifier to search within
+     * @return The child stop ID (object_id), or null if not found
+     */
     public static String findStopChildrenByTrip(String stopId, String tripId) {
         String childStopId = null;
         String query = """
@@ -447,6 +595,14 @@ public class TripFinder {
         return childStopId;
     }
 
+    /**
+     * Checks if the stop_extensions table exists in the GTFS database.
+     * 
+     * <p>The stop_extensions table is a custom extension used by some GTFS feeds
+     * to store additional stop metadata, particularly for hierarchical stop structures.
+     * 
+     * @return true if the stop_extensions table exists, false otherwise
+     */
     public static boolean checkIfStopExtensionsTableExists() {
         String query = "SELECT name FROM sqlite_master WHERE type='table' AND name='stop_extensions';";
         try (Connection conn = dataSource.getConnection();
@@ -460,6 +616,16 @@ public class TripFinder {
         }
     }
 
+    /**
+     * Finds a stop ID from the GTFS stops table using a stop code.
+     * 
+     * <p>This method searches for stops where the stop_id contains the given stop code
+     * as a suffix (after a colon separator). This matches the common pattern where
+     * stop IDs are formatted as "prefix:code".
+     * 
+     * @param stopCode The stop code to search for
+     * @return The full stop ID, or null if not found
+     */
     public static String findStopIdFromCode(String stopCode) {
         String query = "SELECT stop_id FROM stops WHERE stop_id LIKE ?;";
         try (Connection conn = dataSource.getConnection();
@@ -478,6 +644,16 @@ public class TripFinder {
         return null;
     }
 
+    /**
+     * Finds a stop ID from the stop_extensions table using a stop extension code.
+     * 
+     * <p>This method searches the stop_extensions table for entries matching the given
+     * stop extension code in the 'netex_zder_quay' object system. This is specific to
+     * certain GTFS feeds that use NeTEx extensions.
+     * 
+     * @param stopExtension The stop extension code to search for
+     * @return The object ID (stop ID), or null if not found
+     */
     public static String findStopIdFromStopExtension(String stopExtension) {
         String query = "SELECT object_id FROM stop_extensions WHERE object_code LIKE ? AND object_system LIKE 'netex_zder_quay' LIMIT 1;";
         try (Connection conn = dataSource.getConnection();
@@ -496,17 +672,34 @@ public class TripFinder {
         return null;
     }
 
+    /** Marker used in cache to distinguish between "not found" and "not cached" */
     private static final String EMPTY_MARKER = "__NULL__";
+    
+    /** 
+     * Cache for stop code to stop ID mappings.
+     * Maps stop codes to their resolved stop IDs to avoid repeated database queries.
+     */
     public static final Map<String, String> stopCodeCache = new ConcurrentHashMap<>();
 
-    // Caches to reduce DB access during a processing run
+    /** Cache for trip metadata (tripId -> TripMeta) to reduce database access */
     private static final ConcurrentHashMap<String, TripMeta> tripMetaCache = new ConcurrentHashMap<>();
+    
+    /** Cache for stop times by trip (tripId -> list of stop time data strings) */
     private static final ConcurrentHashMap<String, List<String>> allStopTimesCache = new ConcurrentHashMap<>();
-    /** tripId -> (stopId -> list of sequences as strings) */
+    
+    /** 
+     * Cache for stop sequences by trip and stop.
+     * Maps tripId -> (stopId -> list of sequences as strings).
+     */
     private static final ConcurrentHashMap<String, Map<String, List<String>>> stopSequencesCache = new ConcurrentHashMap<>();
     
-    // Simple LRU cache for findTripIdFromEstimatedCalls results to avoid repeated heavy DB queries
+    /** Maximum size of the LRU cache for trip finding results */
     private static final int FIND_TRIP_CACHE_SIZE = 5000;
+    
+    /** 
+     * LRU cache for findTripIdFromEstimatedCalls results to avoid repeated heavy DB queries.
+     * Uses an access-order LinkedHashMap with automatic eviction of eldest entries.
+     */
     private static final java.util.Map<String, String> findTripCache = java.util.Collections.synchronizedMap(
         new java.util.LinkedHashMap<String, String>(16, 0.75f, true) {
             @Override
@@ -516,7 +709,22 @@ public class TripFinder {
         }
     );
 
-
+    /**
+     * Resolves a stop code to its full stop ID using multiple lookup strategies.
+     * 
+     * <p>This method first checks the cache, then attempts to find the stop ID:
+     * <ol>
+     *   <li>By searching the stops table for a matching stop code</li>
+     *   <li>By searching the stop_extensions table if the first method fails</li>
+     * </ol>
+     * 
+     * <p>Results are cached to improve performance for repeated lookups.
+     * 
+     * @param stopCode The stop code to resolve
+     * @return The resolved stop ID, or null if not found
+     * @see #findStopIdFromCode(String)
+     * @see #findStopIdFromStopExtension(String)
+     */
     public static String resolveStopId(String stopCode) {
         String cached = stopCodeCache.get(stopCode);
         if (cached != null) {
@@ -533,7 +741,19 @@ public class TripFinder {
     }
 
     /**
-     * Retourne l'heure d'arrivée théorique (epoch seconds) pour un stop donné dans stopTimes.
+     * Retrieves the scheduled arrival time for a specific stop in a trip.
+     * 
+     * <p>Searches through the provided stop times list for a matching stop ID and sequence,
+     * then converts the scheduled arrival time to epoch seconds.
+     * 
+     * <p><b>Note:</b> The arrival time may be >= 86400 seconds for trips that continue
+     * past midnight on the same service day (e.g., 24:30:00 = 88200 seconds).
+     * 
+     * @param stopTimes List of stop time data (format: "stopId,arrivalTime,departureTime,stopSequence")
+     * @param stopId The stop identifier to find
+     * @param stopSequence The stop sequence number to match
+     * @param zoneId The timezone for time calculations
+     * @return The scheduled arrival time as epoch seconds, or null if not found
      */
     public static Long getScheduledArrivalTime(List<String> stopTimes, String stopId, String stopSequence, ZoneId zoneId) {
         for (String stopTime : stopTimes) {
@@ -555,7 +775,19 @@ public class TripFinder {
     }
 
     /**
-     * Retourne l'heure de départ théorique (epoch seconds) pour un stop donné dans stopTimes.
+     * Retrieves the scheduled departure time for a specific stop in a trip.
+     * 
+     * <p>Searches through the provided stop times list for a matching stop ID and sequence,
+     * then converts the scheduled departure time to epoch seconds.
+     * 
+     * <p><b>Note:</b> The departure time may be >= 86400 seconds for trips that continue
+     * past midnight on the same service day (e.g., 25:15:00 = 90900 seconds).
+     * 
+     * @param stopTimes List of stop time data (format: "stopId,arrivalTime,departureTime,stopSequence")
+     * @param stopId The stop identifier to find
+     * @param stopSequence The stop sequence number to match
+     * @param zoneId The timezone for time calculations
+     * @return The scheduled departure time as epoch seconds, or null if not found
      */
     public static Long getScheduledDepartureTime(List<String> stopTimes, String stopId, String stopSequence, ZoneId zoneId) {
         for (String stopTime : stopTimes) {
@@ -576,6 +808,15 @@ public class TripFinder {
         return null;
     }
 
+    /**
+     * Retrieves the direction ID for a given trip.
+     * 
+     * <p>First checks the cache for trip metadata, then queries the database if needed.
+     * Direction ID is typically 0 for outbound and 1 for inbound, but conventions vary by agency.
+     * 
+     * @param tripId The trip identifier
+     * @return The direction ID as a string, or null if not found
+     */
     public static String getTripDirection(String tripId) {
         TripMeta cached = tripMetaCache.get(tripId);
         if (cached != null) return String.valueOf(cached.directionId);
@@ -602,9 +843,21 @@ public class TripFinder {
     }
 
     /**
-     * Returns all trips (with minimal metadata) that are active today for the given route ids.
-     * This uses calendar and calendar_dates to determine service validity and aggregates the
-     * earliest time (arrival or departure) for each trip to allow filtering by time window.
+     * Returns all trips with minimal metadata that are active today for the given route IDs.
+     * 
+     * <p>This method uses the GTFS calendar and calendar_dates tables to determine which
+     * trips are running on the current service day. It includes:
+     * <ul>
+     *   <li>Trips from regular service patterns (calendar table)</li>
+     *   <li>Trips added for today (calendar_dates with exception_type = 1)</li>
+     *   <li>Excludes trips removed for today (calendar_dates with exception_type = 2)</li>
+     * </ul>
+     * 
+     * <p>Each trip includes the first stop time (earliest arrival or departure) which can
+     * be used for filtering trips by time window.
+     * 
+     * @param routeIds List of route identifiers to query
+     * @return List of TripMeta objects containing trip ID, route ID, direction, and first stop time
      */
     public static List<TripMeta> getActiveTripsForRoutesToday(List<String> routeIds) {
         if (routeIds == null || routeIds.isEmpty()) return java.util.Collections.emptyList();
@@ -675,7 +928,17 @@ public class TripFinder {
     }
 
     /**
-     * Returns TripMeta for a given trip id, including routeId, directionId and the trip's first time of day.
+     * Returns trip metadata for a given trip ID.
+     * 
+     * <p>Retrieves essential trip information including route ID, direction ID, and the
+     * first stop time of the trip. This metadata is useful for building GTFS Realtime
+     * trip descriptors and for trip matching operations.
+     * 
+     * <p>Results are cached to improve performance for repeated queries.
+     * 
+     * @param tripId The trip identifier to retrieve metadata for
+     * @return TripMeta object containing trip metadata, or null if the trip is not found
+     * @see TripMeta
      */
     public static TripMeta getTripMeta(String tripId) {
         TripMeta cached = tripMetaCache.get(tripId);
