@@ -21,8 +21,6 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 
 #### GTFS-RT Alerts : http://gtfsidfm.clarifygdps.com/gtfs-rt-alerts-idfm
 
-> **You can also view a preview of the IDFM GTFS-RT feed using my own [MOTIS](https://github.com/motis-project/motis) instance here:** http://motis.clarifygdps.com/
-
 ## ✨ Features
 
 - 🚆 **Real-time Transit Data**: Automatic fetching and processing of IDFM transit data
