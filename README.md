@@ -52,7 +52,24 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 
 ## 🚀 Quick Start
 
-### Using Docker (Recommended)
+### Using Pre-built Docker Image from GitHub Container Registry (Recommended)
+
+1. **Create a `.env` file from the example**
+
+    You need to create a `.env` file based on the provided `.env.example`:
+
+2. **Run the container**
+   ```bash
+   docker run -d \
+     --name gtfs_app \
+     --env-file .env \
+     -p 8507:8507 \
+     ghcr.io/jouca/idfm_gtfs-rt:latest
+   ```
+
+> The application will be available at `http://localhost:8507`
+
+### Using Docker Compose (Build from Source)
 
 1. **Clone the repository**
    ```bash
