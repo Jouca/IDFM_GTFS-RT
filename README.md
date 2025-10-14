@@ -73,8 +73,8 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/Jouca/idfm_gtfs-rt.git
-   cd idfm_gtfs-rt
+   git clone https://github.com/Jouca/IDFM_GTFS-RT.git
+   cd IDFM_GTFS-RT
    ```
 
 2. **Create environment file**
@@ -94,8 +94,8 @@ The application will be available at `http://localhost:8507`
 
 1. **Clone and build**
    ```bash
-   git clone https://github.com/Jouca/idfm_gtfs-rt.git
-   cd idfm_gtfs-rt
+   git clone https://github.com/Jouca/IDFM_GTFS-RT.git
+   cd IDFM_GTFS-RT
    mvn clean package
    ```
 
@@ -282,7 +282,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🐛 Issues
 
-If you encounter any issues, please file a bug report on the [GitHub Issues](https://github.com/Jouca/idfm_gtfs-rt/issues) page.
+If you encounter any issues, please file a bug report on the [GitHub Issues](https://github.com/Jouca/IDFM_GTFS-RT/issues) page.
 
 ---
 
