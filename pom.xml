@@ -10,7 +10,7 @@
 	</parent>
 	<groupId>org.jouca</groupId>
 	<artifactId>idfm_gtfs_rt</artifactId>
-	<version>1.0.0</version>
+	<version>1.0.1</version>
 	<name>idfm_gtfs_rt</name>
 	<description>IDFM GTFS RT Project</description>
 	<url/>

@@ -31,4 +31,4 @@ COPY src ./src
 RUN mvn clean package -DskipTests
 
 # Run the application
-CMD ["java", "-jar", "target/idfm_gtfs_rt-0.0.1-SNAPSHOT.jar"]
+CMD ["java", "-jar", "target/idfm_gtfs_rt-1.0.1.jar"]
