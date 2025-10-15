@@ -204,6 +204,7 @@ The application is containerized for easy deployment:
 - **CPU Limit**: 8 cores
 - **Port**: 8507
 - **Network**: Isolated bridge network
+- **Auto-restart**: The container automatically restarts every day at 3:00 AM to ensure optimal performance and resource management
 
 ### Docker Commands
 

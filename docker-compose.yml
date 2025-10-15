@@ -4,6 +4,7 @@ services:
   app:
     build: .
     container_name: gtfs_app
+    restart: unless-stopped
     mem_limit: 12g
     cpus: 8
     env_file:

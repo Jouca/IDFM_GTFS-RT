@@ -11,6 +11,8 @@ import org.jouca.idfm_gtfs_rt.fetchers.GTFSFetcher;
 import org.jouca.idfm_gtfs_rt.generator.AlertGenerator;
 import org.jouca.idfm_gtfs_rt.generator.TripUpdateGenerator;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.SpringApplication;
+import org.springframework.context.ApplicationContext;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -51,6 +53,12 @@ public class ScheduledTasks {
      */
     @Autowired
     private AlertGenerator alertGenerator;
+
+    /**
+     * Spring application context for graceful shutdown.
+     */
+    @Autowired
+    private ApplicationContext applicationContext;
 
     /**
      * Environment configuration loader for accessing environment variables and configuration settings.
@@ -194,5 +202,29 @@ public class ScheduledTasks {
         } else {
             System.out.println("[Trips] GTFS download in progress, skipping GTFS-RT generation.");
         }
+    }
+
+    /**
+     * Scheduled task that restarts the application at 3 AM every day.
+     * <p>
+     * This method is executed at 3:00 AM according to the cron schedule.
+     * It performs a graceful shutdown of the Spring application, which will
+     * cause the Docker container to exit. When combined with Docker's restart
+     * policy (restart: unless-stopped or restart: always), the container will
+     * automatically restart, ensuring a fresh start of the application.
+     * <p>
+     * This daily restart helps to:
+     * <ul>
+     *   <li>Clear any memory leaks or accumulated resources</li>
+     *   <li>Ensure a fresh state of the application</li>
+     *   <li>Apply any configuration changes that require a restart</li>
+     * </ul>
+     * <p>
+     * <strong>Schedule:</strong> Daily at 3:00 AM
+     */
+    @Scheduled(cron = "0 0 3 * * ?") // Every day at 3:00 AM
+    public void restartApplication() {
+        System.out.println("[Restart] Scheduled restart at 3:00 AM - Shutting down application...");
+        SpringApplication.exit(applicationContext, () -> 0);
     }
 }
