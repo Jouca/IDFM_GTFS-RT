@@ -471,7 +471,7 @@ public class TripUpdateGenerator {
         }
 
         // Specific cases with RATP lines where JourneyNote is detailed
-        if (vehicleId.matches("(?<=RATP\\.)[A-Z0-9]+(?=:)")) { // RATP RER vehicles
+        if (vehicleId.matches("(?<=RATP\\.)[A-Z0-9]+(?=:|$)")) { // RATP RER vehicles
             java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("(?<=RATP\\.)[A-Z0-9]+(?=:)").matcher(vehicleId);
             if (matcher.find()) {
                 journeyNote = matcher.group();
