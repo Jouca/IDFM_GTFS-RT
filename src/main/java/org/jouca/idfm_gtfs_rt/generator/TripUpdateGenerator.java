@@ -246,93 +246,164 @@ public class TripUpdateGenerator {
      * @param context processing context for tracking trip statistics
      */
     private void processSiriLiteData(JsonNode siriLiteData, GtfsRealtime.FeedMessage.Builder feedMessage, ProcessingContext context) {
-        List<JsonNode> entities = new ArrayList<>();
-        siriLiteData.get("Siri").get("ServiceDelivery").get("EstimatedTimetableDelivery").get(0)
-                .get("EstimatedJourneyVersionFrame").get(0).get("EstimatedVehicleJourney").forEach(entities::add);
-
+        List<JsonNode> entities = extractEntitiesFromSiriLite(siriLiteData);
         System.out.println(entities.size() + " entities found in SiriLite data.");
     
-        // Sort entities by the earliest departure and arrival times
-        entities.sort(Comparator.comparingLong(entity -> {
-            JsonNode estimatedCalls = entity.get("EstimatedCalls").get("EstimatedCall");
-            if (estimatedCalls != null && estimatedCalls.size() > 0) {
-                JsonNode firstCall = estimatedCalls.get(0);
-                String time = null;
-                if (firstCall.has("ExpectedDepartureTime")) {
-                    time = firstCall.get("ExpectedDepartureTime").asText();
-                } else if (firstCall.has("ExpectedArrivalTime")) {
-                    time = firstCall.get("ExpectedArrivalTime").asText();
-                } else if (firstCall.has("AimedDepartureTime")) {
-                    time = firstCall.get("AimedDepartureTime").asText();
-                } else if (firstCall.has("AimedArrivalTime")) {
-                    time = firstCall.get("AimedArrivalTime").asText();
-                }
-                if (time != null) {
-                    return Instant.parse(time)
-                        .atZone(ZONE_ID)
-                        .toLocalDateTime()
-                        .atZone(ZONE_ID)
-                        .toEpochSecond();
-                }
-            }
-            return Long.MAX_VALUE; // Default to max value if no time is available
-        }));
-
+        sortEntitiesByTime(entities);
         System.out.println("Processing " + entities.size() + " entities...");
 
         Map<String, JsonNode> entitiesTrips = dumpDebugFiles ? new ConcurrentHashMap<>() : null;
+        List<IndexedEntity> builtEntities = processEntitiesInParallel(entities, entitiesTrips, context);
+        
+        addEntitiesToFeed(builtEntities, feedMessage);
+        cleanupStaleTripStates();
+        
+        System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
+        exportDebugData(entitiesTrips);
+    }
 
+    /**
+     * Extracts EstimatedVehicleJourney entities from SIRI Lite data.
+     * 
+     * @param siriLiteData the JSON data from SIRI Lite API
+     * @return list of extracted entities
+     */
+    private List<JsonNode> extractEntitiesFromSiriLite(JsonNode siriLiteData) {
+        List<JsonNode> entities = new ArrayList<>();
+        siriLiteData.get("Siri").get("ServiceDelivery").get("EstimatedTimetableDelivery").get(0)
+                .get("EstimatedJourneyVersionFrame").get(0).get("EstimatedVehicleJourney").forEach(entities::add);
+        return entities;
+    }
+
+    /**
+     * Sorts entities by their earliest departure or arrival time.
+     * 
+     * @param entities the list of entities to sort (modified in place)
+     */
+    private void sortEntitiesByTime(List<JsonNode> entities) {
+        entities.sort(Comparator.comparingLong(this::extractFirstCallTime));
+    }
+
+    /**
+     * Extracts the earliest time from an entity's first estimated call.
+     * 
+     * @param entity the SIRI Lite entity
+     * @return epoch seconds of the earliest time, or Long.MAX_VALUE if no time available
+     */
+    private long extractFirstCallTime(JsonNode entity) {
+        JsonNode estimatedCalls = entity.get("EstimatedCalls").get("EstimatedCall");
+        if (estimatedCalls != null && estimatedCalls.size() > 0) {
+            JsonNode firstCall = estimatedCalls.get(0);
+            String time = null;
+            if (firstCall.has("ExpectedDepartureTime")) {
+                time = firstCall.get("ExpectedDepartureTime").asText();
+            } else if (firstCall.has("ExpectedArrivalTime")) {
+                time = firstCall.get("ExpectedArrivalTime").asText();
+            } else if (firstCall.has("AimedDepartureTime")) {
+                time = firstCall.get("AimedDepartureTime").asText();
+            } else if (firstCall.has("AimedArrivalTime")) {
+                time = firstCall.get("AimedArrivalTime").asText();
+            }
+            if (time != null) {
+                return Instant.parse(time)
+                    .atZone(ZONE_ID)
+                    .toLocalDateTime()
+                    .atZone(ZONE_ID)
+                    .toEpochSecond();
+            }
+        }
+        return Long.MAX_VALUE;
+    }
+
+    /**
+     * Processes entities in parallel using a thread pool.
+     * 
+     * @param entities the list of entities to process
+     * @param entitiesTrips optional map for debug output
+     * @param context processing context for tracking statistics
+     * @return list of successfully processed indexed entities
+     */
+    private List<IndexedEntity> processEntitiesInParallel(List<JsonNode> entities, Map<String, JsonNode> entitiesTrips, ProcessingContext context) {
         int total = entities.size();
         renderProgressBar(0, total);
 
         ExecutorService executor = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
         List<IndexedEntity> builtEntities = new ArrayList<>();
         try {
-            List<Future<IndexedEntity>> futures = new ArrayList<>(total);
-
-            for (int idx = 0; idx < entities.size(); idx++) {
-                final int index = idx;
-                final JsonNode entity = entities.get(idx);
-                futures.add(executor.submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips, context)));
-            }
-
+            List<Future<IndexedEntity>> futures = submitEntityProcessingTasks(entities, entitiesTrips, context, executor);
             builtEntities = collectFutureResults(futures, total);
-
-            builtEntities.stream()
-                .sorted(Comparator.comparingInt(IndexedEntity::index))
-                .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt(); // Restore interrupt status
+            Thread.currentThread().interrupt();
             logger.error("Thread interrupted during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
         } catch (ExecutionException e) {
             logger.error("Execution error during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
         } finally {
             shutdownExecutor(executor);
         }
+        return builtEntities;
+    }
 
-        // Clear tripStates where timestamp is older than 15 minutes
+    /**
+     * Submits entity processing tasks to the executor.
+     * 
+     * @param entities the list of entities to process
+     * @param entitiesTrips optional map for debug output
+     * @param context processing context
+     * @param executor the executor service
+     * @return list of futures for the submitted tasks
+     */
+    private List<Future<IndexedEntity>> submitEntityProcessingTasks(List<JsonNode> entities, Map<String, JsonNode> entitiesTrips, ProcessingContext context, ExecutorService executor) {
+        List<Future<IndexedEntity>> futures = new ArrayList<>(entities.size());
+        for (int idx = 0; idx < entities.size(); idx++) {
+            final int index = idx;
+            final JsonNode entity = entities.get(idx);
+            futures.add(executor.submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips, context)));
+        }
+        return futures;
+    }
+
+    /**
+     * Adds processed entities to the GTFS-RT feed in sorted order.
+     * 
+     * @param builtEntities the list of indexed entities
+     * @param feedMessage the feed message builder
+     */
+    private void addEntitiesToFeed(List<IndexedEntity> builtEntities, GtfsRealtime.FeedMessage.Builder feedMessage) {
+        builtEntities.stream()
+            .sorted(Comparator.comparingInt(IndexedEntity::index))
+            .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
+    }
+
+    /**
+     * Cleans up trip states that are older than 15 minutes.
+     */
+    private void cleanupStaleTripStates() {
         long currentTime = Instant.now().atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
         tripStates.entrySet().removeIf(entry -> currentTime - entry.getValue().lastUpdate > 15 * 60);
-        
-        // Clean vehicleToTrip entries referencing removed trip states
         vehicleToTrip.entrySet().removeIf(e -> !tripStates.containsKey(e.getValue()));
+    }
 
-        System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
-
-        // Export entitiesTrips to a JSON file
-        if (dumpDebugFiles && entitiesTrips != null) {
-            try {
-                ObjectMapper objectMapper = new ObjectMapper();
-                JsonNodeFactory nodeFactory = JsonNodeFactory.instance;
-                com.fasterxml.jackson.databind.node.ObjectNode entitiesTripsJson = nodeFactory.objectNode();
-                for (String tripId : entitiesTrips.keySet()) {
-                    entitiesTripsJson.set(tripId, entitiesTrips.get(tripId));
-                }
-                objectMapper.writerWithDefaultPrettyPrinter().writeValue(new java.io.File("entities_trips.json"), entitiesTripsJson);
-                System.out.println("Entities trips written to entities_trips.json");
-            } catch (Exception e) {
-                logger.error("Error writing entities trips to JSON: {}", e.getMessage(), e);
+    /**
+     * Exports debug data to a JSON file if enabled.
+     * 
+     * @param entitiesTrips map of trip IDs to their entities
+     */
+    private void exportDebugData(Map<String, JsonNode> entitiesTrips) {
+        if (!dumpDebugFiles || entitiesTrips == null) {
+            return;
+        }
+        
+        try {
+            ObjectMapper objectMapper = new ObjectMapper();
+            JsonNodeFactory nodeFactory = JsonNodeFactory.instance;
+            com.fasterxml.jackson.databind.node.ObjectNode entitiesTripsJson = nodeFactory.objectNode();
+            for (String tripId : entitiesTrips.keySet()) {
+                entitiesTripsJson.set(tripId, entitiesTrips.get(tripId));
             }
+            objectMapper.writerWithDefaultPrettyPrinter().writeValue(new java.io.File("entities_trips.json"), entitiesTripsJson);
+            System.out.println("Entities trips written to entities_trips.json");
+        } catch (Exception e) {
+            logger.error("Error writing entities trips to JSON: {}", e.getMessage(), e);
         }
     }
 
