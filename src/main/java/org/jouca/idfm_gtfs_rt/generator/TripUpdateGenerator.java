@@ -290,18 +290,7 @@ public class TripUpdateGenerator {
                 futures.add(executor.submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips, context)));
             }
 
-            List<IndexedEntity> builtEntities = new ArrayList<>();
-            for (int i = 0; i < futures.size(); i++) {
-                try {
-                    IndexedEntity result = futures.get(i).get();
-                    if (result != null && result.entity() != null) {
-                        builtEntities.add(result);
-                    }
-                } catch (Exception e) {
-                    System.err.println("Failed to process entity index " + i + ": " + e.getMessage());
-                }
-                renderProgressBar(i + 1, total);
-            }
+            List<IndexedEntity> builtEntities = collectFutureResults(futures, total);
 
             builtEntities.stream()
                 .sorted(Comparator.comparingInt(IndexedEntity::index))
@@ -310,18 +299,7 @@ public class TripUpdateGenerator {
             System.err.println("Error during parallel processing: " + e.getMessage());
             throw e;
         } finally {
-            executor.shutdown();
-            try {
-                if (!executor.awaitTermination(2, TimeUnit.MINUTES)) {
-                    executor.shutdownNow();
-                    if (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
-                        System.err.println("ExecutorService did not terminate");
-                    }
-                }
-            } catch (InterruptedException ie) {
-                executor.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
+            shutdownExecutor(executor);
         }
 
         // Clear tripStates where timestamp is older than 15 minutes
@@ -840,6 +818,63 @@ public class TripUpdateGenerator {
             if (stopTimeUpdate.hasArrival()) {
                 stopTimeUpdate.clearArrival();
             }
+        }
+    }
+
+    /**
+     * Collects results from completed futures and updates the progress bar.
+     * 
+     * <p>This method iterates through the list of futures, retrieves their results,
+     * and filters out null or empty entities. It also handles exceptions that may
+     * occur during result retrieval and updates the progress bar after each entity
+     * is processed.
+     * 
+     * @param futures the list of futures containing indexed entities
+     * @param total the total number of entities being processed (for progress bar)
+     * @return a list of successfully processed indexed entities
+     */
+    private List<IndexedEntity> collectFutureResults(List<Future<IndexedEntity>> futures, int total) {
+        List<IndexedEntity> builtEntities = new ArrayList<>();
+        for (int i = 0; i < futures.size(); i++) {
+            try {
+                IndexedEntity result = futures.get(i).get();
+                if (result != null && result.entity() != null) {
+                    builtEntities.add(result);
+                }
+            } catch (Exception e) {
+                System.err.println("Failed to process entity index " + i + ": " + e.getMessage());
+            }
+            renderProgressBar(i + 1, total);
+        }
+        return builtEntities;
+    }
+
+    /**
+     * Shuts down the executor service gracefully with timeout handling.
+     * 
+     * <p>This method performs a graceful shutdown of the executor service:
+     * <ol>
+     *   <li>Initiates an orderly shutdown</li>
+     *   <li>Waits up to 2 minutes for tasks to complete</li>
+     *   <li>Forces shutdown if tasks don't complete in time</li>
+     *   <li>Waits an additional 1 minute for forced shutdown</li>
+     *   <li>Handles interruptions by forcing shutdown and restoring interrupt status</li>
+     * </ol>
+     * 
+     * @param executor the executor service to shut down
+     */
+    private void shutdownExecutor(ExecutorService executor) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(2, TimeUnit.MINUTES)) {
+                executor.shutdownNow();
+                if (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
+                    System.err.println("ExecutorService did not terminate");
+                }
+            }
+        } catch (InterruptedException ie) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
