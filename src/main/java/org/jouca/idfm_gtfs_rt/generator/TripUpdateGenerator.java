@@ -19,6 +19,8 @@ import java.util.stream.Collectors;
 
 import org.jouca.idfm_gtfs_rt.fetchers.SiriLiteFetcher;
 import org.jouca.idfm_gtfs_rt.finders.TripFinder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -50,6 +52,8 @@ import com.google.transit.realtime.GtfsRealtime;
  */
 @Component
 public class TripUpdateGenerator {
+    private static final Logger logger = LoggerFactory.getLogger(TripUpdateGenerator.class);
+    
     /** Time zone for Paris, used for all time conversions */
     private static final ZoneId ZONE_ID = ZoneId.of("Europe/Paris");
     
@@ -219,7 +223,7 @@ public class TripUpdateGenerator {
             outputStream.write(siriLiteData.toString().getBytes());
             System.out.println("SiriLite data written to " + filePath);
         } catch (java.io.IOException e) {
-            System.err.println("Error writing SiriLite data: " + e.getMessage());
+            logger.error("Error writing SiriLite data: {}", e.getMessage(), e);
         }
     }
 
@@ -296,7 +300,7 @@ public class TripUpdateGenerator {
                 .sorted(Comparator.comparingInt(IndexedEntity::index))
                 .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
         } catch (Exception e) {
-            System.err.println("Error during parallel processing: " + e.getMessage());
+            logger.error("Error during parallel processing: {}", e.getMessage(), e);
             throw e;
         } finally {
             shutdownExecutor(executor);
@@ -323,7 +327,7 @@ public class TripUpdateGenerator {
                 objectMapper.writerWithDefaultPrettyPrinter().writeValue(new java.io.File("entities_trips.json"), entitiesTripsJson);
                 System.out.println("Entities trips written to entities_trips.json");
             } catch (Exception e) {
-                System.err.println("Error writing entities trips to JSON: " + e.getMessage());
+                logger.error("Error writing entities trips to JSON: {}", e.getMessage(), e);
             }
         }
     }
@@ -841,8 +845,11 @@ public class TripUpdateGenerator {
                 if (result != null && result.entity() != null) {
                     builtEntities.add(result);
                 }
+            } catch (InterruptedException e) {
+                logger.error("Failed to process entity index {}: {}", i, e.getMessage(), e);
+                Thread.currentThread().interrupt(); // Restore interrupt status
             } catch (Exception e) {
-                System.err.println("Failed to process entity index " + i + ": " + e.getMessage());
+                logger.error("Failed to process entity index {}: {}", i, e.getMessage(), e);
             }
             renderProgressBar(i + 1, total);
         }
@@ -869,7 +876,7 @@ public class TripUpdateGenerator {
             if (!executor.awaitTermination(2, TimeUnit.MINUTES)) {
                 executor.shutdownNow();
                 if (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
-                    System.err.println("ExecutorService did not terminate");
+                    logger.error("ExecutorService did not terminate");
                 }
             }
         } catch (InterruptedException ie) {
@@ -922,7 +929,7 @@ public class TripUpdateGenerator {
             feedMessage.build().writeTo(outputStream);
             System.out.println("GTFS-RT feed written to " + filePath);
         } catch (java.io.IOException e) {
-            System.err.println("Error writing GTFS-RT feed: " + e.getMessage());
+            logger.error("Error writing GTFS-RT feed: {}", e.getMessage(), e);
         }
     }
 }
