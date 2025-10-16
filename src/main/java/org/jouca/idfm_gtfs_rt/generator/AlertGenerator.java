@@ -38,6 +38,9 @@ public class AlertGenerator {
     private static final String FIELD_SEVERITY = "severity";
     private static final String FIELD_TITLE = "title";
     private static final String FIELD_MESSAGE = "message";
+    private static final String FIELD_IMPACTED_OBJECTS = "impactedObjects";
+    private static final String FIELD_APPLICATION_PERIODS = "applicationPeriods";
+    private static final String FIELD_LAST_UPDATE = "lastUpdate";
     
     /**
      * Creates a GTFS-Realtime TimeRange from an application period JSON node.
@@ -178,7 +181,7 @@ public class AlertGenerator {
             @SuppressWarnings("unchecked")
             Map<String, Object> line = (Map<String, Object>) lineEntry.getValue();
             
-            for (JsonNode impactedObject : (ArrayNode) line.get("impactedObjects")) {
+            for (JsonNode impactedObject : (ArrayNode) line.get(FIELD_IMPACTED_OBJECTS)) {
                 if (isDisruptionInImpactedObject(impactedObject, disruptionId)) {
                     addInformedEntity(impactedObject, alertBuilder);
                 }
@@ -285,7 +288,7 @@ public class AlertGenerator {
             @SuppressWarnings("unchecked")
             Map<String, Object> alert = (Map<String, Object>) entry.getValue();
 
-            for (JsonNode applicationPeriod : (ArrayNode) alert.get("applicationPeriods")) {
+            for (JsonNode applicationPeriod : (ArrayNode) alert.get(FIELD_APPLICATION_PERIODS)) {
                 createAlertEntity(feed, alert, applicationPeriod, lines);
             }
         }
@@ -346,35 +349,76 @@ public class AlertGenerator {
         Map<String, Object> alertDict = new HashMap<>();
     
         for (JsonNode disruption : disruptions) {
-            String id = disruption.has("id") ? disruption.get("id").asText() : null;
-            ArrayNode applicationPeriods = disruption.has("applicationPeriods") ? (ArrayNode) disruption.get("applicationPeriods") : null;
-            String lastUpdate = disruption.has("lastUpdate") ? disruption.get("lastUpdate").asText() : null;
-            String cause = disruption.has(FIELD_CAUSE) ? disruption.get(FIELD_CAUSE).asText() : null;
-            String severity = disruption.has(FIELD_SEVERITY) ? disruption.get(FIELD_SEVERITY).asText() : null;
-            ArrayNode tags = disruption.has("tags") ? (ArrayNode) disruption.get("tags") : null;
-            String title = disruption.has(FIELD_TITLE) ? disruption.get(FIELD_TITLE).asText() : null;
-            String message = disruption.has(FIELD_MESSAGE) ? disruption.get(FIELD_MESSAGE).asText() : null;
+            String id = getStringField(disruption, "id");
+            ArrayNode applicationPeriods = getArrayNodeField(disruption, FIELD_APPLICATION_PERIODS);
     
-            // Skip disruptions without mandatory fields
-            if (id == null || applicationPeriods == null) {
-                System.err.println("Skipping disruption due to missing mandatory fields: id or applicationPeriods");
+            if (!isValidDisruption(id, applicationPeriods)) {
                 continue;
             }
     
-            Map<String, Object> alert = new HashMap<>();
-            alert.put("id", id);
-            alert.put("applicationPeriods", applicationPeriods);
-            alert.put("lastUpdate", lastUpdate);
-            alert.put(FIELD_CAUSE, cause);
-            alert.put(FIELD_SEVERITY, severity);
-            alert.put("tags", tags);
-            alert.put(FIELD_TITLE, title);
-            alert.put(FIELD_MESSAGE, message);
-    
+            Map<String, Object> alert = createAlertFromDisruption(disruption, id, applicationPeriods);
             alertDict.put(id, alert);
         }
     
         return alertDict;
+    }
+
+    /**
+     * Extracts a string field from a JSON node, returning null if not present.
+     *
+     * @param node the JSON node to extract from
+     * @param fieldName the name of the field to extract
+     * @return the field value as a string, or null if not present
+     */
+    private String getStringField(JsonNode node, String fieldName) {
+        return node.has(fieldName) ? node.get(fieldName).asText() : null;
+    }
+
+    /**
+     * Extracts an ArrayNode field from a JSON node, returning null if not present.
+     *
+     * @param node the JSON node to extract from
+     * @param fieldName the name of the field to extract
+     * @return the field value as an ArrayNode, or null if not present
+     */
+    private ArrayNode getArrayNodeField(JsonNode node, String fieldName) {
+        return node.has(fieldName) ? (ArrayNode) node.get(fieldName) : null;
+    }
+
+    /**
+     * Validates that a disruption has all mandatory fields.
+     *
+     * @param id the disruption ID
+     * @param applicationPeriods the application periods
+     * @return true if valid, false otherwise
+     */
+    private boolean isValidDisruption(String id, ArrayNode applicationPeriods) {
+        if (id == null || applicationPeriods == null) {
+            System.err.println("Skipping disruption due to missing mandatory fields: id or applicationPeriods");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Creates an alert map from a disruption JSON node.
+     *
+     * @param disruption the disruption JSON node
+     * @param id the disruption ID
+     * @param applicationPeriods the application periods
+     * @return a map containing all alert fields
+     */
+    private Map<String, Object> createAlertFromDisruption(JsonNode disruption, String id, ArrayNode applicationPeriods) {
+        Map<String, Object> alert = new HashMap<>();
+        alert.put("id", id);
+        alert.put(FIELD_APPLICATION_PERIODS, applicationPeriods);
+        alert.put(FIELD_LAST_UPDATE, getStringField(disruption, FIELD_LAST_UPDATE));
+        alert.put(FIELD_CAUSE, getStringField(disruption, FIELD_CAUSE));
+        alert.put(FIELD_SEVERITY, getStringField(disruption, FIELD_SEVERITY));
+        alert.put("tags", getArrayNodeField(disruption, "tags"));
+        alert.put(FIELD_TITLE, getStringField(disruption, FIELD_TITLE));
+        alert.put(FIELD_MESSAGE, getStringField(disruption, FIELD_MESSAGE));
+        return alert;
     }
 
     /**
@@ -405,7 +449,7 @@ public class AlertGenerator {
             String shortName = line.get("shortName").asText();
             String mode = line.get("mode").asText();
             String networkId = line.get("networkId").asText();
-            ArrayNode impactedObjects = (ArrayNode) line.get("impactedObjects");
+            ArrayNode impactedObjects = (ArrayNode) line.get(FIELD_IMPACTED_OBJECTS);
 
             Map<String, Object> lineDict = new HashMap<>();
             lineDict.put("id", id);
@@ -413,7 +457,7 @@ public class AlertGenerator {
             lineDict.put("shortName", shortName);
             lineDict.put("mode", mode);
             lineDict.put("networkId", networkId);
-            lineDict.put("impactedObjects", impactedObjects);
+            lineDict.put(FIELD_IMPACTED_OBJECTS, impactedObjects);
 
             linesDict.put(id, lineDict);
         }
