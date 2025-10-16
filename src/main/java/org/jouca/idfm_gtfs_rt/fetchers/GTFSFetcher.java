@@ -210,7 +210,15 @@ public class GTFSFetcher {
                 java.nio.file.Files.newInputStream(java.nio.file.Paths.get(zipFilePath)))) {
             java.util.zip.ZipEntry entry;
             while ((entry = zipIn.getNextEntry()) != null) {
-                java.nio.file.Path filePath = outputDir.resolve(entry.getName());
+                java.nio.file.Path filePath = outputDir.resolve(entry.getName()).normalize();
+                
+                // Security check: Prevent Zip Slip attack by ensuring the resolved path
+                // is within the intended output directory
+                if (!filePath.startsWith(outputDir.normalize())) {
+                    logger.warn("Skipping malicious ZIP entry that attempts path traversal: {}", entry.getName());
+                    throw new IOException("ZIP entry is outside of the target directory: " + entry.getName());
+                }
+                
                 if (!entry.isDirectory()) {
                     java.nio.file.Files.createDirectories(filePath.getParent());
                     java.nio.file.Files.copy(zipIn, filePath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
