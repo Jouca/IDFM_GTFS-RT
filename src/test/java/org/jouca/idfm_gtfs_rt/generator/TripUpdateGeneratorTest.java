@@ -811,4 +811,876 @@ class TripUpdateGeneratorTest {
         assertTrue(result.contains("trip1"));
         assertTrue(result.contains("trip2"));
     }
+
+    @Test
+    void testExtractCallTimeForSortingWithExpectedArrival() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractCallTimeForSorting", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ExpectedArrivalTime": "2025-10-16T10:30:00Z"
+            }
+            """;
+        JsonNode call = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, call);
+        
+        assertTrue(result > 0);
+        assertTrue(result < Long.MAX_VALUE);
+    }
+
+    @Test
+    void testExtractCallTimeForSortingWithExpectedDeparture() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractCallTimeForSorting", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ExpectedDepartureTime": "2025-10-16T11:00:00Z"
+            }
+            """;
+        JsonNode call = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, call);
+        
+        assertTrue(result > 0);
+    }
+
+    @Test
+    void testExtractCallTimeForSortingWithAimedTimes() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractCallTimeForSorting", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedArrivalTime": "2025-10-16T10:30:00Z",
+                "AimedDepartureTime": "2025-10-16T10:35:00Z"
+            }
+            """;
+        JsonNode call = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, call);
+        
+        assertTrue(result > 0);
+    }
+
+    @Test
+    void testExtractCallTimeForSortingWithNoTimes() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractCallTimeForSorting", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = "{}";
+        JsonNode call = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, call);
+        
+        assertEquals(Long.MAX_VALUE, result);
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWithFutureExpectedArrival() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+        
+        // Set future time (1 hour from now)
+        String futureTime = java.time.Instant.now().plusSeconds(3600).toString();
+        String json = String.format("""
+            {
+                "ExpectedArrivalTime": "%s"
+            }
+            """, futureTime);
+        
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+        
+        assertFalse(result);
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWithPastExpectedArrival() throws Exception {
+        // Set currentEpochSecond to a value in the future (relative to 2020)
+        java.lang.reflect.Field field = TripUpdateGenerator.class.getDeclaredField("currentEpochSecond");
+        field.setAccessible(true);
+        field.setLong(generator, System.currentTimeMillis() / 1000);
+        
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ExpectedArrivalTime": "2020-01-01T10:00:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+        
+        assertTrue(result);
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWithAimedTimes() throws Exception {
+        // Set currentEpochSecond to a value in the future (relative to 2020)
+        java.lang.reflect.Field field = TripUpdateGenerator.class.getDeclaredField("currentEpochSecond");
+        field.setAccessible(true);
+        field.setLong(generator, System.currentTimeMillis() / 1000);
+        
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedArrivalTime": "2020-01-01T10:00:00Z",
+                "AimedDepartureTime": "2020-01-01T10:05:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+        
+        assertTrue(result);
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWithOnlyDepartureTimes() throws Exception {
+        // Set currentEpochSecond to a value in the future (relative to 2020)
+        java.lang.reflect.Field field = TripUpdateGenerator.class.getDeclaredField("currentEpochSecond");
+        field.setAccessible(true);
+        field.setLong(generator, System.currentTimeMillis() / 1000);
+        
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ExpectedDepartureTime": "2020-01-01T10:00:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+        
+        assertTrue(result);
+    }
+
+    @Test
+    void testSetArrivalTimeWithExpectedArrivalTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "setArrivalTime", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ExpectedArrivalTime": "2025-10-16T10:30:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertTrue(builder.hasArrival());
+        assertTrue(builder.getArrival().getTime() > 0);
+    }
+
+    @Test
+    void testSetArrivalTimeWithAimedArrivalTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "setArrivalTime", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedArrivalTime": "2025-10-16T10:30:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertTrue(builder.hasArrival());
+    }
+
+    @Test
+    void testSetArrivalTimeWithNoArrivalTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "setArrivalTime", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = "{}";
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertFalse(builder.hasArrival());
+    }
+
+    @Test
+    void testSetDepartureTimeWithExpectedDepartureTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "setDepartureTime", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ExpectedDepartureTime": "2025-10-16T10:35:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertTrue(builder.hasDeparture());
+        assertTrue(builder.getDeparture().getTime() > 0);
+    }
+
+    @Test
+    void testSetDepartureTimeWithAimedDepartureTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "setDepartureTime", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedDepartureTime": "2025-10-16T10:35:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertTrue(builder.hasDeparture());
+    }
+
+    @Test
+    void testSetDepartureTimeWithNoDepartureTime() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "setDepartureTime", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = "{}";
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertFalse(builder.hasDeparture());
+    }
+
+    @Test
+    void testHandleCancellationStatusWithDepartureCancelled() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "handleCancellationStatus", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DepartureStatus": "CANCELLED"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        builder.setArrival(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(1000).build());
+        builder.setDeparture(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(1100).build());
+        
+        method.invoke(generator, call, builder);
+        
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED, 
+                     builder.getScheduleRelationship());
+        assertFalse(builder.hasArrival());
+        assertFalse(builder.hasDeparture());
+    }
+
+    @Test
+    void testHandleCancellationStatusWithArrivalCancelled() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "handleCancellationStatus", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "ArrivalStatus": "CANCELLED"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        builder.setArrival(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(1000).build());
+        
+        method.invoke(generator, call, builder);
+        
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED, 
+                     builder.getScheduleRelationship());
+    }
+
+    @Test
+    void testHandleCancellationStatusWithBothCancelled() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "handleCancellationStatus", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DepartureStatus": "CANCELLED",
+                "ArrivalStatus": "CANCELLED"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        
+        method.invoke(generator, call, builder);
+        
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED, 
+                     builder.getScheduleRelationship());
+    }
+
+    @Test
+    void testHandleCancellationStatusWithNoCancellation() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "handleCancellationStatus", 
+            JsonNode.class, 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DepartureStatus": "ON_TIME",
+                "ArrivalStatus": "DELAYED"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
+        builder.setArrival(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(1000).build());
+        
+        method.invoke(generator, call, builder);
+        
+        assertTrue(builder.hasArrival());
+    }
+
+    @Test
+    void testExtractTimeFromCallWithAimedArrival() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractTimeFromCall", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedArrivalTime": "2025-10-16T10:30:00Z"
+            }
+            """;
+        JsonNode node = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, node);
+        
+        assertEquals("2025-10-16T10:30:00Z", result);
+    }
+
+    @Test
+    void testExtractTimeFromCallWithAimedDeparture() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractTimeFromCall", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedDepartureTime": "2025-10-16T10:35:00Z"
+            }
+            """;
+        JsonNode node = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, node);
+        
+        assertEquals("2025-10-16T10:35:00Z", result);
+    }
+
+    @Test
+    void testExtractTimeFromCallPriority() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractTimeFromCall", JsonNode.class);
+        method.setAccessible(true);
+        
+        // ExpectedArrivalTime should have highest priority
+        String json = """
+            {
+                "ExpectedArrivalTime": "2025-10-16T10:30:00Z",
+                "ExpectedDepartureTime": "2025-10-16T10:35:00Z",
+                "AimedArrivalTime": "2025-10-16T10:28:00Z",
+                "AimedDepartureTime": "2025-10-16T10:33:00Z"
+            }
+            """;
+        JsonNode node = objectMapper.readTree(json);
+        String result = (String) method.invoke(generator, node);
+        
+        assertEquals("2025-10-16T10:30:00Z", result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithAller() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "Aller"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithRetour() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "Retour"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(0, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithInbound() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "inbound"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithOutbound() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "outbound"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(0, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithSingleLetterA() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "A"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(0, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithSingleLetterR() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "R"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithMissingField() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = "{}";
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(-1, result);
+    }
+
+    @Test
+    void testParseDirectionFromNameWithEmptyArray() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": []
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(-1, result);
+    }
+
+    @Test
+    void testParseDirectionFromRefWithMissingField() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromRef", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = "{}";
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(-1, result);
+    }
+
+    @Test
+    void testParseDirectionFromRefWithSimpleValue() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromRef", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionRef": {
+                    "value": "Aller"
+                }
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testDetermineDirectionWithValidRef() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "determineDirection", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionRef": {
+                    "value": "IDFM:Line:123:A"
+                }
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testDetermineDirectionWithValidName() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "determineDirection", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "DirectionName": [
+                    {
+                        "value": "Aller"
+                    }
+                ]
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testDetermineDirectionWithNoValidFields() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "determineDirection", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = "{}";
+        JsonNode entity = objectMapper.readTree(json);
+        int result = (int) method.invoke(generator, entity);
+        
+        assertEquals(-1, result);
+    }
+
+    @Test
+    void testGroupTheoreticalTripsByRouteAndDirection() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "groupTheoreticalTripsByRouteAndDirection", java.util.List.class);
+        method.setAccessible(true);
+        
+        java.util.List<org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta> trips = new java.util.ArrayList<>();
+        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 0, 3600));
+        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip2", "route1", 1, 7200));
+        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip3", "route2", 0, 5400));
+        
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, java.util.Map<Integer, java.util.List<org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta>>> result = 
+            (java.util.Map<String, java.util.Map<Integer, java.util.List<org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta>>>) 
+            method.invoke(generator, trips);
+        
+        assertEquals(2, result.size());
+        assertTrue(result.containsKey("route1"));
+        assertTrue(result.containsKey("route2"));
+        assertEquals(2, result.get("route1").size());
+        assertEquals(1, result.get("route2").size());
+    }
+
+    @Test
+    void testExtractFirstCallTimeWithAllFields() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractFirstCallTime", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "EstimatedCalls": {
+                    "EstimatedCall": [
+                        {
+                            "ExpectedDepartureTime": "2025-10-16T10:00:00Z"
+                        }
+                    ]
+                }
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, entity);
+        
+        assertTrue(result > 0);
+        assertTrue(result < Long.MAX_VALUE);
+    }
+
+    @Test
+    void testExtractFirstCallTimeWithNoEstimatedCalls() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractFirstCallTime", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "EstimatedCalls": {
+                    "EstimatedCall": []
+                }
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, entity);
+        
+        assertEquals(Long.MAX_VALUE, result);
+    }
+
+    @Test
+    void testExtractFirstCallTimeWithOnlyAimedTimes() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractFirstCallTime", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "EstimatedCalls": {
+                    "EstimatedCall": [
+                        {
+                            "AimedDepartureTime": "2025-10-16T10:00:00Z"
+                        }
+                    ]
+                }
+            }
+            """;
+        JsonNode entity = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, entity);
+        
+        assertTrue(result > 0);
+    }
+
+    @Test
+    void testIndexedEntityRecordCreation() throws Exception {
+        Class<?> indexedEntityClass = Class.forName("org.jouca.idfm_gtfs_rt.generator.TripUpdateGenerator$IndexedEntity");
+        java.lang.reflect.Constructor<?> constructor = indexedEntityClass.getDeclaredConstructor(
+            int.class, 
+            com.google.transit.realtime.GtfsRealtime.FeedEntity.class);
+        constructor.setAccessible(true);
+        
+        com.google.transit.realtime.GtfsRealtime.FeedEntity entity = 
+            com.google.transit.realtime.GtfsRealtime.FeedEntity.newBuilder()
+                .setId("test_trip")
+                .build();
+        
+        Object indexedEntity = constructor.newInstance(5, entity);
+        
+        assertNotNull(indexedEntity);
+        
+        java.lang.reflect.Method indexMethod = indexedEntityClass.getDeclaredMethod("index");
+        indexMethod.setAccessible(true);
+        assertEquals(5, (int) indexMethod.invoke(indexedEntity));
+        
+        java.lang.reflect.Method entityMethod = indexedEntityClass.getDeclaredMethod("entity");
+        entityMethod.setAccessible(true);
+        assertEquals(entity, entityMethod.invoke(indexedEntity));
+    }
+
+    @Test
+    void testParseDirectionFromColonDelimitedValueWithShortString() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "parseDirectionFromColonDelimitedValue", String.class);
+        method.setAccessible(true);
+        
+        assertEquals(-1, (int) method.invoke(generator, "A:B"));
+        assertEquals(-1, (int) method.invoke(generator, ""));
+    }
+
+    @Test
+    void testExtractCallTimeForSortingOnlyAimedDeparture() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "extractCallTimeForSorting", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedDepartureTime": "2025-10-16T11:00:00Z"
+            }
+            """;
+        JsonNode call = objectMapper.readTree(json);
+        long result = (long) method.invoke(generator, call);
+        
+        assertTrue(result > 0);
+        assertTrue(result < Long.MAX_VALUE);
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWithFutureDeparture() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+        
+        String futureTime = java.time.Instant.now().plusSeconds(3600).toString();
+        String json = String.format("""
+            {
+                "ExpectedDepartureTime": "%s"
+            }
+            """, futureTime);
+        
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+        
+        assertFalse(result);
+    }
+
+    @Test
+    void testIsEstimatedCallInPastWithPastAimedDeparture() throws Exception {
+        // Set currentEpochSecond to a value in the future (relative to 2020)
+        java.lang.reflect.Field field = TripUpdateGenerator.class.getDeclaredField("currentEpochSecond");
+        field.setAccessible(true);
+        field.setLong(generator, System.currentTimeMillis() / 1000);
+        
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "isEstimatedCallInPast", JsonNode.class);
+        method.setAccessible(true);
+        
+        String json = """
+            {
+                "AimedDepartureTime": "2020-01-01T10:00:00Z"
+            }
+            """;
+        
+        JsonNode call = objectMapper.readTree(json);
+        boolean result = (boolean) method.invoke(generator, call);
+        
+        assertTrue(result);
+    }
 }
