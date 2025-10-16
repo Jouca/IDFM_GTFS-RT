@@ -20,6 +20,8 @@ import java.util.stream.Collectors;
 
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.jouca.idfm_gtfs_rt.records.EstimatedCall;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * TripFinder is responsible for matching real-time transit data to scheduled GTFS trips.
@@ -50,6 +52,9 @@ import org.jouca.idfm_gtfs_rt.records.EstimatedCall;
  * @see TripMeta
  */
 public class TripFinder {
+    /** Logger instance for debugging and error reporting */
+    private static final Logger logger = LoggerFactory.getLogger(TripFinder.class);
+    
     /** JDBC connection URL for the SQLite GTFS database */
     private static final String DB_URL = "jdbc:sqlite:./gtfs.db";
     
@@ -680,7 +685,7 @@ public class TripFinder {
             // populate cache
             allStopTimesCache.put(tripId, results);
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.debug("Error getting all stop times for trip: {}", tripId, e);
         }
 
         return results;
@@ -718,7 +723,7 @@ public class TripFinder {
                     }
                 }
             } catch (SQLException e) {
-                e.printStackTrace();
+                logger.debug("Error getting stop sequences for trip: {}", tripId, e);
             }
             stopSequencesCache.put(tripId, seqMap);
         }
@@ -765,7 +770,7 @@ public class TripFinder {
                 }
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.debug("Error finding child stop ID for stopId: {} and tripId: {}", stopId, tripId, e);
         }
 
         return childStopId;
@@ -787,7 +792,7 @@ public class TripFinder {
 
             return rs.next();
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.debug("Error checking if stop_extensions table exists", e);
             return false;
         }
     }
@@ -815,7 +820,7 @@ public class TripFinder {
                 }
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.debug("Error finding stop ID from code: {}", stopCode, e);
         }
         return null;
     }
@@ -843,7 +848,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.debug("Error finding stop ID from extension: {}", stopExtension, e);
         }
         return null;
     }
@@ -1013,7 +1018,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.debug("Error finding direction ID for trip: {}", tripId, e);
         }
         return null;
     }
@@ -1098,7 +1103,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.debug("Error getting active trips for route IDs", e);
         }
         return result;
     }
@@ -1136,7 +1141,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.debug("Error getting trip metadata for trip: {}", tripId, e);
         }
         return null;
     }

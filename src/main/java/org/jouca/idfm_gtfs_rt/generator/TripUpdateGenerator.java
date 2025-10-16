@@ -796,7 +796,7 @@ public class TripUpdateGenerator {
                     destinationId, directionInfo.journeyNote(), directionInfo.journeyNoteDetailled(), 
                     directionInfo.directionIdForMatching());
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.debug("Error finding trip ID for lineId: {}, destinationId: {}", lineId, destinationId, e);
             return null;
         }
     }
