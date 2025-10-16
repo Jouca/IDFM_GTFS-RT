@@ -57,11 +57,17 @@ public class TripFinder {
     private static final BasicDataSource dataSource = new BasicDataSource();
     
     /**
+     * The timezone used for all date and time operations in the GTFS system.
+     * Paris timezone is used as this is for the Île-de-France Mobilités (IDFM) transit system.
+     */
+    private static final ZoneId PARIS_ZONE = ZoneId.of("Europe/Paris");
+    
+    /**
      * Stores the program start time to determine service day consistently.
      * This ensures that a trip running at 00:30 AM is matched against the previous day's service
      * if the program started before midnight.
      */
-    private static final ZonedDateTime PROGRAM_START_TIME = ZonedDateTime.now(ZoneId.of("Europe/Paris"));
+    private static final ZonedDateTime PROGRAM_START_TIME = ZonedDateTime.now(PARIS_ZONE);
     
     /**
      * Threshold for considering times as potentially belonging to the previous day's service.
@@ -176,6 +182,273 @@ public class TripFinder {
     }
 
     /**
+     * Determines the service day from a list of estimated calls.
+     * Returns the service day of the first estimated call.
+     */
+    private static LocalDate determineServiceDayFromEstimatedCalls(
+        List<EstimatedCall> estimatedCalls,
+        ZoneId zone
+    ) {
+        if (estimatedCalls.isEmpty()) {
+            return LocalDate.now(zone);
+        }
+        
+        EstimatedCall firstCall = estimatedCalls.get(0);
+        Instant instant = Instant.parse(firstCall.isoTime());
+        ZonedDateTime zdt = instant.atZone(zone);
+        return determineServiceDay(zdt, zone);
+    }
+
+    /**
+     * Converts an EstimatedCall to seconds since service day start.
+     */
+    private static int convertToSecondsSinceServiceDay(
+        EstimatedCall ec,
+        ZoneId zone
+    ) {
+        Instant inst = Instant.parse(ec.isoTime());
+        ZonedDateTime zdtEc = inst.atZone(zone);
+        LocalDate serviceDayForEc = determineServiceDay(zdtEc, zone);
+        return (int) (zdtEc.toEpochSecond() - serviceDayForEc.atStartOfDay(zone).toEpochSecond());
+    }
+
+    /**
+     * Builds the SQL query for finding candidate trips.
+     */
+    private static String buildTripFinderQuery(
+        String timeColumn,
+        List<String> allStopIds,
+        Integer directionId,
+        String journeyNote,
+        boolean journeyNoteDetailled
+    ) {
+        StringBuilder query = new StringBuilder("""
+            WITH valid_services AS (
+                SELECT service_id FROM calendar
+                WHERE start_date <= ? AND end_date >= ?
+                AND (
+                    (monday = 1 AND ? = '1') OR
+                    (tuesday = 1 AND ? = '2') OR
+                    (wednesday = 1 AND ? = '3') OR
+                    (thursday = 1 AND ? = '4') OR
+                    (friday = 1 AND ? = '5') OR
+                    (saturday = 1 AND ? = '6') OR
+                    (sunday = 1 AND ? = '0')
+                )
+                UNION
+                SELECT service_id FROM calendar_dates
+                WHERE date = ? AND exception_type = 1
+            ),
+            excluded_services AS (
+                SELECT service_id FROM calendar_dates
+                WHERE date = ? AND exception_type = 2
+            )
+            SELECT st.trip_id, st.stop_id, st.stop_sequence, st.%s as stop_time
+            FROM stop_times st
+            JOIN trips t ON st.trip_id = t.trip_id
+            WHERE t.route_id = ?
+            AND t.service_id IN (SELECT service_id FROM valid_services)
+            AND t.service_id NOT IN (SELECT service_id FROM excluded_services)
+        """.formatted(timeColumn));
+
+        query.append("AND st.stop_id IN (")
+             .append(allStopIds.stream().map(x -> "?").collect(Collectors.joining(",")))
+             .append(")\n");
+
+        if (directionId != null) {
+            query.append("AND t.direction_id = ?\n");
+        }
+
+        query.append("""
+            AND (
+                st.trip_id NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM stop_times st2
+                    WHERE st2.trip_id = st.trip_id
+                    AND st2.stop_id = ?
+                    AND st2.stop_sequence = (
+                        SELECT MAX(st3.stop_sequence)
+                        FROM stop_times st3
+                        WHERE st3.trip_id = st.trip_id
+                    )
+                )
+            )
+        """);
+
+        if (journeyNote != null) {
+            if (journeyNoteDetailled) {
+                query.append("AND t.trip_short_name LIKE ?\n");
+            } else {
+                query.append("AND t.trip_headsign LIKE ?\n");
+            }
+        }
+
+        query.append("ORDER BY st.departure_timestamp ASC;");
+        return query.toString();
+    }
+
+    /**
+     * Binds parameters to the prepared statement for trip finder query.
+     */
+    private static void bindTripFinderParameters(
+        PreparedStatement stmt,
+        String yyyymmdd,
+        String weekday,
+        String routeId,
+        List<String> allStopIds,
+        Integer directionId,
+        String destinationId,
+        String journeyNote
+    ) throws SQLException {
+        int i = 1;
+        stmt.setString(i++, yyyymmdd);
+        stmt.setString(i++, yyyymmdd);
+        for (int j = 0; j < 7; j++) stmt.setString(i++, weekday);
+        stmt.setString(i++, yyyymmdd);
+        stmt.setString(i++, yyyymmdd);
+        stmt.setString(i++, routeId);
+
+        for (String stopId : allStopIds) {
+            stmt.setString(i++, stopId);
+        }
+        
+        if (directionId != null) {
+            stmt.setInt(i++, directionId);
+        }
+        
+        stmt.setString(i++, destinationId);
+
+        if (journeyNote != null && journeyNote.length() == 4) {
+            stmt.setString(i++, journeyNote);
+        }
+    }
+
+    /**
+     * Builds a cache key for the trip finder query.
+     */
+    private static String buildCacheKey(
+        String routeId,
+        boolean isArrivalTime,
+        String destinationId,
+        String journeyNote,
+        Integer directionId,
+        List<EstimatedCall> estimatedCalls
+    ) {
+        StringBuilder keyBuilder = new StringBuilder();
+        keyBuilder.append(routeId).append('|')
+                  .append(isArrivalTime ? 'A' : 'D').append('|')
+                  .append(destinationId).append('|');
+        if (journeyNote != null) keyBuilder.append(journeyNote).append('|');
+        if (directionId != null) keyBuilder.append(directionId).append('|');
+        for (EstimatedCall ec : estimatedCalls) {
+            keyBuilder.append(ec.stopId()).append('@').append(ec.isoTime()).append('|');
+        }
+        return keyBuilder.toString();
+    }
+
+    /**
+     * Finds the best matching theoretical time within the given time window.
+     * Returns null if no time is within the window.
+     */
+    private static Integer findBestTheoreticalTime(
+        List<Integer> theoreticalTimes,
+        int realTime,
+        int minWindow,
+        int maxWindow
+    ) {
+        Integer bestTheo = null;
+        int minDiff = Integer.MAX_VALUE;
+        
+        for (Integer theoTime : theoreticalTimes) {
+            int normalizedTheoTime = theoTime;
+            int diff = normalizedTheoTime - realTime;
+
+            if (diff >= minWindow && diff <= maxWindow) {
+                int absDiff = Math.abs(diff);
+                if (absDiff < minDiff) {
+                    minDiff = absDiff;
+                    bestTheo = normalizedTheoTime;
+                }
+            }
+        }
+        
+        return bestTheo;
+    }
+
+    /**
+     * Evaluates a single trip against the estimated calls within the given time window.
+     * Returns the total time difference if all stops match, or -1 if not all stops match.
+     */
+    private static long evaluateTripMatch(
+        Map<String, List<Integer>> tripStops,
+        List<EstimatedCall> estimatedCalls,
+        ZoneId zone,
+        int minWindow,
+        int maxWindow
+    ) {
+        long totalDiff = 0;
+
+        for (EstimatedCall ec : estimatedCalls) {
+            String stopId = ec.stopId();
+            int realTime = convertToSecondsSinceServiceDay(ec, zone);
+
+            List<Integer> theoreticalTimes = tripStops.get(stopId);
+            if (theoreticalTimes == null || theoreticalTimes.isEmpty()) {
+                return -1; // Stop not matched
+            }
+
+            Integer bestTheo = findBestTheoreticalTime(theoreticalTimes, realTime, minWindow, maxWindow);
+            if (bestTheo == null) {
+                return -1; // No theoretical time within window
+            }
+            
+            totalDiff += Math.abs(bestTheo - realTime);
+        }
+
+        return totalDiff;
+    }
+
+    /**
+     * Finds the best matching trip from the candidate trips within the defined time windows.
+     */
+    private static String findBestMatchingTrip(
+        Map<String, Map<String, List<Integer>>> tripStopTimes,
+        List<EstimatedCall> estimatedCalls,
+        ZoneId zone
+    ) {
+        int[][] windows = {
+            {-1, 1},
+            {-2, 2},
+            {-3, 5},
+            {-3, 10},
+            {-3, 20},
+            {-3, 30}
+        };
+
+        List<TripMatch> allMatches = new ArrayList<>();
+
+        for (int[] window : windows) {
+            int minWindow = window[0] * 60;
+            int maxWindow = window[1] * 60;
+
+            for (Map.Entry<String, Map<String, List<Integer>>> entry : tripStopTimes.entrySet()) {
+                String tripId = entry.getKey();
+                Map<String, List<Integer>> tripStops = entry.getValue();
+
+                long totalDiff = evaluateTripMatch(tripStops, estimatedCalls, zone, minWindow, maxWindow);
+                
+                if (totalDiff >= 0) {
+                    allMatches.add(new TripMatch(tripId, totalDiff));
+                }
+            }
+        }
+
+        allMatches.sort((a, b) -> Long.compare(a.totalDiff, b.totalDiff));
+
+        return allMatches.isEmpty() ? null : allMatches.get(0).tripId;
+    }
+
+    /**
      * Finds the trip ID that best matches a sequence of real-time estimated calls.
      * 
      * <p>This method attempts to match real-time stop data (EstimatedCalls) to scheduled trips
@@ -219,153 +492,60 @@ public class TripFinder {
             throw new IllegalArgumentException("Inputs cannot be null or empty.");
         }
 
-        String timeColumn = isArrivalTime ? "arrival_timestamp" : "departure_timestamp";
-        ZoneId zone = ZoneId.of("Europe/Paris");
-
-        Map<String, List<Integer>> stopTimes = new HashMap<>();
-        LocalDate serviceDay = null;
-
-        for (EstimatedCall ec : estimatedCalls) {
-            Instant instant = Instant.parse(ec.isoTime());
-            ZonedDateTime zdt = instant.atZone(zone);
-            
-            // Determine the service day (accounting for midnight-crossing trips)
-            LocalDate determinedServiceDay = determineServiceDay(zdt, zone);
-            if (serviceDay == null) {
-                serviceDay = determinedServiceDay;
-            }
-            
-            // Calculate seconds since the start of the SERVICE day (not calendar day)
-            // For trips crossing midnight, this allows matching times like 24:33:00
-            long serviceDayStartEpoch = serviceDay.atStartOfDay(zone).toEpochSecond();
-            int seconds = (int) (zdt.toEpochSecond() - serviceDayStartEpoch);
-            
-            stopTimes.computeIfAbsent(ec.stopId(), k -> new ArrayList<>()).add(seconds);
-        }
-
-        String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-        int dayOfWeek = serviceDay.getDayOfWeek().getValue();
-        String weekday = String.valueOf(dayOfWeek == 7 ? 0 : dayOfWeek);
-
-        List<String> allStopIds = estimatedCalls.stream().map(EstimatedCall::stopId).distinct().collect(Collectors.toList());
-
-        StringBuilder query = new StringBuilder("""
-            WITH valid_services AS (
-                SELECT service_id FROM calendar
-                WHERE start_date <= ? AND end_date >= ?
-                AND (
-                    (monday = 1 AND ? = '1') OR
-                    (tuesday = 1 AND ? = '2') OR
-                    (wednesday = 1 AND ? = '3') OR
-                    (thursday = 1 AND ? = '4') OR
-                    (friday = 1 AND ? = '5') OR
-                    (saturday = 1 AND ? = '6') OR
-                    (sunday = 1 AND ? = '0')
-                )
-                UNION
-                SELECT service_id FROM calendar_dates
-                WHERE date = ? AND exception_type = 1
-            ),
-            excluded_services AS (
-                SELECT service_id FROM calendar_dates
-                WHERE date = ? AND exception_type = 2
-            )
-            SELECT st.trip_id, st.stop_id, st.stop_sequence, st.%s as stop_time
-            FROM stop_times st
-            JOIN trips t ON st.trip_id = t.trip_id
-            WHERE t.route_id = ?
-            AND t.service_id IN (SELECT service_id FROM valid_services)
-            AND t.service_id NOT IN (SELECT service_id FROM excluded_services)
-        """.formatted(timeColumn));
-
-        query.append("AND st.stop_id IN (")
-             .append(allStopIds.stream().map(x -> "?").collect(Collectors.joining(",")))
-             .append(")\n");
-
-        // Add direction constraint if provided
-        if (directionId != null) {
-            query.append("AND t.direction_id = ?\n");
-        }
-
-        // Add destination constraint: last stop_id must match destinationId and be the last stop_sequence for the trip
-        query.append("""
-            AND (
-                st.trip_id NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM stop_times st2
-                    WHERE st2.trip_id = st.trip_id
-                    AND st2.stop_id = ?
-                    AND st2.stop_sequence = (
-                        SELECT MAX(st3.stop_sequence)
-                        FROM stop_times st3
-                        WHERE st3.trip_id = st.trip_id
-                    )
-                )
-            )
-        """);
-
-        if (journeyNote != null) {
-            if (journeyNoteDetailled) {
-                query.append("AND t.trip_short_name LIKE ?\n");
-            } else {
-                query.append("AND t.trip_headsign LIKE ?\n");
-            }
-        }
-
-        // Fenêtres de recherche en minutes (min, max)
-        int[][] windows = {
-            {-1, 1},
-            {-2, 2},
-            {-3, 5},
-            {-3, 10},
-            {-3, 20},
-            {-3, 30}
-        };
-
-        query.append("ORDER BY st.departure_timestamp ASC;");
-
-        Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
-
-        // Build cache key for this query to avoid repeating heavy DB work for identical inputs
-        StringBuilder keyBuilder = new StringBuilder();
-        keyBuilder.append(routeId).append('|').append(isArrivalTime ? 'A' : 'D').append('|').append(destinationId).append('|');
-        if (journeyNote != null) keyBuilder.append(journeyNote).append('|');
-        if (directionId != null) keyBuilder.append(directionId).append('|');
-        for (EstimatedCall ec : estimatedCalls) {
-            keyBuilder.append(ec.stopId()).append('@').append(ec.isoTime()).append('|');
-        }
-        String cacheKey = keyBuilder.toString();
+        // Check cache first
+        String cacheKey = buildCacheKey(routeId, isArrivalTime, destinationId, journeyNote, directionId, estimatedCalls);
         if (findTripCache.containsKey(cacheKey)) {
             return findTripCache.get(cacheKey);
         }
 
-       try (Connection conn = dataSource.getConnection();
-           PreparedStatement stmt = conn.prepareStatement(query.toString())) {
+        ZoneId zone = PARIS_ZONE;
+        String timeColumn = isArrivalTime ? "arrival_timestamp" : "departure_timestamp";
 
-            int i = 1;
-            stmt.setString(i++, yyyymmdd);
-            stmt.setString(i++, yyyymmdd);
-            for (int j = 0; j < 7; j++) stmt.setString(i++, weekday);
-            stmt.setString(i++, yyyymmdd);
-            stmt.setString(i++, yyyymmdd);
-            stmt.setString(i++, routeId);
+        // Determine service day from estimated calls
+        LocalDate serviceDay = determineServiceDayFromEstimatedCalls(estimatedCalls, zone);
 
-            for (String stopId : allStopIds) {
-                stmt.setString(i++, stopId);
-            }
-            
-            // Set directionId if provided
-            if (directionId != null) {
-                stmt.setInt(i++, directionId);
-            }
-            
-            // Set destinationId for the EXISTS clause
-            stmt.setString(i++, destinationId);
+        // Prepare query parameters
+        String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        int dayOfWeek = serviceDay.getDayOfWeek().getValue();
+        String weekday = String.valueOf(dayOfWeek == 7 ? 0 : dayOfWeek);
+        List<String> allStopIds = estimatedCalls.stream()
+            .map(EstimatedCall::stopId)
+            .distinct()
+            .collect(Collectors.toList());
 
-            // Set trip headsign for the filter
-            if (journeyNote != null && journeyNote.length() == 4) {
-                stmt.setString(i++, journeyNote);
-            }
+        // Build query and fetch candidate trips from database
+        String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled);
+        Map<String, Map<String, List<Integer>>> tripStopTimes = fetchCandidateTrips(
+            query, yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote
+        );
+
+        // Find best matching trip
+        String result = findBestMatchingTrip(tripStopTimes, estimatedCalls, zone);
+        
+        // Cache and return result
+        findTripCache.put(cacheKey, result);
+        return result;
+    }
+
+    /**
+     * Fetches candidate trips from the database based on the query and parameters.
+     */
+    private static Map<String, Map<String, List<Integer>>> fetchCandidateTrips(
+        String query,
+        String yyyymmdd,
+        String weekday,
+        String routeId,
+        List<String> allStopIds,
+        Integer directionId,
+        String destinationId,
+        String journeyNote
+    ) throws SQLException {
+        Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+
+            bindTripFinderParameters(stmt, yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote);
 
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
@@ -381,75 +561,7 @@ public class TripFinder {
             }
         }
 
-        List<TripMatch> allMatches = new ArrayList<>();
-
-        for (int[] window : windows) {
-            int minWindow = window[0] * 60;
-            int maxWindow = window[1] * 60;
-
-            // Pour chaque trip, calculer la somme des différences horaires
-            for (Map.Entry<String, Map<String, List<Integer>>> entry : tripStopTimes.entrySet()) {
-                String tripId = entry.getKey();
-                Map<String, List<Integer>> tripStops = entry.getValue();
-
-                long totalDiff = 0;
-                boolean allStopsMatched = true;
-
-                for (EstimatedCall ec : estimatedCalls) {
-                    String stopId = ec.stopId();
-                    Instant inst = Instant.parse(ec.isoTime());
-                    ZonedDateTime zdtEc = inst.atZone(zone);
-                    LocalDate serviceDayForEc = determineServiceDay(zdtEc, zone);
-                    int realTime = (int) (zdtEc.toEpochSecond() - serviceDayForEc.atStartOfDay(zone).toEpochSecond());
-                    // Keep realTime as seconds since service day's start; may be >= 86400 for midnight-crossing trips
-
-                    List<Integer> theoreticalTimes = tripStops.get(stopId);
-                    if (theoreticalTimes == null || theoreticalTimes.isEmpty()) {
-                        allStopsMatched = false;
-                        break;
-                    }
-                    // Find the closest theoretical time for this stop within the window
-                    Integer bestTheo = null;
-                    int minDiff = Integer.MAX_VALUE;
-                    for (Integer theoTime : theoreticalTimes) {
-                        // theoTime may be >= 86400 for trips continuing after midnight; keep as-is
-                        int normalizedTheoTime = theoTime;
-                        int diff = normalizedTheoTime - realTime;
-
-                        if (diff >= minWindow && diff <= maxWindow) {
-                            int absDiff = Math.abs(diff);
-                            if (absDiff < minDiff) {
-                                minDiff = absDiff;
-                                bestTheo = normalizedTheoTime;
-                            }
-                        }
-                    }
-                    if (bestTheo == null) {
-                        allStopsMatched = false;
-                        break;
-                    }
-                    totalDiff += minDiff;
-                }
-
-                if (allStopsMatched) {
-                    allMatches.add(new TripMatch(tripId, totalDiff));
-                }
-            }
-        }
-
-        // Trier tous les matches trouvés par totalDiff croissant
-        allMatches.sort((a, b) -> Long.compare(a.totalDiff, b.totalDiff));
-
-        if (!allMatches.isEmpty()) {
-            // Retourner le trip_id avec la plus petite différence totale
-            String result = allMatches.get(0).tripId;
-            findTripCache.put(cacheKey, result);
-            return result;
-        }
-
-        // Si aucun trip trouvé dans les fenêtres, retourner null
-        findTripCache.put(cacheKey, null);
-        return null;
+        return tripStopTimes;
     }
 
     /**
@@ -870,7 +982,7 @@ public class TripFinder {
     public static List<TripMeta> getActiveTripsForRoutesToday(List<String> routeIds) {
         if (routeIds == null || routeIds.isEmpty()) return java.util.Collections.emptyList();
 
-        ZoneId zone = ZoneId.of("Europe/Paris");
+        ZoneId zone = PARIS_ZONE;
         LocalDate date = LocalDate.now(zone);
         String yyyymmdd = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         int dayOfWeek = date.getDayOfWeek().getValue();

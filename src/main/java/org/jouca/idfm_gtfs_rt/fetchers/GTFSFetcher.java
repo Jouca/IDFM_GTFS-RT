@@ -82,15 +82,22 @@ public class GTFSFetcher {
      *                     </ul>
      */
     public static void fetchGTFS(String urlString, String outputFilePath) throws IOException {
+        logger.info("Starting GTFS data fetch process...");
+        logger.info("Source URL: {}", urlString);
+        logger.info("Target database: {}", outputFilePath);
+        
         // ========================================
         // Step 1: Download GTFS ZIP file from URL
         // ========================================
         // Opens an input stream from the URL and copies the content to a local file.
         // Uses REPLACE_EXISTING to overwrite any previous downloads.
+        logger.info("Step 1/5: Downloading GTFS ZIP file...");
         try (java.io.InputStream in = java.net.URI.create(urlString).toURL().openStream()) {
             java.nio.file.Files.copy(in, java.nio.file.Paths.get("IDFM-gtfs.zip"), 
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            logger.info("GTFS ZIP file downloaded successfully.");
         } catch (IOException e) {
+            logger.error("Failed to download GTFS data from {}: {}", urlString, e.getMessage());
             throw new IOException("Failed to download GTFS data from " + urlString, e);
         }
 
@@ -99,9 +106,12 @@ public class GTFSFetcher {
         // ===================================
         // Extracts all files from IDFM-gtfs.zip to the extracted-gtfs/ directory.
         // Maintains directory structure and overwrites existing files.
+        logger.info("Step 2/5: Extracting ZIP archive...");
         try {
             extractZipFile("IDFM-gtfs.zip", java.nio.file.Paths.get("extracted-gtfs"));
+            logger.info("ZIP archive extracted successfully.");
         } catch (IOException e) {
+            logger.error("Failed to unzip GTFS data: {}", e.getMessage());
             throw new IOException("Failed to unzip GTFS data", e);
         }
 
@@ -110,7 +120,9 @@ public class GTFSFetcher {
         // ================================================================
         // Executes the gtfs-import CLI tool to parse GTFS files and populate the database.
         // The gtfs-import tool creates standard GTFS tables (routes, trips, stops, stop_times, etc.).
+        logger.info("Step 3/5: Importing GTFS data into SQLite database...");
         importGtfsData("./IDFM-gtfs.zip", outputFilePath);
+        logger.info("GTFS data imported successfully.");
 
         // =============================================================================
         // Step 4: Import custom GTFS extension file (stop_extensions.txt)
@@ -118,14 +130,18 @@ public class GTFSFetcher {
         // IDFM provides additional stop metadata in stop_extensions.txt that is not part
         // of standard GTFS. This includes object_id and object_code fields used for
         // matching real-time data with scheduled stops.
+        logger.info("Step 4/5: Importing stop extensions...");
         importStopExtensions("./extracted-gtfs/stop_extensions.txt", outputFilePath);
+        logger.info("Stop extensions imported successfully.");
 
         // ==================================================================================
         // Step 5: Create database indexes for query performance optimization
         // ==================================================================================
         // The following indexes are created to optimize common queries in the application,
         // particularly for real-time trip matching and schedule lookups.
+        logger.info("Step 5/5: Creating database indexes...");
         createDatabaseIndexes(outputFilePath);
+        logger.info("All database indexes created successfully.");
 
         // ==================================================================================
         // Step 6: Completion
@@ -141,6 +157,7 @@ public class GTFSFetcher {
      * @throws IOException If an error occurs during command execution
      */
     private static void executeCommand(String command, String errorMessage) throws IOException {
+        logger.info("Executing command: {}", command);
         ProcessBuilder processBuilder = new ProcessBuilder("/bin/sh", "-c", command);
         processBuilder.redirectErrorStream(true);
         Process process = processBuilder.start();
@@ -149,17 +166,20 @@ public class GTFSFetcher {
                 new java.io.InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                logger.debug(line);
+                logger.info("  > {}", line);
             }
         }
         
         try {
             int exitCode = process.waitFor();
             if (exitCode != 0) {
+                logger.error("Command failed with exit code {}: {}", exitCode, command);
                 throw new IOException(errorMessage + " (exit code: " + exitCode + ")");
             }
+            logger.info("Command completed successfully.");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            logger.error("Command interrupted: {}", command);
             throw new IOException(errorMessage + " (process interrupted)", e);
         }
     }

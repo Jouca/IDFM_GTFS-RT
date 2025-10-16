@@ -10,6 +10,8 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.jouca.idfm_gtfs_rt.fetchers.GTFSFetcher;
 import org.jouca.idfm_gtfs_rt.generator.AlertGenerator;
 import org.jouca.idfm_gtfs_rt.generator.TripUpdateGenerator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
 import org.springframework.context.ApplicationContext;
@@ -41,6 +43,8 @@ import io.github.cdimascio.dotenv.Dotenv;
  */
 @Service
 public class ScheduledTasks {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ScheduledTasks.class);
     
     /**
      * Generator for GTFS-RT trip updates based on real-time data.
@@ -110,8 +114,9 @@ public class ScheduledTasks {
 
             // Check if the database file exists
             if (!Files.exists(dbPath)) {
-                System.out.println("SQLite database not found. Fetching GTFS data...");
+                logger.info("SQLite database not found at {}. Fetching GTFS data from {}...", GTFS_FILE_PATH, GTFS_URL);
                 GTFSFetcher.fetchGTFS(GTFS_URL, GTFS_FILE_PATH);
+                logger.info("GTFS data fetch completed successfully.");
                 return;
             }
 
@@ -119,16 +124,17 @@ public class ScheduledTasks {
             BasicFileAttributes attrs = Files.readAttributes(dbPath, BasicFileAttributes.class);
             Instant lastModifiedTime = attrs.lastModifiedTime().toInstant();
             Instant now = Instant.now();
+            long hoursSinceUpdate = ChronoUnit.HOURS.between(lastModifiedTime, now);
 
-            if (ChronoUnit.HOURS.between(lastModifiedTime, now) > 24) {
-                System.out.println("SQLite database is outdated. Fetching GTFS data...");
+            if (hoursSinceUpdate > 24) {
+                logger.info("SQLite database is outdated ({} hours old). Fetching fresh GTFS data from {}...", hoursSinceUpdate, GTFS_URL);
                 GTFSFetcher.fetchGTFS(GTFS_URL, GTFS_FILE_PATH);
+                logger.info("GTFS data fetch completed successfully.");
             } else {
-                System.out.println("SQLite database is up-to-date.");
+                logger.info("SQLite database is up-to-date ({} hours old).", hoursSinceUpdate);
             }
         } catch (Exception e) {
-            System.err.println("Failed to check or update GTFS data:");
-            e.printStackTrace();
+            logger.error("Failed to check or update GTFS data: {}", e.getMessage(), e);
         }
     }
 

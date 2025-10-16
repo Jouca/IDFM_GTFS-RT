@@ -36,8 +36,19 @@ public class GTFSRTApplication implements ApplicationListener<ContextRefreshedEv
     
     /**
      * Instance of {@link ScheduledTasks} responsible for managing periodic GTFS data updates.
+     * This is injected by Spring, not manually instantiated.
      */
-    private final ScheduledTasks scheduledTasks = new ScheduledTasks();
+    private ScheduledTasks scheduledTasks;
+
+    /**
+     * Constructor with dependency injection for ScheduledTasks.
+     * Spring will automatically inject the ScheduledTasks bean.
+     * 
+     * @param scheduledTasks The Spring-managed ScheduledTasks service
+     */
+    public GTFSRTApplication(ScheduledTasks scheduledTasks) {
+        this.scheduledTasks = scheduledTasks;
+    }
 
     /**
      * Main entry point for the Spring Boot application.
