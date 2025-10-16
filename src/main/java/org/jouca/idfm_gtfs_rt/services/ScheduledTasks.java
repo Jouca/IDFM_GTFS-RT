@@ -85,11 +85,16 @@ public class ScheduledTasks {
     private static final String GTFS_FILE_PATH = "./gtfs.db";
     
     /**
+     * Environment variable key for the GTFS URL configuration.
+     */
+    private static final String GTFS_URL_ENV_KEY = "GTFS_URL";
+    
+    /**
      * URL to download GTFS static data from. Can be configured via the GTFS_URL environment variable.
      * Defaults to the Île-de-France Mobilités GTFS data URL if not specified.
      */
-    private static final String GTFS_URL = (dotenv.get("GTFS_URL") != null && !dotenv.get("GTFS_URL").isEmpty())
-        ? dotenv.get("GTFS_URL")
+    private static final String GTFS_URL = (dotenv.get(GTFS_URL_ENV_KEY) != null && !dotenv.get(GTFS_URL_ENV_KEY).isEmpty())
+        ? dotenv.get(GTFS_URL_ENV_KEY)
         : "https://data.iledefrance-mobilites.fr/explore/dataset/offre-horaires-tc-gtfs-idfm/files/a925e164271e4bca93433756d6a340d1/download/";
 
     /**

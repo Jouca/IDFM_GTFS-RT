@@ -69,6 +69,27 @@ public class TripUpdateGenerator {
     
     /** SIRI Lite JSON field name for journey note */
     private static final String FIELD_JOURNEY_NOTE = "JourneyNote";
+    
+    /** SIRI Lite JSON field name for stop point reference */
+    private static final String FIELD_STOP_POINT_REF = "StopPointRef";
+    
+    /** SIRI Lite JSON field name for departure status */
+    private static final String FIELD_DEPARTURE_STATUS = "DepartureStatus";
+    
+    /** SIRI Lite JSON field name for arrival status */
+    private static final String FIELD_ARRIVAL_STATUS = "ArrivalStatus";
+    
+    /** SIRI Lite JSON field name for direction reference */
+    private static final String FIELD_DIRECTION_REF = "DirectionRef";
+    
+    /** SIRI Lite JSON field name for direction name */
+    private static final String FIELD_DIRECTION_NAME = "DirectionName";
+    
+    /** Common JSON field name used across SIRI Lite responses */
+    private static final String FIELD_VALUE = "value";
+    
+    /** Status value indicating a cancelled stop or trip in SIRI Lite data */
+    private static final String STATUS_CANCELLED = "CANCELLED";
 
     /** Flag to enable debug file output (configured via application properties) */
     @Value("${gtfsrt.debug.dump:false}")
@@ -629,8 +650,8 @@ public class TripUpdateGenerator {
      * @return an IndexedEntity containing the built GTFS-RT entity, or null if processing fails
      */
     private IndexedEntity processEntity(JsonNode entity, int index, Map<String, JsonNode> entitiesTrips, ProcessingContext context) {
-        String lineId = "IDFM:" + entity.get("LineRef").get("value").asText().split(":")[3];
-        String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
+        String lineId = "IDFM:" + entity.get("LineRef").get(FIELD_VALUE).asText().split(":")[3];
+        String vehicleId = entity.get("DatedVehicleJourneyRef").get(FIELD_VALUE).asText();
 
         DirectionInfo directionInfo = extractDirectionInfo(entity, vehicleId);
         
@@ -682,9 +703,9 @@ public class TripUpdateGenerator {
 
         if (entity.get(FIELD_JOURNEY_NOTE) != null &&
             entity.get(FIELD_JOURNEY_NOTE).size() > 0 &&
-            entity.get(FIELD_JOURNEY_NOTE).get(0).get("value") != null &&
-            entity.get(FIELD_JOURNEY_NOTE).get(0).get("value").asText().matches("^[A-Z]{4}$")) {
-            journeyNote = entity.get(FIELD_JOURNEY_NOTE).get(0).get("value").asText();
+            entity.get(FIELD_JOURNEY_NOTE).get(0).get(FIELD_VALUE) != null &&
+            entity.get(FIELD_JOURNEY_NOTE).get(0).get(FIELD_VALUE).asText().matches("^[A-Z]{4}$")) {
+            journeyNote = entity.get(FIELD_JOURNEY_NOTE).get(0).get(FIELD_VALUE).asText();
         } else {
             int direction = determineDirection(entity);
             directionIdForMatching = (direction != -1) ? direction : null;
@@ -710,7 +731,7 @@ public class TripUpdateGenerator {
      * @return the resolved destination ID, or null if not found
      */
     private String extractDestinationId(JsonNode entity) {
-        String destinationIdCode = entity.get("DestinationRef").get("value").asText().split(":")[3];
+        String destinationIdCode = entity.get("DestinationRef").get(FIELD_VALUE).asText().split(":")[3];
         return TripFinder.resolveStopId(destinationIdCode);
     }
 
@@ -723,7 +744,7 @@ public class TripUpdateGenerator {
     private List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> buildEstimatedCallList(List<JsonNode> estimatedCalls) {
         List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList = new ArrayList<>();
         for (JsonNode call : estimatedCalls) {
-            String stopCode = call.get("StopPointRef").get("value").asText().split(":")[3];
+            String stopCode = call.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
             String stopId = TripFinder.resolveStopId(stopCode);
             if (stopId == null) continue;
 
@@ -895,8 +916,8 @@ public class TripUpdateGenerator {
      */
     private void addStopTimeUpdates(GtfsRealtime.TripUpdate.Builder tripUpdate, List<JsonNode> estimatedCalls, String tripId) {
         boolean allCancelled = estimatedCalls.stream().allMatch(call ->
-            (call.has("DepartureStatus") && call.get("DepartureStatus").asText().contains("CANCELLED")) ||
-            (call.has("ArrivalStatus") && call.get("ArrivalStatus").asText().contains("CANCELLED"))
+            (call.has(FIELD_DEPARTURE_STATUS) && call.get(FIELD_DEPARTURE_STATUS).asText().contains(STATUS_CANCELLED)) ||
+            (call.has(FIELD_ARRIVAL_STATUS) && call.get(FIELD_ARRIVAL_STATUS).asText().contains(STATUS_CANCELLED))
         );
         
         if (allCancelled) {
@@ -928,8 +949,8 @@ public class TripUpdateGenerator {
      * @return 0 or 1 for valid directions, -1 if direction cannot be determined
      */
     private int determineDirection(JsonNode entity) {
-        if (entity.has("DirectionRef") && entity.get("DirectionRef").has("value")) {
-            String directionValue = entity.get("DirectionRef").get("value").asText();
+        if (entity.has(FIELD_DIRECTION_REF) && entity.get(FIELD_DIRECTION_REF).has(FIELD_VALUE)) {
+            String directionValue = entity.get(FIELD_DIRECTION_REF).get(FIELD_VALUE).asText();
             if (directionValue.contains(":")) {
                 String[] directionParts = directionValue.split(":");
                 if (directionParts.length > 3) {
@@ -949,8 +970,8 @@ public class TripUpdateGenerator {
             }
         } 
         
-        if (entity.has("DirectionName") && entity.get("DirectionName").size() > 0) {
-            String directionName = entity.get("DirectionName").get(0).get("value").asText();
+        if (entity.has(FIELD_DIRECTION_NAME) && entity.get(FIELD_DIRECTION_NAME).size() > 0) {
+            String directionName = entity.get(FIELD_DIRECTION_NAME).get(0).get(FIELD_VALUE).asText();
 
             // IDFM cases
             if (directionName.equals("A")) {
@@ -979,8 +1000,8 @@ public class TripUpdateGenerator {
      */
     boolean checkStopIntegrity(JsonNode entity) {
         // Check if the stop is a integer
-        if (entity.has("StopPointRef") && entity.get("StopPointRef").has("value")) {
-            String stopPointRef = entity.get("StopPointRef").get("value").asText().split(":")[3];
+        if (entity.has(FIELD_STOP_POINT_REF) && entity.get(FIELD_STOP_POINT_REF).has(FIELD_VALUE)) {
+            String stopPointRef = entity.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
             return stopPointRef.matches("\\d+"); // Check if the stop ID is an integer
         }
 
@@ -1097,7 +1118,7 @@ public class TripUpdateGenerator {
             if (departureTime < currentEpochSecond) return;
         }
 
-        String stopId = TripFinder.resolveStopId(estimatedCall.get("StopPointRef").get("value").asText().split(":")[3]);
+        String stopId = TripFinder.resolveStopId(estimatedCall.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3]);
         if (stopId == null) return;
 
         String stopSequence = TripFinder.findStopSequence(tripId, stopId, stopTimeUpdates);
@@ -1126,7 +1147,7 @@ public class TripUpdateGenerator {
         }
 
         // Check if skipped
-        if (estimatedCall.has("DepartureStatus") && estimatedCall.get("DepartureStatus").asText().contains("CANCELLED")) {
+        if (estimatedCall.has(FIELD_DEPARTURE_STATUS) && estimatedCall.get(FIELD_DEPARTURE_STATUS).asText().contains(STATUS_CANCELLED)) {
             stopTimeUpdate.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
 
             // Clear the arrival time if the departure is cancelled
@@ -1136,7 +1157,7 @@ public class TripUpdateGenerator {
             if (stopTimeUpdate.hasDeparture()) {
                 stopTimeUpdate.clearDeparture();
             }
-        } else if (estimatedCall.has("ArrivalStatus") && estimatedCall.get("ArrivalStatus").asText().contains("CANCELLED")) {
+        } else if (estimatedCall.has(FIELD_ARRIVAL_STATUS) && estimatedCall.get(FIELD_ARRIVAL_STATUS).asText().contains(STATUS_CANCELLED)) {
             stopTimeUpdate.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
 
             // Clear the departure time if the arrival is cancelled
