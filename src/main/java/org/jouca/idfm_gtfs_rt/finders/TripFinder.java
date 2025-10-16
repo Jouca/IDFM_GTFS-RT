@@ -369,7 +369,7 @@ public class TripFinder {
         stmt.setString(i++, params.destinationId);
 
         if (params.journeyNote != null && params.journeyNote.length() == 4) {
-            stmt.setString(i++, params.journeyNote);
+            stmt.setString(i, params.journeyNote);
         }
     }
 
@@ -561,7 +561,7 @@ public class TripFinder {
         List<String> allStopIds = estimatedCalls.stream()
             .map(EstimatedCall::stopId)
             .distinct()
-            .collect(Collectors.toList());
+            .toList();
 
         // Build query and fetch candidate trips from database
         String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled);
