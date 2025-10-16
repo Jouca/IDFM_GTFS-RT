@@ -60,6 +60,12 @@ public class TripUpdateGenerator {
     
     /** Width of the progress bar displayed during processing */
     private static final int PROGRESS_BAR_WIDTH = 40;
+    
+    /** SIRI Lite JSON field names for time attributes */
+    private static final String FIELD_EXPECTED_ARRIVAL_TIME = "ExpectedArrivalTime";
+    private static final String FIELD_EXPECTED_DEPARTURE_TIME = "ExpectedDepartureTime";
+    private static final String FIELD_AIMED_ARRIVAL_TIME = "AimedArrivalTime";
+    private static final String FIELD_AIMED_DEPARTURE_TIME = "AimedDepartureTime";
 
     /** Flag to enable debug file output (configured via application properties) */
     @Value("${gtfsrt.debug.dump:false}")
@@ -295,14 +301,14 @@ public class TripUpdateGenerator {
         if (estimatedCalls != null && estimatedCalls.size() > 0) {
             JsonNode firstCall = estimatedCalls.get(0);
             String time = null;
-            if (firstCall.has("ExpectedDepartureTime")) {
-                time = firstCall.get("ExpectedDepartureTime").asText();
-            } else if (firstCall.has("ExpectedArrivalTime")) {
-                time = firstCall.get("ExpectedArrivalTime").asText();
-            } else if (firstCall.has("AimedDepartureTime")) {
-                time = firstCall.get("AimedDepartureTime").asText();
-            } else if (firstCall.has("AimedArrivalTime")) {
-                time = firstCall.get("AimedArrivalTime").asText();
+            if (firstCall.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+                time = firstCall.get(FIELD_EXPECTED_DEPARTURE_TIME).asText();
+            } else if (firstCall.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+                time = firstCall.get(FIELD_EXPECTED_ARRIVAL_TIME).asText();
+            } else if (firstCall.has(FIELD_AIMED_DEPARTURE_TIME)) {
+                time = firstCall.get(FIELD_AIMED_DEPARTURE_TIME).asText();
+            } else if (firstCall.has(FIELD_AIMED_ARRIVAL_TIME)) {
+                time = firstCall.get(FIELD_AIMED_ARRIVAL_TIME).asText();
             }
             if (time != null) {
                 return Instant.parse(time)
@@ -424,7 +430,7 @@ public class TripUpdateGenerator {
      * @param context processing context containing real-time trip statistics
      */
     void appendCanceledTrips(GtfsRealtime.FeedMessage.Builder feedMessage, ProcessingContext context) {
-        if (context == null || context.statsByRouteDirection.isEmpty()) {
+        if (!isValidContext(context)) {
             return;
         }
 
@@ -434,50 +440,150 @@ public class TripUpdateGenerator {
             return;
         }
 
-        Map<String, Map<Integer, List<TripFinder.TripMeta>>> theoreticalByRouteDirection = theoreticalTrips.stream()
-                .collect(Collectors.groupingBy(meta -> meta.routeId,
-                        Collectors.groupingBy(meta -> meta.directionId)));
+        Map<String, Map<Integer, List<TripFinder.TripMeta>>> theoreticalByRouteDirection = 
+                groupTheoreticalTripsByRouteAndDirection(theoreticalTrips);
 
-        Set<String> existingEntityIds = feedMessage.getEntityList().stream()
-                .map(GtfsRealtime.FeedEntity::getId)
-                .collect(Collectors.toCollection(java.util.HashSet::new));
+        Set<String> existingEntityIds = extractExistingEntityIds(feedMessage);
 
         for (String routeId : routeIds) {
-            Map<Integer, RealtimeDirectionStats> statsByDirection = context.statsByRouteDirection.get(routeId);
-            if (statsByDirection == null || statsByDirection.isEmpty()) {
-                continue;
-            }
-
-            Map<Integer, List<TripFinder.TripMeta>> theoreticalByDirection = theoreticalByRouteDirection.get(routeId);
-            if (theoreticalByDirection == null || theoreticalByDirection.isEmpty()) {
-                continue;
-            }
-
-            for (Map.Entry<Integer, RealtimeDirectionStats> entry : statsByDirection.entrySet()) {
-                int directionId = entry.getKey();
-                RealtimeDirectionStats stats = entry.getValue();
-                if (stats == null || stats.tripIds.isEmpty()) {
-                    continue;
-                }
-
-                List<TripFinder.TripMeta> candidates = theoreticalByDirection.get(directionId);
-                if (candidates == null || candidates.isEmpty()) {
-                    continue;
-                }
-
-                long cutoff = stats.maxStartTime;
-                if (cutoff == Long.MIN_VALUE) {
-                    continue;
-                }
-
-                candidates.stream()
-                        .sorted(Comparator.comparingInt(meta -> meta.firstTimeSecOfDay))
-                        .filter(meta -> meta.firstTimeSecOfDay <= cutoff)
-                        .filter(meta -> !stats.tripIds.contains(meta.tripId))
-                        .filter(meta -> existingEntityIds.add(meta.tripId))
-                        .forEach(meta -> feedMessage.addEntity(buildCanceledEntity(meta)));
-            }
+            processCanceledTripsForRoute(routeId, context, theoreticalByRouteDirection, existingEntityIds, feedMessage);
         }
+    }
+
+    /**
+     * Validates that the processing context is not null and contains data.
+     * 
+     * @param context the processing context to validate
+     * @return true if context is valid, false otherwise
+     */
+    private boolean isValidContext(ProcessingContext context) {
+        return context != null && !context.statsByRouteDirection.isEmpty();
+    }
+
+    /**
+     * Groups theoretical trips by route ID and direction ID.
+     * 
+     * @param theoreticalTrips the list of theoretical trips to group
+     * @return map of trips grouped by route and direction
+     */
+    private Map<String, Map<Integer, List<TripFinder.TripMeta>>> groupTheoreticalTripsByRouteAndDirection(
+            List<TripFinder.TripMeta> theoreticalTrips) {
+        return theoreticalTrips.stream()
+                .collect(Collectors.groupingBy(meta -> meta.routeId,
+                        Collectors.groupingBy(meta -> meta.directionId)));
+    }
+
+    /**
+     * Extracts existing entity IDs from the feed message.
+     * 
+     * @param feedMessage the feed message to extract IDs from
+     * @return set of existing entity IDs
+     */
+    private Set<String> extractExistingEntityIds(GtfsRealtime.FeedMessage.Builder feedMessage) {
+        return feedMessage.getEntityList().stream()
+                .map(GtfsRealtime.FeedEntity::getId)
+                .collect(Collectors.toCollection(java.util.HashSet::new));
+    }
+
+    /**
+     * Processes canceled trips for a specific route.
+     * 
+     * @param routeId the route ID to process
+     * @param context the processing context
+     * @param theoreticalByRouteDirection grouped theoretical trips
+     * @param existingEntityIds set of existing entity IDs
+     * @param feedMessage the feed message builder to append entities
+     */
+    private void processCanceledTripsForRoute(String routeId, ProcessingContext context,
+            Map<String, Map<Integer, List<TripFinder.TripMeta>>> theoreticalByRouteDirection,
+            Set<String> existingEntityIds, GtfsRealtime.FeedMessage.Builder feedMessage) {
+        
+        Map<Integer, RealtimeDirectionStats> statsByDirection = context.statsByRouteDirection.get(routeId);
+        if (statsByDirection == null || statsByDirection.isEmpty()) {
+            return;
+        }
+
+        Map<Integer, List<TripFinder.TripMeta>> theoreticalByDirection = theoreticalByRouteDirection.get(routeId);
+        if (theoreticalByDirection == null || theoreticalByDirection.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<Integer, RealtimeDirectionStats> entry : statsByDirection.entrySet()) {
+            processCanceledTripsForDirection(entry.getKey(), entry.getValue(), 
+                    theoreticalByDirection, existingEntityIds, feedMessage);
+        }
+    }
+
+    /**
+     * Processes canceled trips for a specific direction.
+     * 
+     * @param directionId the direction ID
+     * @param stats the real-time direction statistics
+     * @param theoreticalByDirection theoretical trips grouped by direction
+     * @param existingEntityIds set of existing entity IDs
+     * @param feedMessage the feed message builder to append entities
+     */
+    private void processCanceledTripsForDirection(int directionId, RealtimeDirectionStats stats,
+            Map<Integer, List<TripFinder.TripMeta>> theoreticalByDirection,
+            Set<String> existingEntityIds, GtfsRealtime.FeedMessage.Builder feedMessage) {
+        
+        if (!isValidDirectionStats(stats)) {
+            return;
+        }
+
+        List<TripFinder.TripMeta> candidates = theoreticalByDirection.get(directionId);
+        if (candidates == null || candidates.isEmpty()) {
+            return;
+        }
+
+        long cutoff = stats.maxStartTime;
+        if (cutoff == Long.MIN_VALUE) {
+            return;
+        }
+
+        addCanceledTripEntities(candidates, cutoff, stats.tripIds, existingEntityIds, feedMessage);
+    }
+
+    /**
+     * Validates that direction statistics contain valid data.
+     * 
+     * @param stats the direction statistics to validate
+     * @return true if valid, false otherwise
+     */
+    private boolean isValidDirectionStats(RealtimeDirectionStats stats) {
+        return stats != null && !stats.tripIds.isEmpty();
+    }
+
+    /**
+     * Filters and adds canceled trip entities to the feed.
+     * 
+     * @param candidates list of candidate trips to check
+     * @param cutoff the maximum start time cutoff
+     * @param realtimeTripIds set of trip IDs present in real-time data
+     * @param existingEntityIds set of existing entity IDs
+     * @param feedMessage the feed message builder to append entities
+     */
+    private void addCanceledTripEntities(List<TripFinder.TripMeta> candidates, long cutoff,
+            Set<String> realtimeTripIds, Set<String> existingEntityIds,
+            GtfsRealtime.FeedMessage.Builder feedMessage) {
+        
+        candidates.stream()
+                .sorted(Comparator.comparingInt(meta -> meta.firstTimeSecOfDay))
+                .filter(meta -> isTripCanceled(meta, cutoff, realtimeTripIds))
+                .filter(meta -> existingEntityIds.add(meta.tripId))
+                .forEach(meta -> feedMessage.addEntity(buildCanceledEntity(meta)));
+    }
+
+    /**
+     * Determines if a trip should be marked as canceled.
+     * 
+     * @param meta the trip metadata
+     * @param cutoff the time cutoff
+     * @param realtimeTripIds set of trip IDs in real-time data
+     * @return true if the trip should be canceled, false otherwise
+     */
+    private boolean isTripCanceled(TripFinder.TripMeta meta, long cutoff, Set<String> realtimeTripIds) {
+        return meta.firstTimeSecOfDay <= cutoff && !realtimeTripIds.contains(meta.tripId);
     }
 
     /**
@@ -568,14 +674,14 @@ public class TripUpdateGenerator {
             if (stopId == null) continue;
 
             String isoTime = null;
-            if (call.has("ExpectedArrivalTime")) {
-                isoTime = call.get("ExpectedArrivalTime").asText();
-            } else if (call.has("ExpectedDepartureTime")) {
-                isoTime = call.get("ExpectedDepartureTime").asText();
-            } else if (call.has("AimedArrivalTime")) {
-                isoTime = call.get("AimedArrivalTime").asText();
-            } else if (call.has("AimedDepartureTime")) {
-                isoTime = call.get("AimedDepartureTime").asText();
+            if (call.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+                isoTime = call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText();
+            } else if (call.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+                isoTime = call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText();
+            } else if (call.has(FIELD_AIMED_ARRIVAL_TIME)) {
+                isoTime = call.get(FIELD_AIMED_ARRIVAL_TIME).asText();
+            } else if (call.has(FIELD_AIMED_DEPARTURE_TIME)) {
+                isoTime = call.get(FIELD_AIMED_DEPARTURE_TIME).asText();
             }
             if (isoTime != null) {
                 estimatedCallList.add(new org.jouca.idfm_gtfs_rt.records.EstimatedCall(stopId, isoTime));
@@ -587,7 +693,7 @@ public class TripUpdateGenerator {
         }
 
         // Use the new trip finder method
-        boolean isArrivalTime = !estimatedCallList.isEmpty() && (estimatedCalls.get(0).has("ExpectedArrivalTime") || estimatedCalls.get(0).has("AimedArrivalTime"));
+        boolean isArrivalTime = !estimatedCallList.isEmpty() && (estimatedCalls.get(0).has(FIELD_EXPECTED_ARRIVAL_TIME) || estimatedCalls.get(0).has(FIELD_AIMED_ARRIVAL_TIME));
 
         // Find the trip ID using the TripFinder utility
         final String tripId;
@@ -801,10 +907,10 @@ public class TripUpdateGenerator {
 
         return estimatedCalls.stream()
                 .sorted(Comparator.comparingLong(call -> {
-                    String callTime = call.has("ExpectedArrivalTime") ? call.get("ExpectedArrivalTime").asText()
-                            : call.has("ExpectedDepartureTime") ? call.get("ExpectedDepartureTime").asText() : 
-                            call.has("AimedArrivalTime") ? call.get("AimedArrivalTime").asText() :
-                            call.has("AimedDepartureTime") ? call.get("AimedDepartureTime").asText() : null;
+                    String callTime = call.has(FIELD_EXPECTED_ARRIVAL_TIME) ? call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText()
+                            : call.has(FIELD_EXPECTED_DEPARTURE_TIME) ? call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText() : 
+                            call.has(FIELD_AIMED_ARRIVAL_TIME) ? call.get(FIELD_AIMED_ARRIVAL_TIME).asText() :
+                            call.has(FIELD_AIMED_DEPARTURE_TIME) ? call.get(FIELD_AIMED_DEPARTURE_TIME).asText() : null;
                     return callTime != null ? Instant.parse(callTime).atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond() : Long.MAX_VALUE;
                 }))
                 .collect(Collectors.toList());
@@ -832,19 +938,19 @@ public class TripUpdateGenerator {
      */
     private void processEstimatedCall(JsonNode estimatedCall, GtfsRealtime.TripUpdate.Builder tripUpdate, String tripId, List<String> stopTimeUpdates) {
         // Check if times are after or equal to the current time (utiliser le cache)
-        if (estimatedCall.has("ExpectedArrivalTime")) {
-            long arrivalTime = parseTime(estimatedCall.get("ExpectedArrivalTime").asText());
+        if (estimatedCall.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+            long arrivalTime = parseTime(estimatedCall.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
             if (arrivalTime < currentEpochSecond) return;
-        } else if (estimatedCall.has("AimedArrivalTime")) {
-            long arrivalTime = parseTime(estimatedCall.get("AimedArrivalTime").asText());
+        } else if (estimatedCall.has(FIELD_AIMED_ARRIVAL_TIME)) {
+            long arrivalTime = parseTime(estimatedCall.get(FIELD_AIMED_ARRIVAL_TIME).asText());
             if (arrivalTime < currentEpochSecond) return;
         }
 
-        if (estimatedCall.has("ExpectedDepartureTime")) {
-            long departureTime = parseTime(estimatedCall.get("ExpectedDepartureTime").asText());
+        if (estimatedCall.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+            long departureTime = parseTime(estimatedCall.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
             if (departureTime < currentEpochSecond) return;
-        } else if (estimatedCall.has("AimedDepartureTime")) {
-            long departureTime = parseTime(estimatedCall.get("AimedDepartureTime").asText());
+        } else if (estimatedCall.has(FIELD_AIMED_DEPARTURE_TIME)) {
+            long departureTime = parseTime(estimatedCall.get(FIELD_AIMED_DEPARTURE_TIME).asText());
             if (departureTime < currentEpochSecond) return;
         }
 
@@ -860,19 +966,19 @@ public class TripUpdateGenerator {
         stopTimeUpdate.setStopSequence(Integer.parseInt(stopSequence));
         stopTimeUpdate.setStopId(stopId);
 
-        if (estimatedCall.has("ExpectedArrivalTime")) {
-            long arrivalTime = parseTime(estimatedCall.get("ExpectedArrivalTime").asText());
+        if (estimatedCall.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+            long arrivalTime = parseTime(estimatedCall.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
             stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
-        } else if (estimatedCall.has("AimedArrivalTime")) {
-            long arrivalTime = parseTime(estimatedCall.get("AimedArrivalTime").asText());
+        } else if (estimatedCall.has(FIELD_AIMED_ARRIVAL_TIME)) {
+            long arrivalTime = parseTime(estimatedCall.get(FIELD_AIMED_ARRIVAL_TIME).asText());
             stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
         }
 
-        if (estimatedCall.has("ExpectedDepartureTime")) {
-            long departureTime = parseTime(estimatedCall.get("ExpectedDepartureTime").asText());
+        if (estimatedCall.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+            long departureTime = parseTime(estimatedCall.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
             stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
-        } else if (estimatedCall.has("AimedDepartureTime")) {
-            long departureTime = parseTime(estimatedCall.get("AimedDepartureTime").asText());
+        } else if (estimatedCall.has(FIELD_AIMED_DEPARTURE_TIME)) {
+            long departureTime = parseTime(estimatedCall.get(FIELD_AIMED_DEPARTURE_TIME).asText());
             stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
         }
 
