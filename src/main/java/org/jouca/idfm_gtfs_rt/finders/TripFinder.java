@@ -316,7 +316,9 @@ public class TripFinder {
             {-3, 30}
         };
 
-    Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
+        query.append("ORDER BY st.departure_timestamp ASC;");
+
+        Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
 
         // Build cache key for this query to avoid repeating heavy DB work for identical inputs
         StringBuilder keyBuilder = new StringBuilder();
