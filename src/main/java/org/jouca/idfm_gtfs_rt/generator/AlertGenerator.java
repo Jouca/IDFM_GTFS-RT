@@ -34,6 +34,11 @@ import com.google.transit.realtime.GtfsRealtime;
 @Component
 public class AlertGenerator {
     
+    private static final String FIELD_CAUSE = "cause";
+    private static final String FIELD_SEVERITY = "severity";
+    private static final String FIELD_TITLE = "title";
+    private static final String FIELD_MESSAGE = "message";
+    
     /**
      * Creates a GTFS-Realtime TimeRange from an application period JSON node.
      *
@@ -151,8 +156,7 @@ public class AlertGenerator {
             case "line":
                 entitySelector.setRouteId(Id);
                 break;
-            case "stop_point":
-            case "stop_area":
+            case "stop_point", "stop_area":
                 entitySelector.setStopId(Id);
                 break;
             default:
@@ -212,10 +216,10 @@ public class AlertGenerator {
      */
     private void populateAlertBuilder(GtfsRealtime.Alert.Builder alertBuilder, Map<String, Object> alert, Map<String, Object> lines) {
         String disruptionId = alert.get("id").toString();
-        String cause = (String) alert.get("cause");
-        String severity = (String) alert.get("severity");
-        String title = (String) alert.get("title");
-        String message = alert.get("message").toString();
+        String cause = (String) alert.get(FIELD_CAUSE);
+        String severity = (String) alert.get(FIELD_SEVERITY);
+        String title = (String) alert.get(FIELD_TITLE);
+        String message = alert.get(FIELD_MESSAGE).toString();
         
         addInformedEntities(alertBuilder, disruptionId, lines);
         alertBuilder.setCause(mapCause(cause));
@@ -345,11 +349,11 @@ public class AlertGenerator {
             String id = disruption.has("id") ? disruption.get("id").asText() : null;
             ArrayNode applicationPeriods = disruption.has("applicationPeriods") ? (ArrayNode) disruption.get("applicationPeriods") : null;
             String lastUpdate = disruption.has("lastUpdate") ? disruption.get("lastUpdate").asText() : null;
-            String cause = disruption.has("cause") ? disruption.get("cause").asText() : null;
-            String severity = disruption.has("severity") ? disruption.get("severity").asText() : null;
+            String cause = disruption.has(FIELD_CAUSE) ? disruption.get(FIELD_CAUSE).asText() : null;
+            String severity = disruption.has(FIELD_SEVERITY) ? disruption.get(FIELD_SEVERITY).asText() : null;
             ArrayNode tags = disruption.has("tags") ? (ArrayNode) disruption.get("tags") : null;
-            String title = disruption.has("title") ? disruption.get("title").asText() : null;
-            String message = disruption.has("message") ? disruption.get("message").asText() : null;
+            String title = disruption.has(FIELD_TITLE) ? disruption.get(FIELD_TITLE).asText() : null;
+            String message = disruption.has(FIELD_MESSAGE) ? disruption.get(FIELD_MESSAGE).asText() : null;
     
             // Skip disruptions without mandatory fields
             if (id == null || applicationPeriods == null) {
@@ -361,11 +365,11 @@ public class AlertGenerator {
             alert.put("id", id);
             alert.put("applicationPeriods", applicationPeriods);
             alert.put("lastUpdate", lastUpdate);
-            alert.put("cause", cause);
-            alert.put("severity", severity);
+            alert.put(FIELD_CAUSE, cause);
+            alert.put(FIELD_SEVERITY, severity);
             alert.put("tags", tags);
-            alert.put("title", title);
-            alert.put("message", message);
+            alert.put(FIELD_TITLE, title);
+            alert.put(FIELD_MESSAGE, message);
     
             alertDict.put(id, alert);
         }

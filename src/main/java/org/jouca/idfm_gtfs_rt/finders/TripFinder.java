@@ -1128,7 +1128,7 @@ public class TripFinder {
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
                     String routeId = rs.getString("route_id");
-                    int dir = rs.getInt("direction_id");
+                    int dir = rs.getInt(COL_DIRECTION_ID);
                     int first = rs.getInt("first_time");
                     TripMeta meta = new TripMeta(tripId, routeId, dir, first);
                     tripMetaCache.put(tripId, meta);
