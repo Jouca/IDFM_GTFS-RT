@@ -949,45 +949,102 @@ public class TripUpdateGenerator {
      * @return 0 or 1 for valid directions, -1 if direction cannot be determined
      */
     private int determineDirection(JsonNode entity) {
-        if (entity.has(FIELD_DIRECTION_REF) && entity.get(FIELD_DIRECTION_REF).has(FIELD_VALUE)) {
-            String directionValue = entity.get(FIELD_DIRECTION_REF).get(FIELD_VALUE).asText();
-            if (directionValue.contains(":")) {
-                String[] directionParts = directionValue.split(":");
-                if (directionParts.length > 3) {
-                    String directionString = directionParts[3];
-                    if ("A".equals(directionString)) {
-                        return 1;
-                    } else if ("R".equals(directionString)) {
-                        return 0;
-                    }
-                }
-            } else {
-                if ("Aller".equals(directionValue) || "inbound".equals(directionValue) || "A".equals(directionValue)) {
-                    return 1;
-                } else if ("Retour".equals(directionValue) || "outbound".equals(directionValue) || "R".equals(directionValue)) {
-                    return 0;
-                }
-            }
-        } 
-        
-        if (entity.has(FIELD_DIRECTION_NAME) && entity.get(FIELD_DIRECTION_NAME).size() > 0) {
-            String directionName = entity.get(FIELD_DIRECTION_NAME).get(0).get(FIELD_VALUE).asText();
-
-            // IDFM cases
-            if (directionName.equals("A")) {
-                return 0;
-            } else if (directionName.equals("R")) {
-                return 1;
-            }
-
-            if (directionName.equals("Aller") || directionName.equals("inbound")) {
-                return 1;
-            } else if (directionName.equals("Retour") || directionName.equals("outbound")) {
-                return 0;
-            }
+        // Try DirectionRef field first
+        int direction = parseDirectionFromRef(entity);
+        if (direction != -1) {
+            return direction;
         }
+        
+        // Fall back to DirectionName field
+        return parseDirectionFromName(entity);
+    }
 
-        return -1; // Invalid direction
+    /**
+     * Parses direction from the DirectionRef field.
+     * 
+     * @param entity the SIRI Lite entity
+     * @return direction ID (0 or 1), or -1 if not found or invalid
+     */
+    private int parseDirectionFromRef(JsonNode entity) {
+        if (!entity.has(FIELD_DIRECTION_REF) || !entity.get(FIELD_DIRECTION_REF).has(FIELD_VALUE)) {
+            return -1;
+        }
+        
+        String directionValue = entity.get(FIELD_DIRECTION_REF).get(FIELD_VALUE).asText();
+        
+        if (directionValue.contains(":")) {
+            return parseDirectionFromColonDelimitedValue(directionValue);
+        }
+        
+        return parseDirectionFromSimpleValue(directionValue);
+    }
+
+    /**
+     * Parses direction from a colon-delimited DirectionRef value (IDFM format).
+     * 
+     * @param directionValue the colon-delimited direction value
+     * @return direction ID (0 or 1), or -1 if not found or invalid
+     */
+    private int parseDirectionFromColonDelimitedValue(String directionValue) {
+        String[] directionParts = directionValue.split(":");
+        if (directionParts.length <= 3) {
+            return -1;
+        }
+        
+        String directionString = directionParts[3];
+        if ("A".equals(directionString)) {
+            return 1;
+        } else if ("R".equals(directionString)) {
+            return 0;
+        }
+        
+        return -1;
+    }
+
+    /**
+     * Parses direction from a simple (non-colon-delimited) direction value.
+     * 
+     * @param directionValue the direction value to parse
+     * @return direction ID (0 or 1), or -1 if not found or invalid
+     */
+    private int parseDirectionFromSimpleValue(String directionValue) {
+        if ("Aller".equals(directionValue) || "inbound".equals(directionValue) || "A".equals(directionValue)) {
+            return 1;
+        } else if ("Retour".equals(directionValue) || "outbound".equals(directionValue) || "R".equals(directionValue)) {
+            return 0;
+        }
+        
+        return -1;
+    }
+
+    /**
+     * Parses direction from the DirectionName field.
+     * 
+     * @param entity the SIRI Lite entity
+     * @return direction ID (0 or 1), or -1 if not found or invalid
+     */
+    private int parseDirectionFromName(JsonNode entity) {
+        if (!entity.has(FIELD_DIRECTION_NAME) || entity.get(FIELD_DIRECTION_NAME).size() == 0) {
+            return -1;
+        }
+        
+        String directionName = entity.get(FIELD_DIRECTION_NAME).get(0).get(FIELD_VALUE).asText();
+        
+        // IDFM specific cases (single letter)
+        if ("A".equals(directionName)) {
+            return 0;
+        } else if ("R".equals(directionName)) {
+            return 1;
+        }
+        
+        // French and English labels
+        if ("Aller".equals(directionName) || "inbound".equals(directionName)) {
+            return 1;
+        } else if ("Retour".equals(directionName) || "outbound".equals(directionName)) {
+            return 0;
+        }
+        
+        return -1;
     }
 
     /**
@@ -1101,21 +1158,9 @@ public class TripUpdateGenerator {
      * @param stopTimeUpdates list tracking which stop sequences have been processed
      */
     private void processEstimatedCall(JsonNode estimatedCall, GtfsRealtime.TripUpdate.Builder tripUpdate, String tripId, List<String> stopTimeUpdates) {
-        // Check if times are after or equal to the current time (utiliser le cache)
-        if (estimatedCall.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
-            long arrivalTime = parseTime(estimatedCall.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
-            if (arrivalTime < currentEpochSecond) return;
-        } else if (estimatedCall.has(FIELD_AIMED_ARRIVAL_TIME)) {
-            long arrivalTime = parseTime(estimatedCall.get(FIELD_AIMED_ARRIVAL_TIME).asText());
-            if (arrivalTime < currentEpochSecond) return;
-        }
-
-        if (estimatedCall.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
-            long departureTime = parseTime(estimatedCall.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
-            if (departureTime < currentEpochSecond) return;
-        } else if (estimatedCall.has(FIELD_AIMED_DEPARTURE_TIME)) {
-            long departureTime = parseTime(estimatedCall.get(FIELD_AIMED_DEPARTURE_TIME).asText());
-            if (departureTime < currentEpochSecond) return;
+        // Skip if times are in the past
+        if (isEstimatedCallInPast(estimatedCall)) {
+            return;
         }
 
         String stopId = TripFinder.resolveStopId(estimatedCall.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3]);
@@ -1130,6 +1175,50 @@ public class TripUpdateGenerator {
         stopTimeUpdate.setStopSequence(Integer.parseInt(stopSequence));
         stopTimeUpdate.setStopId(stopId);
 
+        // Set arrival and departure times
+        setArrivalTime(estimatedCall, stopTimeUpdate);
+        setDepartureTime(estimatedCall, stopTimeUpdate);
+
+        // Handle cancellations
+        handleCancellationStatus(estimatedCall, stopTimeUpdate);
+    }
+
+    /**
+     * Checks if the estimated call is in the past and should be skipped.
+     * 
+     * @param estimatedCall the estimated call to check
+     * @return true if the call is in the past, false otherwise
+     */
+    private boolean isEstimatedCallInPast(JsonNode estimatedCall) {
+        // Check arrival times
+        if (estimatedCall.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+            long arrivalTime = parseTime(estimatedCall.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
+            if (arrivalTime < currentEpochSecond) return true;
+        } else if (estimatedCall.has(FIELD_AIMED_ARRIVAL_TIME)) {
+            long arrivalTime = parseTime(estimatedCall.get(FIELD_AIMED_ARRIVAL_TIME).asText());
+            if (arrivalTime < currentEpochSecond) return true;
+        }
+
+        // Check departure times
+        if (estimatedCall.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+            long departureTime = parseTime(estimatedCall.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
+            if (departureTime < currentEpochSecond) return true;
+        } else if (estimatedCall.has(FIELD_AIMED_DEPARTURE_TIME)) {
+            long departureTime = parseTime(estimatedCall.get(FIELD_AIMED_DEPARTURE_TIME).asText());
+            if (departureTime < currentEpochSecond) return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Sets the arrival time on the stop time update from the estimated call.
+     * Prefers ExpectedArrivalTime over AimedArrivalTime.
+     * 
+     * @param estimatedCall the estimated call containing time data
+     * @param stopTimeUpdate the stop time update builder to set the arrival time on
+     */
+    private void setArrivalTime(JsonNode estimatedCall, GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stopTimeUpdate) {
         if (estimatedCall.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
             long arrivalTime = parseTime(estimatedCall.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
             stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
@@ -1137,7 +1226,16 @@ public class TripUpdateGenerator {
             long arrivalTime = parseTime(estimatedCall.get(FIELD_AIMED_ARRIVAL_TIME).asText());
             stopTimeUpdate.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
         }
+    }
 
+    /**
+     * Sets the departure time on the stop time update from the estimated call.
+     * Prefers ExpectedDepartureTime over AimedDepartureTime.
+     * 
+     * @param estimatedCall the estimated call containing time data
+     * @param stopTimeUpdate the stop time update builder to set the departure time on
+     */
+    private void setDepartureTime(JsonNode estimatedCall, GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stopTimeUpdate) {
         if (estimatedCall.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
             long departureTime = parseTime(estimatedCall.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
             stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
@@ -1145,28 +1243,26 @@ public class TripUpdateGenerator {
             long departureTime = parseTime(estimatedCall.get(FIELD_AIMED_DEPARTURE_TIME).asText());
             stopTimeUpdate.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
         }
+    }
 
-        // Check if skipped
-        if (estimatedCall.has(FIELD_DEPARTURE_STATUS) && estimatedCall.get(FIELD_DEPARTURE_STATUS).asText().contains(STATUS_CANCELLED)) {
+    /**
+     * Handles cancellation status for the stop time update.
+     * If either departure or arrival is cancelled, marks the stop as SKIPPED
+     * and clears the timing information.
+     * 
+     * @param estimatedCall the estimated call containing status information
+     * @param stopTimeUpdate the stop time update builder to update
+     */
+    private void handleCancellationStatus(JsonNode estimatedCall, GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stopTimeUpdate) {
+        boolean isDepartureCancelled = estimatedCall.has(FIELD_DEPARTURE_STATUS) && 
+                                        estimatedCall.get(FIELD_DEPARTURE_STATUS).asText().contains(STATUS_CANCELLED);
+        boolean isArrivalCancelled = estimatedCall.has(FIELD_ARRIVAL_STATUS) && 
+                                      estimatedCall.get(FIELD_ARRIVAL_STATUS).asText().contains(STATUS_CANCELLED);
+
+        if (isDepartureCancelled || isArrivalCancelled) {
             stopTimeUpdate.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
-
-            // Clear the arrival time if the departure is cancelled
-            if (stopTimeUpdate.hasArrival()) {
-                stopTimeUpdate.clearArrival();
-            }
-            if (stopTimeUpdate.hasDeparture()) {
-                stopTimeUpdate.clearDeparture();
-            }
-        } else if (estimatedCall.has(FIELD_ARRIVAL_STATUS) && estimatedCall.get(FIELD_ARRIVAL_STATUS).asText().contains(STATUS_CANCELLED)) {
-            stopTimeUpdate.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
-
-            // Clear the departure time if the arrival is cancelled
-            if (stopTimeUpdate.hasDeparture()) {
-                stopTimeUpdate.clearDeparture();
-            }
-            if (stopTimeUpdate.hasArrival()) {
-                stopTimeUpdate.clearArrival();
-            }
+            stopTimeUpdate.clearArrival();
+            stopTimeUpdate.clearDeparture();
         }
     }
 
