@@ -18,7 +18,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-import org.jouca.idfm_gtfs_rt.exceptions.GtfsRtProcessingException;
 import org.jouca.idfm_gtfs_rt.fetchers.SiriLiteFetcher;
 import org.jouca.idfm_gtfs_rt.finders.TripFinder;
 import org.slf4j.Logger;
@@ -305,10 +304,8 @@ public class TripUpdateGenerator {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt(); // Restore interrupt status
             logger.error("Thread interrupted during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
-            return;
         } catch (ExecutionException e) {
             logger.error("Execution error during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
-            return;
         } finally {
             shutdownExecutor(executor);
         }
@@ -858,10 +855,8 @@ public class TripUpdateGenerator {
             } catch (InterruptedException e) {
                 logger.error("Thread interrupted while processing entity index {}: {}", i, e.getMessage(), e);
                 Thread.currentThread().interrupt(); // Restore interrupt status
-                throw e; // Re-throw to allow caller to handle
             } catch (ExecutionException e) {
                 logger.error("Execution failed for entity index {}: {}", i, e.getMessage(), e);
-                throw e; // Re-throw to allow caller to handle
             }
             renderProgressBar(i + 1, total);
         }
