@@ -285,6 +285,7 @@ public class TripUpdateGenerator {
         renderProgressBar(0, total);
 
         ExecutorService executor = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
+        List<IndexedEntity> builtEntities = new ArrayList<>();
         try {
             List<Future<IndexedEntity>> futures = new ArrayList<>(total);
 
@@ -294,14 +295,15 @@ public class TripUpdateGenerator {
                 futures.add(executor.submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips, context)));
             }
 
-            List<IndexedEntity> builtEntities = collectFutureResults(futures, total);
+            builtEntities = collectFutureResults(futures, total);
 
             builtEntities.stream()
                 .sorted(Comparator.comparingInt(IndexedEntity::index))
                 .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
         } catch (Exception e) {
-            logger.error("Error during parallel processing: {}", e.getMessage(), e);
-            throw e;
+            logger.error("Error during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
+            throw new RuntimeException("Failed to process SIRI Lite data during parallel entity processing. Processed " + 
+                                     builtEntities.size() + " out of " + total + " entities before failure.", e);
         } finally {
             shutdownExecutor(executor);
         }
