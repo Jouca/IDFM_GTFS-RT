@@ -305,12 +305,10 @@ public class TripUpdateGenerator {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt(); // Restore interrupt status
             logger.error("Thread interrupted during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
-            throw new GtfsRtProcessingException("Parallel processing interrupted. Processed " + 
-                                     builtEntities.size() + " out of " + total + " entities before interruption.", e);
+            return;
         } catch (ExecutionException e) {
             logger.error("Execution error during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
-            throw new GtfsRtProcessingException("Failed to process SIRI Lite data during parallel entity processing. Processed " + 
-                                     builtEntities.size() + " out of " + total + " entities before failure.", e);
+            return;
         } finally {
             shutdownExecutor(executor);
         }
