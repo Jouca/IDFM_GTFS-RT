@@ -199,7 +199,8 @@ public class TripFinder {
      * @param estimatedCalls List of real-time stop estimates with stop IDs and timestamps
      * @param isArrivalTime If true, match on arrival times; if false, match on departure times
      * @param destinationId The final stop ID that the trip must reach
-     * @param journeyNote Optional trip headsign filter (4 characters), or null
+     * @param journeyNote Optional journey note to match against trip headsign or short name
+     * @param journeyNoteDetailled If true, match journeyNote against trip_short_name; if false, against trip_headsign
      * @param directionId Optional direction filter (0 or 1), or null to match both directions
      * @return The matching trip ID, or null if no suitable match is found
      * @throws SQLException If a database error occurs
@@ -211,6 +212,7 @@ public class TripFinder {
         boolean isArrivalTime,
         String destinationId,
         String journeyNote,
+        boolean journeyNoteDetailled,
         Integer directionId
     ) throws SQLException {
         if (routeId == null || estimatedCalls == null || estimatedCalls.isEmpty()) {
@@ -302,8 +304,12 @@ public class TripFinder {
             )
         """);
 
-        if (journeyNote != null && journeyNote.length() == 4) {
-            query.append("AND t.trip_headsign = ?\n");
+        if (journeyNote != null) {
+            if (journeyNoteDetailled) {
+                query.append("AND t.trip_short_name LIKE ?\n");
+            } else {
+                query.append("AND t.trip_headsign LIKE ?\n");
+            }
         }
 
         // Fenêtres de recherche en minutes (min, max)

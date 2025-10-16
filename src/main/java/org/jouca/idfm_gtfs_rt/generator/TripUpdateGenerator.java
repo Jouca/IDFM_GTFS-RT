@@ -459,8 +459,33 @@ public class TripUpdateGenerator {
         String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
 
         // Determine direction from SIRI Lite data
-        int direction = determineDirection(entity);
-        Integer directionIdForMatching = (direction != -1) ? direction : null;
+        Integer directionIdForMatching = null;
+        String journeyNote = null;
+        boolean journeyNoteDetailled = false;
+        if (
+            entity.get("JourneyNote") != null &&
+            entity.get("JourneyNote").size() > 0 &&
+            entity.get("JourneyNote").get(0).get("value") != null &&
+            entity.get("JourneyNote").get(0).get("value").asText().matches("^[A-Z]{4}$") // Exclude 4-letter codes
+        ) {
+            // Get journey note
+            journeyNote = entity.get("JourneyNote").get(0).get("value").asText();
+        } else {
+            // Get direction from DirectionRef or DirectionName
+            int direction = determineDirection(entity);
+            directionIdForMatching = (direction != -1) ? direction : null;
+        }
+
+        // Specific cases with RATP lines where JourneyNote is detailed
+        if (vehicleId.matches("(?<=RATP\\.)[A-Z0-9]+(?=:)")) { // RATP RER vehicles
+            java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("(?<=RATP\\.)[A-Z0-9]+(?=:)").matcher(vehicleId);
+            if (matcher.find()) {
+                journeyNote = matcher.group();
+            } else {
+                journeyNote = vehicleId;
+            }
+            journeyNoteDetailled = true;
+        }
 
         String destinationIdCode = entity.get("DestinationRef").get("value").asText().split(":")[3];
         String destinationId = TripFinder.resolveStopId(destinationIdCode);
@@ -499,17 +524,11 @@ public class TripUpdateGenerator {
         // Use the new trip finder method
         boolean isArrivalTime = !estimatedCallList.isEmpty() && (estimatedCalls.get(0).has("ExpectedArrivalTime") || estimatedCalls.get(0).has("AimedArrivalTime"));
 
-        // Get journey note
-        String journeyNote = null;
-        if (entity.has("JourneyNote") && entity.get("JourneyNote").size() > 0) {
-            journeyNote = entity.get("JourneyNote").get(0).get("value").asText();
-        }
-
         // Find the trip ID using the TripFinder utility
         final String tripId;
         String tmpTripId = null;
         try {
-            tmpTripId = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, destinationId, journeyNote, directionIdForMatching);
+            tmpTripId = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, destinationId, journeyNote, journeyNoteDetailled, directionIdForMatching);
         } catch (SQLException e) {
             e.printStackTrace();
         }
