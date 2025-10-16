@@ -66,6 +66,9 @@ public class TripUpdateGenerator {
     private static final String FIELD_EXPECTED_DEPARTURE_TIME = "ExpectedDepartureTime";
     private static final String FIELD_AIMED_ARRIVAL_TIME = "AimedArrivalTime";
     private static final String FIELD_AIMED_DEPARTURE_TIME = "AimedDepartureTime";
+    
+    /** SIRI Lite JSON field name for journey note */
+    private static final String FIELD_JOURNEY_NOTE = "JourneyNote";
 
     /** Flag to enable debug file output (configured via application properties) */
     @Value("${gtfsrt.debug.dump:false}")
@@ -637,7 +640,7 @@ public class TripUpdateGenerator {
         List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
         List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList = buildEstimatedCallList(estimatedCalls);
 
-        if (lineId == null || lineId.isEmpty() || estimatedCallList.isEmpty()) {
+        if (lineId.isEmpty() || estimatedCallList.isEmpty()) {
             return null;
         }
 
@@ -677,11 +680,11 @@ public class TripUpdateGenerator {
         String journeyNote = null;
         boolean journeyNoteDetailled = false;
 
-        if (entity.get("JourneyNote") != null &&
-            entity.get("JourneyNote").size() > 0 &&
-            entity.get("JourneyNote").get(0).get("value") != null &&
-            entity.get("JourneyNote").get(0).get("value").asText().matches("^[A-Z]{4}$")) {
-            journeyNote = entity.get("JourneyNote").get(0).get("value").asText();
+        if (entity.get(FIELD_JOURNEY_NOTE) != null &&
+            entity.get(FIELD_JOURNEY_NOTE).size() > 0 &&
+            entity.get(FIELD_JOURNEY_NOTE).get(0).get("value") != null &&
+            entity.get(FIELD_JOURNEY_NOTE).get(0).get("value").asText().matches("^[A-Z]{4}$")) {
+            journeyNote = entity.get(FIELD_JOURNEY_NOTE).get(0).get("value").asText();
         } else {
             int direction = determineDirection(entity);
             directionIdForMatching = (direction != -1) ? direction : null;
