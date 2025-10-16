@@ -53,6 +53,12 @@ public class TripFinder {
     /** JDBC connection URL for the SQLite GTFS database */
     private static final String DB_URL = "jdbc:sqlite:./gtfs.db";
     
+    /** Column name constant for stop_id to avoid string duplication */
+    private static final String COL_STOP_ID = "stop_id";
+    
+    /** Column name constant for direction_id to avoid string duplication */
+    private static final String COL_DIRECTION_ID = "direction_id";
+    
     /** Connection pool for database access with optimized settings for concurrent operations */
     private static final BasicDataSource dataSource = new BasicDataSource();
     
@@ -600,7 +606,7 @@ public class TripFinder {
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
                     String tripId = rs.getString("trip_id");
-                    String stopId = rs.getString("stop_id");
+                    String stopId = rs.getString(COL_STOP_ID);
                     int stopTime = rs.getInt("stop_time");
 
                     tripStopTimes
@@ -663,7 +669,7 @@ public class TripFinder {
 
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
-                    String stopId = rs.getString("stop_id");
+                    String stopId = rs.getString(COL_STOP_ID);
                     String arrivalTime = rs.getString("arrival_timestamp");
                     String departureTime = rs.getString("departure_timestamp");
                     int stopSequence = rs.getInt("stop_sequence");
@@ -706,7 +712,7 @@ public class TripFinder {
                 stmt.setString(1, tripId);
                 try (ResultSet rs = stmt.executeQuery()) {
                     while (rs.next()) {
-                        String sId = rs.getString("stop_id");
+                        String sId = rs.getString(COL_STOP_ID);
                         String seq = rs.getString("stop_sequence");
                         seqMap.computeIfAbsent(sId, k -> new ArrayList<>()).add(seq);
                     }
@@ -805,7 +811,7 @@ public class TripFinder {
 
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
-                    return rs.getString("stop_id");
+                    return rs.getString(COL_STOP_ID);
                 }
             }
         } catch (Exception e) {
@@ -999,7 +1005,7 @@ public class TripFinder {
 
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
-                    String dir = rs.getString("direction_id");
+                    String dir = rs.getString(COL_DIRECTION_ID);
                     // no full TripMeta constructed here because cost is small; but we can populate tripMetaCache via getTripMeta
                     TripMeta meta = getTripMeta(tripId);
                     if (meta != null) tripMetaCache.put(tripId, meta);
@@ -1085,7 +1091,7 @@ public class TripFinder {
                 while (rs.next()) {
                     String tripId = rs.getString("trip_id");
                     String routeId = rs.getString("route_id");
-                    int dir = rs.getInt("direction_id");
+                    int dir = rs.getInt(COL_DIRECTION_ID);
                     int first = rs.getInt("first_time");
                     // first may already be seconds since service day; keep raw value but cast into 0..int range
                     result.add(new TripMeta(tripId, routeId, dir, first));

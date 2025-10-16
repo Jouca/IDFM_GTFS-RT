@@ -35,6 +35,220 @@ import com.google.transit.realtime.GtfsRealtime;
 public class AlertGenerator {
     
     /**
+     * Creates a GTFS-Realtime TimeRange from an application period JSON node.
+     *
+     * @param applicationPeriod JSON node containing begin and end timestamps
+     * @return a TimeRange.Builder with start and end times set
+     */
+    private GtfsRealtime.TimeRange.Builder createTimeRange(JsonNode applicationPeriod) {
+        String startStr = applicationPeriod.get("begin").asText();
+        String endStr = applicationPeriod.get("end").asText();
+        
+        long startEpoch = convertToEpoch(startStr);
+        long endEpoch = convertToEpoch(endStr);
+        
+        GtfsRealtime.TimeRange.Builder timeRange = GtfsRealtime.TimeRange.newBuilder();
+        timeRange.setStart(startEpoch);
+        timeRange.setEnd(endEpoch);
+        
+        return timeRange;
+    }
+    
+    /**
+     * Maps IDFM cause strings to GTFS-Realtime Cause enum values.
+     *
+     * @param cause the IDFM cause string (e.g., "TRAVAUX", "PERTURBATION")
+     * @return the corresponding GTFS-Realtime Cause enum value
+     */
+    private GtfsRealtime.Alert.Cause mapCause(String cause) {
+        if (cause == null) {
+            return GtfsRealtime.Alert.Cause.UNKNOWN_CAUSE;
+        }
+        
+        switch (cause) {
+            case "TRAVAUX":
+                return GtfsRealtime.Alert.Cause.CONSTRUCTION;
+            case "PERTURBATION":
+                return GtfsRealtime.Alert.Cause.TECHNICAL_PROBLEM;
+            default:
+                return GtfsRealtime.Alert.Cause.UNKNOWN_CAUSE;
+        }
+    }
+    
+    /**
+     * Maps IDFM severity strings to GTFS-Realtime Effect enum values.
+     *
+     * @param severity the IDFM severity string (e.g., "BLOQUANTE", "PERTURBEE")
+     * @return the corresponding GTFS-Realtime Effect enum value
+     */
+    private GtfsRealtime.Alert.Effect mapEffect(String severity) {
+        if (severity == null) {
+            return GtfsRealtime.Alert.Effect.UNKNOWN_EFFECT;
+        }
+        
+        switch (severity) {
+            case "BLOQUANTE":
+                return GtfsRealtime.Alert.Effect.NO_SERVICE;
+            case "PERTURBEE":
+                return GtfsRealtime.Alert.Effect.REDUCED_SERVICE;
+            default:
+                return GtfsRealtime.Alert.Effect.UNKNOWN_EFFECT;
+        }
+    }
+    
+    /**
+     * Maps IDFM severity strings to GTFS-Realtime SeverityLevel enum values.
+     *
+     * @param severity the IDFM severity string (e.g., "BLOQUANTE", "PERTURBEE")
+     * @return the corresponding GTFS-Realtime SeverityLevel enum value
+     */
+    private GtfsRealtime.Alert.SeverityLevel mapSeverityLevel(String severity) {
+        if (severity == null) {
+            return GtfsRealtime.Alert.SeverityLevel.UNKNOWN_SEVERITY;
+        }
+        
+        switch (severity) {
+            case "BLOQUANTE":
+                return GtfsRealtime.Alert.SeverityLevel.SEVERE;
+            case "PERTURBEE":
+                return GtfsRealtime.Alert.SeverityLevel.WARNING;
+            default:
+                return GtfsRealtime.Alert.SeverityLevel.UNKNOWN_SEVERITY;
+        }
+    }
+    
+    /**
+     * Checks if a disruption ID is present in the impacted object's disruption IDs.
+     *
+     * @param impactedObject JSON node containing disruption IDs
+     * @param disruptionId the disruption ID to search for
+     * @return true if the disruption ID is found, false otherwise
+     */
+    private boolean isDisruptionInImpactedObject(JsonNode impactedObject, String disruptionId) {
+        ArrayNode disruptionIds = (ArrayNode) impactedObject.get("disruptionIds");
+        for (int i = 0; i < disruptionIds.size(); i++) {
+            if (disruptionId.equals(disruptionIds.get(i).asText())) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Processes an impacted object and adds corresponding informed entity to the alert builder.
+     *
+     * @param impactedObject JSON node containing impacted object information
+     * @param alertBuilder the alert builder to add informed entities to
+     */
+    private void addInformedEntity(JsonNode impactedObject, GtfsRealtime.Alert.Builder alertBuilder) {
+        String[] IdParts = impactedObject.get("id").asText().split(":");
+        String Id = String.join(":", Arrays.copyOfRange(IdParts, 1, IdParts.length)).replace("\"", "");
+        String type = impactedObject.get("type").asText();
+        
+        GtfsRealtime.EntitySelector.Builder entitySelector = alertBuilder.addInformedEntityBuilder();
+        
+        switch (type) {
+            case "line":
+                entitySelector.setRouteId(Id);
+                break;
+            case "stop_point":
+            case "stop_area":
+                entitySelector.setStopId(Id);
+                break;
+            default:
+                // Remove the last added entity selector if type is not recognized
+                alertBuilder.removeInformedEntity(alertBuilder.getInformedEntityCount() - 1);
+                break;
+        }
+    }
+    
+    /**
+     * Adds informed entities to the alert builder based on lines and their impacted objects.
+     *
+     * @param alertBuilder the alert builder to add informed entities to
+     * @param disruptionId the disruption ID to match against
+     * @param lines map of line data
+     */
+    private void addInformedEntities(GtfsRealtime.Alert.Builder alertBuilder, String disruptionId, Map<String, Object> lines) {
+        for (Map.Entry<String, Object> lineEntry : lines.entrySet()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> line = (Map<String, Object>) lineEntry.getValue();
+            
+            for (JsonNode impactedObject : (ArrayNode) line.get("impactedObjects")) {
+                if (isDisruptionInImpactedObject(impactedObject, disruptionId)) {
+                    addInformedEntity(impactedObject, alertBuilder);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Sets alert text fields (header and description) on the alert builder.
+     *
+     * @param alertBuilder the alert builder to set text fields on
+     * @param title the title text (may be null)
+     * @param message the description message text
+     */
+    private void setAlertText(GtfsRealtime.Alert.Builder alertBuilder, String title, String message) {
+        if (title != null) {
+            alertBuilder.setHeaderText(
+                GtfsRealtime.TranslatedString.newBuilder()
+                    .addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(title))
+            );
+        }
+        
+        alertBuilder.setDescriptionText(
+            GtfsRealtime.TranslatedString.newBuilder()
+                .addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(message))
+        );
+    }
+    
+    /**
+     * Populates an alert builder with all necessary fields from the alert data.
+     *
+     * @param alertBuilder the alert builder to populate
+     * @param alert map containing alert data
+     * @param lines map of line data for informed entities
+     */
+    private void populateAlertBuilder(GtfsRealtime.Alert.Builder alertBuilder, Map<String, Object> alert, Map<String, Object> lines) {
+        String disruptionId = alert.get("id").toString();
+        String cause = (String) alert.get("cause");
+        String severity = (String) alert.get("severity");
+        String title = (String) alert.get("title");
+        String message = alert.get("message").toString();
+        
+        addInformedEntities(alertBuilder, disruptionId, lines);
+        alertBuilder.setCause(mapCause(cause));
+        alertBuilder.setEffect(mapEffect(severity));
+        alertBuilder.setSeverityLevel(mapSeverityLevel(severity));
+        setAlertText(alertBuilder, title, message);
+    }
+    
+    /**
+     * Creates a GTFS-Realtime alert entity for a specific disruption and application period.
+     *
+     * @param feed the feed message builder to add the entity to
+     * @param alert map containing alert data
+     * @param applicationPeriod JSON node containing the application period
+     * @param lines map of line data for informed entities
+     */
+    private void createAlertEntity(GtfsRealtime.FeedMessage.Builder feed, Map<String, Object> alert, 
+                                    JsonNode applicationPeriod, Map<String, Object> lines) {
+        String startStr = applicationPeriod.get("begin").asText();
+        String endStr = applicationPeriod.get("end").asText();
+        String entityId = alert.get("id").toString() + ":" + startStr + ":" + endStr;
+        
+        GtfsRealtime.Alert.Builder alertBuilder = feed.addEntityBuilder()
+            .setId(entityId)
+            .getAlertBuilder();
+        
+        GtfsRealtime.TimeRange.Builder timeRange = createTimeRange(applicationPeriod);
+        alertBuilder.addActivePeriod(timeRange);
+        
+        populateAlertBuilder(alertBuilder, alert, lines);
+    }
+
+    /**
      * Generates a GTFS-Realtime alert feed from IDFM disruption data.
      * 
      * <p>This method performs the following operations:</p>
@@ -62,118 +276,22 @@ public class AlertGenerator {
         Map<String, Object> alertDict = parseDisruptions(siriData.get("disruptions"));
         Map<String, Object> lines = parseLines(siriData.get("lines"));
 
-        // For each alert, create a new alert entity
+        // For each alert, create a new alert entity for each application period
         for (Map.Entry<String, Object> entry : alertDict.entrySet()) {
             @SuppressWarnings("unchecked")
             Map<String, Object> alert = (Map<String, Object>) entry.getValue();
 
-            // Set active periods
             for (JsonNode applicationPeriod : (ArrayNode) alert.get("applicationPeriods")) {
-                String startStr = applicationPeriod.get("begin").asText();
-                String endStr = applicationPeriod.get("end").asText();
-
-                long startEpoch = convertToEpoch(startStr);
-                long endEpoch = convertToEpoch(endStr);
-
-                // Create a new entity builder for each application period
-                GtfsRealtime.Alert.Builder alertBuilder = feed.addEntityBuilder().setId(alert.get("id").toString() + ":" + startStr + ":" + endStr).getAlertBuilder();
-
-                GtfsRealtime.TimeRange.Builder timeRange = alertBuilder.addActivePeriodBuilder();
-
-                timeRange.setStart(startEpoch);
-                timeRange.setEnd(endEpoch);
-                alertBuilder.addActivePeriod(timeRange);
-
-                // Set other properties for the alertBuilder (informed entities, cause, effect, etc.)
-                for (Map.Entry<String, Object> lineEntry : lines.entrySet()) {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> line = (Map<String, Object>) lineEntry.getValue();
-
-                    for (JsonNode impactedObject : (ArrayNode) line.get("impactedObjects")) {
-                        boolean found = false;
-                        for (int i = 0; i < ((ArrayNode) impactedObject.get("disruptionIds")).size(); i++) {
-                            if (alert.get("id").equals(((ArrayNode) impactedObject.get("disruptionIds")).get(i).asText())) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            continue;
-                        }
-
-                        GtfsRealtime.EntitySelector.Builder entitySelector = alertBuilder.addInformedEntityBuilder();
-
-                        String[] IdParts = impactedObject.get("id").asText().split(":");
-                        String Id = String.join(":", Arrays.copyOfRange(IdParts, 1, IdParts.length)).replace("\"", "");
-
-                        switch (impactedObject.get("type").asText()) {
-                            case "line":
-                                entitySelector.setRouteId(Id);
-                                break;
-                            case "stop_point":
-                                entitySelector.setStopId(Id);
-                                break;
-                            case "stop_area":
-                                entitySelector.setStopId(Id);
-                                break;
-                            default:
-                                alertBuilder.removeInformedEntity(alertBuilder.getInformedEntityCount() - 1);
-                                break;
-                        }
-                    }
-                }
-
-                // Set cause
-                switch (alert.get("cause").toString()) {
-                    case "TRAVAUX":
-                        alertBuilder.setCause(GtfsRealtime.Alert.Cause.CONSTRUCTION);
-                        break;
-                    case "PERTURBATION":
-                        alertBuilder.setCause(GtfsRealtime.Alert.Cause.TECHNICAL_PROBLEM);
-                        break;
-                    default:
-                        alertBuilder.setCause(GtfsRealtime.Alert.Cause.UNKNOWN_CAUSE);
-                        break;
-                }
-
-                // Set effect
-                switch (alert.get("severity").toString()) {
-                    case "BLOQUANTE":
-                        alertBuilder.setEffect(GtfsRealtime.Alert.Effect.NO_SERVICE);
-                        break;
-                    case "PERTURBEE":
-                        alertBuilder.setEffect(GtfsRealtime.Alert.Effect.REDUCED_SERVICE);
-                        break;
-                    default:
-                        alertBuilder.setEffect(GtfsRealtime.Alert.Effect.UNKNOWN_EFFECT);
-                        break;
-                }
-
-                // Set header text
-                if (alert.get("title") != null) {
-                    alertBuilder.setHeaderText(GtfsRealtime.TranslatedString.newBuilder().addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(alert.get("title").toString())));
-                }
-
-                // Set description text
-                alertBuilder.setDescriptionText(GtfsRealtime.TranslatedString.newBuilder().addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(alert.get("message").toString())));
-
-                // Set severity level
-                switch (alert.get("severity").toString()) {
-                    case "BLOQUANTE":
-                        alertBuilder.setSeverityLevel(GtfsRealtime.Alert.SeverityLevel.SEVERE);
-                        break;
-                    case "PERTURBEE":
-                        alertBuilder.setSeverityLevel(GtfsRealtime.Alert.SeverityLevel.WARNING);
-                        break;
-                    default:
-                        alertBuilder.setSeverityLevel(GtfsRealtime.Alert.SeverityLevel.UNKNOWN_SEVERITY);
-                        break;
-                }
+                createAlertEntity(feed, alert, applicationPeriod, lines);
             }
         }
 
         // Build the feed message
-        feed.setHeader(GtfsRealtime.FeedHeader.newBuilder().setGtfsRealtimeVersion("2.0").setIncrementality(GtfsRealtime.FeedHeader.Incrementality.FULL_DATASET).setTimestamp(System.currentTimeMillis()));
+        feed.setHeader(GtfsRealtime.FeedHeader.newBuilder()
+            .setGtfsRealtimeVersion("2.0")
+            .setIncrementality(GtfsRealtime.FeedHeader.Incrementality.FULL_DATASET)
+            .setTimestamp(System.currentTimeMillis()));
+        
         try (FileOutputStream output = new FileOutputStream("gtfs-rt-alerts-idfm.pb")) {
             feed.build().writeTo(output);
         }
