@@ -34,4 +34,6 @@ build/
 
 .env
 gtfs.db
-gtfs.db
+gtfs.db-shm
+gtfs.db-wal
+extracted-gtfs/
