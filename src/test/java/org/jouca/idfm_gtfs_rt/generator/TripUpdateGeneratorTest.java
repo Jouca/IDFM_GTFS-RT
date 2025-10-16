@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -143,39 +145,39 @@ class TripUpdateGeneratorTest {
         assertTrue(result);
     }
 
-    @Test
-    void testCheckStopIntegrityWithInvalidNonNumericStop() throws Exception {
-        String entityJson = """
-            {
-                "StopPointRef": {
-                    "value": "STIF:StopPoint:Q:ABC123"
+    @ParameterizedTest
+    @CsvSource({
+        "'STIF:StopPoint:Q:ABC123', 'non-numeric stop code'",
+        "'STIF:StopPoint:Q:123-ABC', 'special characters in stop code'",
+        "'', 'missing stop point value'"
+    })
+    void testCheckStopIntegrityWithInvalidInputs(String stopPointValue, String description) throws Exception {
+        String entityJson;
+        if (stopPointValue.isEmpty()) {
+            entityJson = """
+                {
+                    "StopPointRef": {}
                 }
-            }
-            """;
+                """;
+        } else {
+            entityJson = String.format("""
+                {
+                    "StopPointRef": {
+                        "value": "%s"
+                    }
+                }
+                """, stopPointValue);
+        }
         
         JsonNode entity = objectMapper.readTree(entityJson);
         boolean result = generator.checkStopIntegrity(entity);
         
-        assertFalse(result);
+        assertFalse(result, "Expected false for: " + description);
     }
 
     @Test
     void testCheckStopIntegrityWithMissingStopPointRef() throws Exception {
         String entityJson = "{}";
-        
-        JsonNode entity = objectMapper.readTree(entityJson);
-        boolean result = generator.checkStopIntegrity(entity);
-        
-        assertFalse(result);
-    }
-
-    @Test
-    void testCheckStopIntegrityWithMissingValue() throws Exception {
-        String entityJson = """
-            {
-                "StopPointRef": {}
-            }
-            """;
         
         JsonNode entity = objectMapper.readTree(entityJson);
         boolean result = generator.checkStopIntegrity(entity);
@@ -412,22 +414,6 @@ class TripUpdateGeneratorTest {
         assertThrows(ArrayIndexOutOfBoundsException.class, () -> {
             generator.checkStopIntegrity(entity);
         });
-    }
-
-    @Test
-    void testCheckStopIntegrityWithSpecialCharacters() throws Exception {
-        String entityJson = """
-            {
-                "StopPointRef": {
-                    "value": "STIF:StopPoint:Q:123-ABC"
-                }
-            }
-            """;
-        
-        JsonNode entity = objectMapper.readTree(entityJson);
-        boolean result = generator.checkStopIntegrity(entity);
-        
-        assertFalse(result); // Contains hyphen, not pure integer
     }
 
     @Test

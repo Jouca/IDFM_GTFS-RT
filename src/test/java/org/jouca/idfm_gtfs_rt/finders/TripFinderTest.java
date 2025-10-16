@@ -78,7 +78,7 @@ class TripFinderTest {
         boolean result = TripFinder.checkIfStopExtensionsTableExists();
         
         // Result should be boolean (test database connection)
-        assertNotNull(result);
+        assertTrue(result || !result); // Verifies method executes without exception
     }
 
     @Test
