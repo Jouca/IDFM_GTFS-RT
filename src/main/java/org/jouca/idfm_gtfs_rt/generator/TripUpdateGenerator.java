@@ -906,14 +906,37 @@ public class TripUpdateGenerator {
         entity.get("EstimatedCalls").get("EstimatedCall").forEach(estimatedCalls::add);
 
         return estimatedCalls.stream()
-                .sorted(Comparator.comparingLong(call -> {
-                    String callTime = call.has(FIELD_EXPECTED_ARRIVAL_TIME) ? call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText()
-                            : call.has(FIELD_EXPECTED_DEPARTURE_TIME) ? call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText() : 
-                            call.has(FIELD_AIMED_ARRIVAL_TIME) ? call.get(FIELD_AIMED_ARRIVAL_TIME).asText() :
-                            call.has(FIELD_AIMED_DEPARTURE_TIME) ? call.get(FIELD_AIMED_DEPARTURE_TIME).asText() : null;
-                    return callTime != null ? Instant.parse(callTime).atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond() : Long.MAX_VALUE;
-                }))
+                .sorted(Comparator.comparingLong(this::extractCallTimeForSorting))
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Extracts the time value from an estimated call for sorting purposes.
+     * 
+     * <p>Checks time fields in order of preference and returns the epoch seconds
+     * of the first available time, or Long.MAX_VALUE if no time is found.
+     * 
+     * @param call the estimated call JSON node
+     * @return epoch seconds of the call time, or Long.MAX_VALUE if unavailable
+     */
+    private long extractCallTimeForSorting(JsonNode call) {
+        String callTime = null;
+        
+        if (call.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+            callTime = call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText();
+        } else if (call.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+            callTime = call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText();
+        } else if (call.has(FIELD_AIMED_ARRIVAL_TIME)) {
+            callTime = call.get(FIELD_AIMED_ARRIVAL_TIME).asText();
+        } else if (call.has(FIELD_AIMED_DEPARTURE_TIME)) {
+            callTime = call.get(FIELD_AIMED_DEPARTURE_TIME).asText();
+        }
+        
+        if (callTime != null) {
+            return Instant.parse(callTime).atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
+        }
+        
+        return Long.MAX_VALUE;
     }
 
     /**
