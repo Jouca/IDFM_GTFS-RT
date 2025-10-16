@@ -2,6 +2,9 @@ package org.jouca.idfm_gtfs_rt.fetchers;
 
 import java.io.IOException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Utility class for fetching, processing, and importing GTFS (General Transit Feed Specification) data.
  * 
@@ -21,6 +24,7 @@ import java.io.IOException;
  * @since 1.0
  */
 public class GTFSFetcher {
+    private static final Logger logger = LoggerFactory.getLogger(GTFSFetcher.class);
 
     /**
      * Downloads a GTFS ZIP file from the specified URL, extracts it, imports it into a SQLite database,
@@ -126,7 +130,7 @@ public class GTFSFetcher {
         // ==================================================================================
         // Step 6: Completion
         // ==================================================================================
-        System.out.println("GTFS data downloaded successfully to: " + outputFilePath);
+        logger.info("GTFS data downloaded successfully to: {}", outputFilePath);
     }
 
     /**
@@ -145,7 +149,7 @@ public class GTFSFetcher {
                 new java.io.InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                System.out.println(line);
+                logger.debug(line);
             }
         }
         
@@ -169,7 +173,7 @@ public class GTFSFetcher {
      * @throws IOException If an error occurs during index creation
      */
     private static void createIndex(String outputFilePath, String indexName, String sql) throws IOException {
-        System.out.println("Creating index " + indexName + "...");
+        logger.info("Creating index {}...", indexName);
         String command = "sqlite3 " + outputFilePath + " \"" + sql + "\"";
         executeCommand(command, "Failed to create index " + indexName);
     }
