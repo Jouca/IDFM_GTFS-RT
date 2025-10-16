@@ -306,11 +306,17 @@ public class TripUpdateGenerator {
             builtEntities.stream()
                 .sorted(Comparator.comparingInt(IndexedEntity::index))
                 .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
+        } catch (Exception e) {
+            System.err.println("Error during parallel processing: " + e.getMessage());
+            throw e;
         } finally {
             executor.shutdown();
             try {
                 if (!executor.awaitTermination(2, TimeUnit.MINUTES)) {
                     executor.shutdownNow();
+                    if (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
+                        System.err.println("ExecutorService did not terminate");
+                    }
                 }
             } catch (InterruptedException ie) {
                 executor.shutdownNow();
