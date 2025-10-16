@@ -281,40 +281,42 @@ public class TripUpdateGenerator {
         renderProgressBar(0, total);
 
         ExecutorService executor = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
-        List<Future<IndexedEntity>> futures = new ArrayList<>(total);
-
-        for (int idx = 0; idx < entities.size(); idx++) {
-            final int index = idx;
-            final JsonNode entity = entities.get(idx);
-            futures.add(executor.submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips, context)));
-        }
-
-        List<IndexedEntity> builtEntities = new ArrayList<>();
-        for (int i = 0; i < futures.size(); i++) {
-            try {
-                IndexedEntity result = futures.get(i).get();
-                if (result != null && result.entity() != null) {
-                    builtEntities.add(result);
-                }
-            } catch (Exception e) {
-                System.err.println("Failed to process entity index " + i + ": " + e.getMessage());
-            }
-            renderProgressBar(i + 1, total);
-        }
-
-        executor.shutdown();
         try {
-            if (!executor.awaitTermination(2, TimeUnit.MINUTES)) {
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException ie) {
-            executor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+            List<Future<IndexedEntity>> futures = new ArrayList<>(total);
 
-    builtEntities.stream()
-        .sorted(Comparator.comparingInt(IndexedEntity::index))
-        .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
+            for (int idx = 0; idx < entities.size(); idx++) {
+                final int index = idx;
+                final JsonNode entity = entities.get(idx);
+                futures.add(executor.submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips, context)));
+            }
+
+            List<IndexedEntity> builtEntities = new ArrayList<>();
+            for (int i = 0; i < futures.size(); i++) {
+                try {
+                    IndexedEntity result = futures.get(i).get();
+                    if (result != null && result.entity() != null) {
+                        builtEntities.add(result);
+                    }
+                } catch (Exception e) {
+                    System.err.println("Failed to process entity index " + i + ": " + e.getMessage());
+                }
+                renderProgressBar(i + 1, total);
+            }
+
+            builtEntities.stream()
+                .sorted(Comparator.comparingInt(IndexedEntity::index))
+                .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
+        } finally {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(2, TimeUnit.MINUTES)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException ie) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
 
         // Clear tripStates where timestamp is older than 15 minutes
         long currentTime = Instant.now().atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
