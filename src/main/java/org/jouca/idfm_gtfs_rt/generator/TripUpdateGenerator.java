@@ -629,26 +629,65 @@ public class TripUpdateGenerator {
         String lineId = "IDFM:" + entity.get("LineRef").get("value").asText().split(":")[3];
         String vehicleId = entity.get("DatedVehicleJourneyRef").get("value").asText();
 
-        // Determine direction from SIRI Lite data
+        DirectionInfo directionInfo = extractDirectionInfo(entity, vehicleId);
+        
+        String destinationId = extractDestinationId(entity);
+        if (destinationId == null) return null;
+
+        List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
+        List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList = buildEstimatedCallList(estimatedCalls);
+
+        if (lineId == null || lineId.isEmpty() || estimatedCallList.isEmpty()) {
+            return null;
+        }
+
+        String tripId = findTripId(lineId, estimatedCallList, estimatedCalls, destinationId, directionInfo);
+        if (tripId == null || tripId.isEmpty()) {
+            return null;
+        }
+
+        TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId);
+        updateContextStats(context, tripMeta);
+
+        TripState state = updateTripState(tripId, vehicleId);
+
+        GtfsRealtime.FeedEntity feedEntity = buildFeedEntity(tripId, state, tripMeta, directionInfo.directionIdForMatching(), 
+                lineId, estimatedCalls);
+
+        if (entitiesTrips != null) {
+            entitiesTrips.put(tripId, entity);
+        }
+        return new IndexedEntity(index, feedEntity);
+    }
+
+    /**
+     * Record to hold direction and journey note information extracted from an entity.
+     */
+    private record DirectionInfo(Integer directionIdForMatching, String journeyNote, boolean journeyNoteDetailled) {}
+
+    /**
+     * Extracts direction and journey note information from SIRI Lite entity.
+     * 
+     * @param entity the SIRI Lite entity
+     * @param vehicleId the vehicle identifier
+     * @return DirectionInfo containing direction ID, journey note, and detail flag
+     */
+    private DirectionInfo extractDirectionInfo(JsonNode entity, String vehicleId) {
         Integer directionIdForMatching = null;
         String journeyNote = null;
         boolean journeyNoteDetailled = false;
-        if (
-            entity.get("JourneyNote") != null &&
+
+        if (entity.get("JourneyNote") != null &&
             entity.get("JourneyNote").size() > 0 &&
             entity.get("JourneyNote").get(0).get("value") != null &&
-            entity.get("JourneyNote").get(0).get("value").asText().matches("^[A-Z]{4}$") // Exclude 4-letter codes
-        ) {
-            // Get journey note
+            entity.get("JourneyNote").get(0).get("value").asText().matches("^[A-Z]{4}$")) {
             journeyNote = entity.get("JourneyNote").get(0).get("value").asText();
         } else {
-            // Get direction from DirectionRef or DirectionName
             int direction = determineDirection(entity);
             directionIdForMatching = (direction != -1) ? direction : null;
         }
 
-        // Specific cases with RATP lines where JourneyNote is detailed
-        if (vehicleId.matches("(?<=RATP\\.)[A-Z0-9]+(?=:|$)")) { // RATP RER vehicles
+        if (vehicleId.matches("(?<=RATP\\.)[A-Z0-9]+(?=:|$)")) {
             java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("(?<=RATP\\.)[A-Z0-9]+(?=:)").matcher(vehicleId);
             if (matcher.find()) {
                 journeyNote = matcher.group();
@@ -658,67 +697,112 @@ public class TripUpdateGenerator {
             journeyNoteDetailled = true;
         }
 
+        return new DirectionInfo(directionIdForMatching, journeyNote, journeyNoteDetailled);
+    }
+
+    /**
+     * Extracts and resolves the destination ID from SIRI Lite entity.
+     * 
+     * @param entity the SIRI Lite entity
+     * @return the resolved destination ID, or null if not found
+     */
+    private String extractDestinationId(JsonNode entity) {
         String destinationIdCode = entity.get("DestinationRef").get("value").asText().split(":")[3];
-        String destinationId = TripFinder.resolveStopId(destinationIdCode);
+        return TripFinder.resolveStopId(destinationIdCode);
+    }
 
-        // If not found, try to find it from the stop_extensions table
-        if (destinationId == null) return null;
-
-        List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
-
-        // Build EstimatedCall list for trip search
+    /**
+     * Builds a list of EstimatedCall records from SIRI Lite estimated calls.
+     * 
+     * @param estimatedCalls the list of estimated call JSON nodes
+     * @return list of EstimatedCall records
+     */
+    private List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> buildEstimatedCallList(List<JsonNode> estimatedCalls) {
         List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList = new ArrayList<>();
         for (JsonNode call : estimatedCalls) {
             String stopCode = call.get("StopPointRef").get("value").asText().split(":")[3];
             String stopId = TripFinder.resolveStopId(stopCode);
             if (stopId == null) continue;
 
-            String isoTime = null;
-            if (call.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
-                isoTime = call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText();
-            } else if (call.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
-                isoTime = call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText();
-            } else if (call.has(FIELD_AIMED_ARRIVAL_TIME)) {
-                isoTime = call.get(FIELD_AIMED_ARRIVAL_TIME).asText();
-            } else if (call.has(FIELD_AIMED_DEPARTURE_TIME)) {
-                isoTime = call.get(FIELD_AIMED_DEPARTURE_TIME).asText();
-            }
+            String isoTime = extractTimeFromCall(call);
             if (isoTime != null) {
                 estimatedCallList.add(new org.jouca.idfm_gtfs_rt.records.EstimatedCall(stopId, isoTime));
             }
         }
+        return estimatedCallList;
+    }
 
-        if (lineId == null || lineId.isEmpty() || estimatedCallList.isEmpty()) {
-            return null;
+    /**
+     * Extracts the first available time value from an estimated call.
+     * 
+     * @param call the estimated call JSON node
+     * @return ISO time string, or null if no time found
+     */
+    private String extractTimeFromCall(JsonNode call) {
+        if (call.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+            return call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText();
+        } else if (call.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+            return call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText();
+        } else if (call.has(FIELD_AIMED_ARRIVAL_TIME)) {
+            return call.get(FIELD_AIMED_ARRIVAL_TIME).asText();
+        } else if (call.has(FIELD_AIMED_DEPARTURE_TIME)) {
+            return call.get(FIELD_AIMED_DEPARTURE_TIME).asText();
         }
+        return null;
+    }
 
-        // Use the new trip finder method
-        boolean isArrivalTime = !estimatedCallList.isEmpty() && (estimatedCalls.get(0).has(FIELD_EXPECTED_ARRIVAL_TIME) || estimatedCalls.get(0).has(FIELD_AIMED_ARRIVAL_TIME));
+    /**
+     * Finds the GTFS trip ID that matches the real-time data.
+     * 
+     * @param lineId the line identifier
+     * @param estimatedCallList the list of estimated calls
+     * @param estimatedCalls the original JSON nodes
+     * @param destinationId the destination stop ID
+     * @param directionInfo the direction information
+     * @return the matched trip ID, or null if not found
+     */
+    private String findTripId(String lineId, List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList,
+                              List<JsonNode> estimatedCalls, String destinationId, DirectionInfo directionInfo) {
+        boolean isArrivalTime = !estimatedCallList.isEmpty() && 
+                (estimatedCalls.get(0).has(FIELD_EXPECTED_ARRIVAL_TIME) || 
+                 estimatedCalls.get(0).has(FIELD_AIMED_ARRIVAL_TIME));
 
-        // Find the trip ID using the TripFinder utility
-        final String tripId;
-        String tmpTripId = null;
         try {
-            tmpTripId = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, destinationId, journeyNote, journeyNoteDetailled, directionIdForMatching);
+            return TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime, 
+                    destinationId, directionInfo.journeyNote(), directionInfo.journeyNoteDetailled(), 
+                    directionInfo.directionIdForMatching());
         } catch (SQLException e) {
             e.printStackTrace();
+            return null;
         }
-        tripId = tmpTripId;
+    }
 
-        if (tripId == null || tripId.isEmpty()) {
-            return null; // Cannot proceed without stable trip id
-        }
-
-        TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId);
-    if (context != null && tripMeta != null && tripMeta.routeId != null) {
+    /**
+     * Updates the processing context statistics with trip metadata.
+     * 
+     * @param context the processing context
+     * @param tripMeta the trip metadata
+     */
+    private void updateContextStats(ProcessingContext context, TripFinder.TripMeta tripMeta) {
+        if (context != null && tripMeta != null && tripMeta.routeId != null) {
             context.statsByRouteDirection
                     .computeIfAbsent(tripMeta.routeId, r -> new ConcurrentHashMap<>())
                     .computeIfAbsent(tripMeta.directionId, d -> new RealtimeDirectionStats())
                     .addTrip(tripMeta);
         }
+    }
 
+    /**
+     * Updates trip state and vehicle associations.
+     * 
+     * @param tripId the trip identifier
+     * @param vehicleId the vehicle identifier
+     * @return the updated trip state
+     */
+    private TripState updateTripState(String tripId, String vehicleId) {
         long now = Instant.now().atZone(ZONE_ID).toLocalDateTime().atZone(ZONE_ID).toEpochSecond();
         final String[] previousVehicleId = new String[1];
+        
         TripState state = tripStates.compute(tripId, (id, existing) -> {
             if (existing == null) {
                 return new TripState(tripId, vehicleId, now);
@@ -728,65 +812,98 @@ public class TripUpdateGenerator {
             existing.vehicleId = vehicleId;
             return existing;
         });
+        
         if (state == null) {
             state = new TripState(tripId, vehicleId, now);
             tripStates.put(tripId, state);
         }
+        
         if (previousVehicleId[0] != null && !previousVehicleId[0].equals(vehicleId)) {
             vehicleToTrip.remove(previousVehicleId[0], tripId);
         }
         vehicleToTrip.put(vehicleId, tripId);
+        
+        return state;
+    }
 
+    /**
+     * Builds a GTFS-RT FeedEntity from processed trip data.
+     * 
+     * @param tripId the trip identifier
+     * @param state the trip state
+     * @param tripMeta the trip metadata
+     * @param directionIdForMatching the direction ID from SIRI Lite
+     * @param lineId the line identifier
+     * @param estimatedCalls the list of estimated calls
+     * @return the built FeedEntity
+     */
+    private GtfsRealtime.FeedEntity buildFeedEntity(String tripId, TripState state, TripFinder.TripMeta tripMeta,
+                                                     Integer directionIdForMatching, String lineId, 
+                                                     List<JsonNode> estimatedCalls) {
         GtfsRealtime.FeedEntity.Builder entityBuilder = GtfsRealtime.FeedEntity.newBuilder();
         entityBuilder.setId(tripId);
 
         GtfsRealtime.TripUpdate.Builder tripUpdate = entityBuilder.getTripUpdateBuilder();
-        int directionId = 0;
-        if (tripMeta != null) {
-            directionId = tripMeta.directionId;
-        } else if (directionIdForMatching != null) {
-            // Use the direction determined from SIRI Lite if available
-            directionId = directionIdForMatching;
-        } else {
-            // Fallback: query from database
-            String directionStr = TripFinder.getTripDirection(tripId);
-            if (directionStr != null && !directionStr.isEmpty()) {
-                try {
-                    directionId = Integer.parseInt(directionStr);
-                } catch (NumberFormatException ignored) {
-                }
-            }
-        }
-
+        int directionId = resolveDirectionId(tripMeta, directionIdForMatching, tripId);
         String routeForDescriptor = tripMeta != null && tripMeta.routeId != null ? tripMeta.routeId : lineId;
+        
         tripUpdate.getTripBuilder()
                 .setRouteId(routeForDescriptor)
                 .setDirectionId(directionId)
                 .setTripId(tripId);
-        // Always set latest vehicle id observed
         tripUpdate.getVehicleBuilder().setId(state.vehicleId);
 
-        List<String> stopTimeUpdates = new ArrayList<>();
+        addStopTimeUpdates(tripUpdate, estimatedCalls, tripId);
+        
+        return entityBuilder.build();
+    }
 
-        // Check if all estimated calls are cancelled (either by DepartureStatus or ArrivalStatus)
+    /**
+     * Resolves the direction ID from available sources.
+     * 
+     * @param tripMeta the trip metadata
+     * @param directionIdForMatching the direction from SIRI Lite
+     * @param tripId the trip identifier
+     * @return the resolved direction ID
+     */
+    private int resolveDirectionId(TripFinder.TripMeta tripMeta, Integer directionIdForMatching, String tripId) {
+        if (tripMeta != null) {
+            return tripMeta.directionId;
+        } else if (directionIdForMatching != null) {
+            return directionIdForMatching;
+        } else {
+            String directionStr = TripFinder.getTripDirection(tripId);
+            if (directionStr != null && !directionStr.isEmpty()) {
+                try {
+                    return Integer.parseInt(directionStr);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Adds stop time updates to the trip update, or marks the trip as canceled.
+     * 
+     * @param tripUpdate the trip update builder
+     * @param estimatedCalls the list of estimated calls
+     * @param tripId the trip identifier
+     */
+    private void addStopTimeUpdates(GtfsRealtime.TripUpdate.Builder tripUpdate, List<JsonNode> estimatedCalls, String tripId) {
         boolean allCancelled = estimatedCalls.stream().allMatch(call ->
             (call.has("DepartureStatus") && call.get("DepartureStatus").asText().contains("CANCELLED")) ||
             (call.has("ArrivalStatus") && call.get("ArrivalStatus").asText().contains("CANCELLED"))
         );
+        
         if (allCancelled) {
             tripUpdate.getTripBuilder().setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
         } else {
-            // Process only real-time estimated calls from SIRI Lite (no theoretical times added)
+            List<String> stopTimeUpdates = new ArrayList<>();
             for (JsonNode estimatedCall : estimatedCalls) {
                 processEstimatedCall(estimatedCall, tripUpdate, tripId, stopTimeUpdates);
             }
         }
-
-        // Add/Update the trip to entitiesTrips (store last processed realtime entity snapshot)
-        if (entitiesTrips != null) {
-            entitiesTrips.put(tripId, entity);
-        }
-        return new IndexedEntity(index, entityBuilder.build());
     }
 
     /**
