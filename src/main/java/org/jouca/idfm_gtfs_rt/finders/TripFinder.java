@@ -660,6 +660,10 @@ public class TripFinder {
      * @return List of comma-separated stop time data (format: "stopId,arrivalTime,departureTime,stopSequence")
      */
     public static List<String> getAllStopTimesFromTrip(String tripId) {
+        if (tripId == null || tripId.isEmpty()) {
+            return new ArrayList<>();
+        }
+        
         // Try cache first
         List<String> cached = allStopTimesCache.get(tripId);
         if (cached != null) return cached;
@@ -706,6 +710,10 @@ public class TripFinder {
      * @return The stop sequence number as a string, or null if not found
      */
     public static String findStopSequence(String tripId, String stopId, List<String> stopUpdates) {
+        if (tripId == null || tripId.isEmpty() || stopId == null || stopId.isEmpty()) {
+            return null;
+        }
+        
         // Use cached mapping tripId -> (stopId -> list of sequences) if available
         Map<String, List<String>> seqMap = stopSequencesCache.get(tripId);
         if (seqMap == null) {
@@ -750,6 +758,10 @@ public class TripFinder {
      * @return The child stop ID (object_id), or null if not found
      */
     public static String findStopChildrenByTrip(String stopId, String tripId) {
+        if (stopId == null || tripId == null) {
+            return null;
+        }
+        
         String childStopId = null;
         String query = """
             SELECT se.object_id
@@ -808,6 +820,10 @@ public class TripFinder {
      * @return The full stop ID, or null if not found
      */
     public static String findStopIdFromCode(String stopCode) {
+        if (stopCode == null) {
+            return null;
+        }
+        
         String query = "SELECT stop_id FROM stops WHERE stop_id LIKE ?;";
         try (Connection conn = dataSource.getConnection();
             PreparedStatement stmt = conn.prepareStatement(query)) {
@@ -836,6 +852,10 @@ public class TripFinder {
      * @return The object ID (stop ID), or null if not found
      */
     public static String findStopIdFromStopExtension(String stopExtension) {
+        if (stopExtension == null) {
+            return null;
+        }
+        
         String query = "SELECT object_id FROM stop_extensions WHERE object_code LIKE ? AND object_system LIKE 'netex_zder_quay' LIMIT 1;";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
@@ -907,6 +927,10 @@ public class TripFinder {
      * @see #findStopIdFromStopExtension(String)
      */
     public static String resolveStopId(String stopCode) {
+        if (stopCode == null || stopCode.isEmpty()) {
+            return null;
+        }
+        
         String cached = stopCodeCache.get(stopCode);
         if (cached != null) {
             return EMPTY_MARKER.equals(cached) ? null : cached;
@@ -937,6 +961,10 @@ public class TripFinder {
      * @return The scheduled arrival time as epoch seconds, or null if not found
      */
     public static Long getScheduledArrivalTime(List<String> stopTimes, String stopId, String stopSequence, ZoneId zoneId) {
+        if (stopTimes == null || stopId == null || stopSequence == null) {
+            return null;
+        }
+        
         for (String stopTime : stopTimes) {
             String[] parts = stopTime.split(",");
             if (parts[0].equals(stopId) && parts[3].equals(stopSequence)) {
@@ -971,6 +999,10 @@ public class TripFinder {
      * @return The scheduled departure time as epoch seconds, or null if not found
      */
     public static Long getScheduledDepartureTime(List<String> stopTimes, String stopId, String stopSequence, ZoneId zoneId) {
+        if (stopTimes == null || stopId == null || stopSequence == null) {
+            return null;
+        }
+        
         for (String stopTime : stopTimes) {
             String[] parts = stopTime.split(",");
             if (parts[0].equals(stopId) && parts[3].equals(stopSequence)) {
@@ -999,6 +1031,10 @@ public class TripFinder {
      * @return The direction ID as a string, or null if not found
      */
     public static String getTripDirection(String tripId) {
+        if (tripId == null || tripId.isEmpty()) {
+            return null;
+        }
+        
         TripMeta cached = tripMetaCache.get(tripId);
         if (cached != null) return String.valueOf(cached.directionId);
 
@@ -1122,6 +1158,10 @@ public class TripFinder {
      * @see TripMeta
      */
     public static TripMeta getTripMeta(String tripId) {
+        if (tripId == null || tripId.isEmpty()) {
+            return null;
+        }
+        
         TripMeta cached = tripMetaCache.get(tripId);
         if (cached != null) return cached;
 

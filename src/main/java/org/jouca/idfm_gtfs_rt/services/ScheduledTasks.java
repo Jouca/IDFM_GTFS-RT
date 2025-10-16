@@ -66,8 +66,12 @@ public class ScheduledTasks {
 
     /**
      * Environment configuration loader for accessing environment variables and configuration settings.
+     * Configured to not fail if the .env file is missing (for test environments).
      */
-    private static final Dotenv dotenv = Dotenv.configure().directory("/app").load();
+    private static final Dotenv dotenv = Dotenv.configure()
+            .directory("/app")
+            .ignoreIfMissing()
+            .load();
 
     /**
      * Lock to prevent concurrent execution of alert update tasks.
