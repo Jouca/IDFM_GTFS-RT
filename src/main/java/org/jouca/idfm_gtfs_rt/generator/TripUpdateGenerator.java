@@ -11,12 +11,14 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import org.jouca.idfm_gtfs_rt.exceptions.GtfsRtProcessingException;
 import org.jouca.idfm_gtfs_rt.fetchers.SiriLiteFetcher;
 import org.jouca.idfm_gtfs_rt.finders.TripFinder;
 import org.slf4j.Logger;
@@ -300,9 +302,14 @@ public class TripUpdateGenerator {
             builtEntities.stream()
                 .sorted(Comparator.comparingInt(IndexedEntity::index))
                 .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
-        } catch (Exception e) {
-            logger.error("Error during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
-            throw new RuntimeException("Failed to process SIRI Lite data during parallel entity processing. Processed " + 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); // Restore interrupt status
+            logger.error("Thread interrupted during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
+            throw new GtfsRtProcessingException("Parallel processing interrupted. Processed " + 
+                                     builtEntities.size() + " out of " + total + " entities before interruption.", e);
+        } catch (ExecutionException e) {
+            logger.error("Execution error during parallel processing of {} SIRI Lite entities: {}", total, e.getMessage(), e);
+            throw new GtfsRtProcessingException("Failed to process SIRI Lite data during parallel entity processing. Processed " + 
                                      builtEntities.size() + " out of " + total + " entities before failure.", e);
         } finally {
             shutdownExecutor(executor);
@@ -838,8 +845,11 @@ public class TripUpdateGenerator {
      * @param futures the list of futures containing indexed entities
      * @param total the total number of entities being processed (for progress bar)
      * @return a list of successfully processed indexed entities
+     * @throws InterruptedException if the thread is interrupted while waiting for results
+     * @throws ExecutionException if an entity processing task threw an exception
      */
-    private List<IndexedEntity> collectFutureResults(List<Future<IndexedEntity>> futures, int total) {
+    private List<IndexedEntity> collectFutureResults(List<Future<IndexedEntity>> futures, int total) 
+            throws InterruptedException, ExecutionException {
         List<IndexedEntity> builtEntities = new ArrayList<>();
         for (int i = 0; i < futures.size(); i++) {
             try {
@@ -848,10 +858,12 @@ public class TripUpdateGenerator {
                     builtEntities.add(result);
                 }
             } catch (InterruptedException e) {
-                logger.error("Failed to process entity index {}: {}", i, e.getMessage(), e);
+                logger.error("Thread interrupted while processing entity index {}: {}", i, e.getMessage(), e);
                 Thread.currentThread().interrupt(); // Restore interrupt status
-            } catch (Exception e) {
-                logger.error("Failed to process entity index {}: {}", i, e.getMessage(), e);
+                throw e; // Re-throw to allow caller to handle
+            } catch (ExecutionException e) {
+                logger.error("Execution failed for entity index {}: {}", i, e.getMessage(), e);
+                throw e; // Re-throw to allow caller to handle
             }
             renderProgressBar(i + 1, total);
         }
