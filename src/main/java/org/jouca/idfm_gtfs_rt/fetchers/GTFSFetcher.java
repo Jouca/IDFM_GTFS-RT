@@ -98,7 +98,6 @@ public class GTFSFetcher {
             logger.info("GTFS ZIP file downloaded successfully.");
         } catch (IOException e) {
             logger.error("Failed to download GTFS data from {}: {}", urlString, e.getMessage());
-            throw new IOException("Failed to download GTFS data from " + urlString, e);
         }
 
         // ===================================
@@ -112,7 +111,6 @@ public class GTFSFetcher {
             logger.info("ZIP archive extracted successfully.");
         } catch (IOException e) {
             logger.error("Failed to unzip GTFS data: {}", e.getMessage());
-            throw new IOException("Failed to unzip GTFS data", e);
         }
 
         // ================================================================

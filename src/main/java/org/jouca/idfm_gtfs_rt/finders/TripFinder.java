@@ -150,6 +150,58 @@ public class TripFinder {
     }
 
     /**
+     * Parameter object that encapsulates the query parameters needed for trip finding operations.
+     * This helps reduce method parameter counts and groups related data together.
+     * 
+     * @since 1.0
+     */
+    public static class TripQueryParameters {
+        /** Service day in YYYYMMDD format */
+        public final String yyyymmdd;
+        
+        /** Weekday name (e.g., "monday", "tuesday") for service calendar lookup */
+        public final String weekday;
+        
+        /** Route identifier from GTFS routes.txt */
+        public final String routeId;
+        
+        /** List of all stop identifiers involved in the query */
+        public final List<String> allStopIds;
+        
+        /** Direction ID (0 or 1), may be null if not filtering by direction */
+        public final Integer directionId;
+        
+        /** Destination stop identifier, may be null */
+        public final String destinationId;
+        
+        /** Journey note/pattern identifier, may be null */
+        public final String journeyNote;
+
+        /**
+         * Constructs a new TripQueryParameters instance.
+         * 
+         * @param yyyymmdd Service day in YYYYMMDD format
+         * @param weekday Weekday name for calendar lookup
+         * @param routeId Route identifier
+         * @param allStopIds List of stop identifiers
+         * @param directionId Direction ID (may be null)
+         * @param destinationId Destination stop ID (may be null)
+         * @param journeyNote Journey note identifier (may be null)
+         */
+        public TripQueryParameters(String yyyymmdd, String weekday, String routeId, 
+                                  List<String> allStopIds, Integer directionId, 
+                                  String destinationId, String journeyNote) {
+            this.yyyymmdd = yyyymmdd;
+            this.weekday = weekday;
+            this.routeId = routeId;
+            this.allStopIds = allStopIds;
+            this.directionId = directionId;
+            this.destinationId = destinationId;
+            this.journeyNote = journeyNote;
+        }
+    }
+
+    /**
      * Determines the service day for a given timestamp, accounting for trips that cross midnight.
      * GTFS allows times >= 24:00:00 to represent trips continuing past midnight on the same service day.
      * 
@@ -289,37 +341,35 @@ public class TripFinder {
 
     /**
      * Binds parameters to the prepared statement for trip finder query.
+     * 
+     * @param stmt The prepared statement to bind parameters to
+     * @param params The query parameters encapsulated in a TripQueryParameters object
+     * @throws SQLException If a database access error occurs
      */
     private static void bindTripFinderParameters(
         PreparedStatement stmt,
-        String yyyymmdd,
-        String weekday,
-        String routeId,
-        List<String> allStopIds,
-        Integer directionId,
-        String destinationId,
-        String journeyNote
+        TripQueryParameters params
     ) throws SQLException {
         int i = 1;
-        stmt.setString(i++, yyyymmdd);
-        stmt.setString(i++, yyyymmdd);
-        for (int j = 0; j < 7; j++) stmt.setString(i++, weekday);
-        stmt.setString(i++, yyyymmdd);
-        stmt.setString(i++, yyyymmdd);
-        stmt.setString(i++, routeId);
+        stmt.setString(i++, params.yyyymmdd);
+        stmt.setString(i++, params.yyyymmdd);
+        for (int j = 0; j < 7; j++) stmt.setString(i++, params.weekday);
+        stmt.setString(i++, params.yyyymmdd);
+        stmt.setString(i++, params.yyyymmdd);
+        stmt.setString(i++, params.routeId);
 
-        for (String stopId : allStopIds) {
+        for (String stopId : params.allStopIds) {
             stmt.setString(i++, stopId);
         }
         
-        if (directionId != null) {
-            stmt.setInt(i++, directionId);
+        if (params.directionId != null) {
+            stmt.setInt(i++, params.directionId);
         }
         
-        stmt.setString(i++, destinationId);
+        stmt.setString(i++, params.destinationId);
 
-        if (journeyNote != null && journeyNote.length() == 4) {
-            stmt.setString(i++, journeyNote);
+        if (params.journeyNote != null && params.journeyNote.length() == 4) {
+            stmt.setString(i++, params.journeyNote);
         }
     }
 
@@ -515,9 +565,10 @@ public class TripFinder {
 
         // Build query and fetch candidate trips from database
         String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled);
-        Map<String, Map<String, List<Integer>>> tripStopTimes = fetchCandidateTrips(
-            query, yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote
+        TripQueryParameters queryParams = new TripQueryParameters(
+            yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote
         );
+        Map<String, Map<String, List<Integer>>> tripStopTimes = fetchCandidateTrips(query, queryParams);
 
         // Find best matching trip
         String result = findBestMatchingTrip(tripStopTimes, estimatedCalls, zone);
@@ -529,23 +580,22 @@ public class TripFinder {
 
     /**
      * Fetches candidate trips from the database based on the query and parameters.
+     * 
+     * @param query The SQL query to execute
+     * @param params The query parameters encapsulated in a TripQueryParameters object
+     * @return A map of trip IDs to their stop times
+     * @throws SQLException If a database access error occurs
      */
     private static Map<String, Map<String, List<Integer>>> fetchCandidateTrips(
         String query,
-        String yyyymmdd,
-        String weekday,
-        String routeId,
-        List<String> allStopIds,
-        Integer directionId,
-        String destinationId,
-        String journeyNote
+        TripQueryParameters params
     ) throws SQLException {
         Map<String, Map<String, List<Integer>>> tripStopTimes = new HashMap<>();
 
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
 
-            bindTripFinderParameters(stmt, yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote);
+            bindTripFinderParameters(stmt, params);
 
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
