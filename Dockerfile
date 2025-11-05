@@ -1,4 +1,4 @@
-FROM eclipse-temurin:21-jdk-jammy
+FROM eclipse-temurin:21.0.8_9-jdk-jammy
 
 # Set the working directory
 WORKDIR /app
