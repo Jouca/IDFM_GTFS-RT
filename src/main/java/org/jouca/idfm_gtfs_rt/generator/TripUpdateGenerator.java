@@ -927,6 +927,8 @@ public class TripUpdateGenerator {
             for (JsonNode estimatedCall : estimatedCalls) {
                 processEstimatedCall(estimatedCall, tripUpdate, tripId, stopTimeUpdates);
             }
+            // Clear invalid stop times where time goes backward
+            clearInvalidStopTimes(tripUpdate);
         }
     }
 
@@ -1359,6 +1361,74 @@ public class TripUpdateGenerator {
 
         if (safeCurrent >= total) {
             System.out.println();
+        }
+    }
+
+    /**
+     * Clears invalid stop times in the trip update where the arrival or departure time
+     * is earlier than the previous stop's time, which indicates a time progression error.
+     * 
+     * <p>This method:
+     * <ul>
+     *   <li>Iterates through all stop time updates in chronological order</li>
+     *   <li>Tracks the maximum departure or arrival time seen so far</li>
+     *   <li>For each stop, compares its times against the previous maximum</li>
+     *   <li>If either arrival or departure time is earlier than the previous maximum,
+     *       the times are cleared (marked as skipped) to maintain temporal consistency</li>
+     *   <li>Updates the maximum time tracker if the current stop's times are valid</li>
+     * </ul>
+     * 
+     * <p><strong>Use case:</strong> Handles cases where real-time data contains time errors
+     * where a later stop in a journey shows an earlier arrival/departure than the previous stop.
+     * This can occur in unreliable data sources like SIRI Lite where timestamps may be
+     * incorrectly calculated or transmitted.
+     * 
+     * @param tripUpdate the trip update builder containing stop time updates to validate
+     */
+    private void clearInvalidStopTimes(GtfsRealtime.TripUpdate.Builder tripUpdate) {
+        long maxTime = Long.MIN_VALUE;
+        List<Integer> indicesToRemove = new ArrayList<>();
+        
+        // Iterate through stop time updates and identify invalid ones
+        for (int i = 0; i < tripUpdate.getStopTimeUpdateCount(); i++) {
+            GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stopTimeUpdate = tripUpdate.getStopTimeUpdateBuilder(i);
+            long currentMinTime = Long.MAX_VALUE;
+            boolean isInvalid = false;
+            
+            // Check arrival time
+            if (stopTimeUpdate.hasArrival()) {
+                long arrivalTime = stopTimeUpdate.getArrival().getTime();
+                if (arrivalTime < maxTime) {
+                    isInvalid = true;
+                } else {
+                    currentMinTime = Math.min(currentMinTime, arrivalTime);
+                }
+            }
+            
+            // Check departure time
+            if (stopTimeUpdate.hasDeparture()) {
+                long departureTime = stopTimeUpdate.getDeparture().getTime();
+                if (departureTime < maxTime) {
+                    isInvalid = true;
+                } else {
+                    currentMinTime = Math.min(currentMinTime, departureTime);
+                }
+            }
+            
+            // Mark for removal if invalid
+            if (isInvalid) {
+                indicesToRemove.add(i);
+            }
+            
+            // Update max time if we have valid times
+            if (currentMinTime != Long.MAX_VALUE) {
+                maxTime = currentMinTime;
+            }
+        }
+        
+        // Remove invalid stop time updates in reverse order to maintain indices
+        for (int i = indicesToRemove.size() - 1; i >= 0; i--) {
+            tripUpdate.removeStopTimeUpdate(indicesToRemove.get(i));
         }
     }
 
