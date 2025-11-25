@@ -134,7 +134,7 @@ The application will be available at `http://localhost:8507`
 
 2. **Run the application**
    ```bash
-   java -jar target/idfm_gtfs_rt-1.0.4.jar
+   java -jar target/idfm_gtfs_rt-1.0.5.jar
    ```
 
 ## 🔧 Configuration
