@@ -73,19 +73,7 @@ public class TripFinder {
      */
     private static final ZoneId PARIS_ZONE = ZoneId.of("Europe/Paris");
     
-    /**
-     * Stores the program start time to determine service day consistently.
-     * This ensures that a trip running at 00:30 AM is matched against the previous day's service
-     * if the program started before midnight.
-     */
-    private static final ZonedDateTime PROGRAM_START_TIME = ZonedDateTime.now(PARIS_ZONE);
-    
-    /**
-     * Threshold for considering times as potentially belonging to the previous day's service.
-     * Times before 3 AM are considered as potentially part of the previous day's service for
-     * midnight-crossing trips.
-     */
-    private static final int MIDNIGHT_CROSSING_THRESHOLD_HOURS = 3;
+
 
     /**
      * Static initializer block that configures the database connection pool.
@@ -143,6 +131,12 @@ public class TripFinder {
          * may be >= 86400 for trips continuing past midnight on the same service day).
          */
         public final int firstTimeSecOfDay;
+        
+        /**
+         * The service date for this trip in YYYYMMDD format (e.g., "20231122").
+         * This is used to populate the start_date field in GTFS-RT TripDescriptor.
+         */
+        public final String startDate;
 
         /**
          * Constructs a new TripMeta instance.
@@ -151,12 +145,14 @@ public class TripFinder {
          * @param routeId The route identifier
          * @param directionId The direction of travel (0 or 1)
          * @param firstTimeSecOfDay First stop time in seconds since service day start
+         * @param startDate The service date in YYYYMMDD format
          */
-        public TripMeta(String tripId, String routeId, int directionId, int firstTimeSecOfDay) {
+        public TripMeta(String tripId, String routeId, int directionId, int firstTimeSecOfDay, String startDate) {
             this.tripId = tripId;
             this.routeId = routeId;
             this.directionId = directionId;
             this.firstTimeSecOfDay = firstTimeSecOfDay;
+            this.startDate = startDate;
         }
     }
 
@@ -213,35 +209,16 @@ public class TripFinder {
     }
 
     /**
-     * Determines the service day for a given timestamp, accounting for trips that cross midnight.
-     * GTFS allows times >= 24:00:00 to represent trips continuing past midnight on the same service day.
-     * 
-     * Logic:
-     * - If the timestamp is in early morning hours (before MIDNIGHT_CROSSING_THRESHOLD_HOURS, e.g., 3 AM)
-     *   AND the program started before midnight, the service day is the previous calendar day.
-     * - Otherwise, the service day is the calendar day of the timestamp.
+     * Determines the service day for a given timestamp.
+     * Simply returns the calendar date of the timestamp.
+     * The midnight-crossing logic is now handled dynamically in convertToSecondsSinceServiceDay.
      * 
      * @param timestamp The real-time timestamp to determine service day for
      * @param zone The timezone to use
-     * @return The service day (may be different from calendar day for early morning times)
+     * @return The service day (calendar day of the timestamp)
      */
     private static LocalDate determineServiceDay(ZonedDateTime timestamp, ZoneId zone) {
-        LocalDate calendarDate = timestamp.toLocalDate();
-        int hour = timestamp.getHour();
-        
-        // If we're in early morning hours (00:00 - 03:00), this might be part of previous day's service
-        if (hour < MIDNIGHT_CROSSING_THRESHOLD_HOURS) {
-            // Check if program started on the previous day
-            LocalDate programStartDate = PROGRAM_START_TIME.toLocalDate();
-            
-            // If program started yesterday and we're now in early morning of next day,
-            // OR if the current time is in early morning, assume it's part of previous day's service
-            if (calendarDate.isAfter(programStartDate) || hour < MIDNIGHT_CROSSING_THRESHOLD_HOURS) {
-                return calendarDate.minusDays(1);
-            }
-        }
-        
-        return calendarDate;
+        return timestamp.toLocalDate();
     }
 
     /**
@@ -264,6 +241,7 @@ public class TripFinder {
 
     /**
      * Converts an EstimatedCall to seconds since service day start.
+     * Handles midnight-crossing trips by returning values >= 86400 for times after midnight.
      */
     private static int convertToSecondsSinceServiceDay(
         EstimatedCall ec,
@@ -271,8 +249,12 @@ public class TripFinder {
     ) {
         Instant inst = Instant.parse(ec.isoTime());
         ZonedDateTime zdtEc = inst.atZone(zone);
-        LocalDate serviceDayForEc = determineServiceDay(zdtEc, zone);
-        return (int) (zdtEc.toEpochSecond() - serviceDayForEc.atStartOfDay(zone).toEpochSecond());
+        LocalDate calendarDay = zdtEc.toLocalDate();
+        int secOfDay = (int) (zdtEc.toEpochSecond() - calendarDay.atStartOfDay(zone).toEpochSecond());
+        
+        // If it's early morning (after midnight), return the value as-is for comparison with GTFS times
+        // This will be compared against both regular times (< 86400) and midnight-crossing times (>= 86400)
+        return secOfDay;
     }
 
     /**
@@ -409,6 +391,7 @@ public class TripFinder {
 
     /**
      * Finds the best matching theoretical time within the given time window.
+     * Handles midnight-crossing trips by trying both the actual time and the time + 24h.
      * Returns null if no time is within the window.
      */
     private static Integer findBestTheoreticalTime(
@@ -421,14 +404,27 @@ public class TripFinder {
         int minDiff = Integer.MAX_VALUE;
         
         for (Integer theoTime : theoreticalTimes) {
-            int normalizedTheoTime = theoTime;
-            int diff = normalizedTheoTime - realTime;
-
+            // Try matching with the real time as-is
+            int diff = theoTime - realTime;
             if (diff >= minWindow && diff <= maxWindow) {
                 int absDiff = Math.abs(diff);
                 if (absDiff < minDiff) {
                     minDiff = absDiff;
-                    bestTheo = normalizedTheoTime;
+                    bestTheo = theoTime;
+                }
+            }
+            
+            // If the theoretical time is >= 86400 (midnight-crossing), also try matching
+            // with realTime + 86400 (in case the real-time data is for yesterday's service day)
+            if (theoTime >= 86400) {
+                int realTimeAdjusted = realTime + 86400;
+                diff = theoTime - realTimeAdjusted;
+                if (diff >= minWindow && diff <= maxWindow) {
+                    int absDiff = Math.abs(diff);
+                    if (absDiff < minDiff) {
+                        minDiff = absDiff;
+                        bestTheo = theoTime;
+                    }
                 }
             }
         }
@@ -471,6 +467,11 @@ public class TripFinder {
 
     /**
      * Finds the best matching trip from the candidate trips within the defined time windows.
+     * Time windows are progressively expanded to handle various delay scenarios in Île-de-France:
+     * - Short delays: ±2-5 minutes (typical for metro/tram)
+     * - Medium delays: up to +15 minutes (typical for buses/RER)
+     * - Large delays: up to +45 minutes (for major disruptions)
+     * - Very large delays: up to +60 minutes (extreme cases)
      */
     private static String findBestMatchingTrip(
         Map<String, Map<String, List<Integer>>> tripStopTimes,
@@ -478,12 +479,13 @@ public class TripFinder {
         ZoneId zone
     ) {
         int[][] windows = {
-            {-1, 1},
-            {-2, 2},
-            {-3, 5},
-            {-3, 10},
-            {-3, 20},
-            {-3, 30}
+            {-2, 2},   // ±2 minutes: strict matching for on-time services
+            {-3, 5},   // -3 to +5 minutes: normal delays
+            {-5, 10},  // -5 to +10 minutes: moderate delays (typical for buses)
+            {-5, 15},  // -5 to +15 minutes: significant delays
+            {-5, 30},  // -5 to +30 minutes: major delays (rush hour, incidents)
+            {-5, 45},  // -5 to +45 minutes: severe delays
+            {-5, 60}   // -5 to +60 minutes: extreme delays (major disruptions)
         };
 
         List<TripMatch> allMatches = new ArrayList<>();
@@ -564,7 +566,49 @@ public class TripFinder {
 
         // Determine service day from estimated calls
         LocalDate serviceDay = determineServiceDayFromEstimatedCalls(estimatedCalls, zone);
+        
+        // For early morning times (between 00:00 and 06:00), also check trips from yesterday's service day
+        // because they might have GTFS times >= 24:00:00 (midnight-crossing trips)
+        // Example: A bus with GTFS time 28:00:00 (04:00 AM) belongs to yesterday's service day
+        EstimatedCall firstCall = estimatedCalls.get(0);
+        Instant firstInstant = Instant.parse(firstCall.isoTime());
+        ZonedDateTime firstZdt = firstInstant.atZone(zone);
+        boolean isEarlyMorning = firstZdt.getHour() < 8;
+        
+        // Try current service day first
+        String result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId, 
+                                                   journeyNote, journeyNoteDetailled, directionId, 
+                                                   serviceDay, zone, timeColumn);
+        
+        // If no match and it's early morning, also try yesterday's service day
+        // (for midnight-crossing trips with times >= 24:00:00)
+        if (result == null && isEarlyMorning) {
+            LocalDate previousServiceDay = serviceDay.minusDays(1);
+            result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId, 
+                                              journeyNote, journeyNoteDetailled, directionId, 
+                                              previousServiceDay, zone, timeColumn);
+        }
+        
+        // Cache and return result
+        findTripCache.put(cacheKey, result);
+        return result;
+    }
 
+    /**
+     * Searches for matching trips for a specific service day.
+     */
+    private static String searchTripsForServiceDay(
+        String routeId,
+        List<EstimatedCall> estimatedCalls,
+        boolean isArrivalTime,
+        String destinationId,
+        String journeyNote,
+        boolean journeyNoteDetailled,
+        Integer directionId,
+        LocalDate serviceDay,
+        ZoneId zone,
+        String timeColumn
+    ) throws SQLException {
         // Prepare query parameters
         String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         int dayOfWeek = serviceDay.getDayOfWeek().getValue();
@@ -581,12 +625,12 @@ public class TripFinder {
         );
         Map<String, Map<String, List<Integer>>> tripStopTimes = fetchCandidateTrips(query, queryParams);
 
+        if (tripStopTimes.isEmpty()) {
+            return null;
+        }
+
         // Find best matching trip
-        String result = findBestMatchingTrip(tripStopTimes, estimatedCalls, zone);
-        
-        // Cache and return result
-        findTripCache.put(cacheKey, result);
-        return result;
+        return findBestMatchingTrip(tripStopTimes, estimatedCalls, zone);
     }
 
     /**
@@ -1135,7 +1179,7 @@ public class TripFinder {
                     int dir = rs.getInt(COL_DIRECTION_ID);
                     int first = rs.getInt("first_time");
                     // first may already be seconds since service day; keep raw value but cast into 0..int range
-                    result.add(new TripMeta(tripId, routeId, dir, first));
+                    result.add(new TripMeta(tripId, routeId, dir, first, yyyymmdd));
                 }
             }
         } catch (SQLException e) {
@@ -1157,13 +1201,30 @@ public class TripFinder {
      * @return TripMeta object containing trip metadata, or null if the trip is not found
      * @see TripMeta
      */
-    public static TripMeta getTripMeta(String tripId) {
+    /**
+     * Returns trip metadata for a given trip ID with service date.
+     * 
+     * @param tripId The trip identifier
+     * @param serviceDate The service date in YYYYMMDD format (uses current date if null)
+     * @return TripMeta object or null if not found
+     */
+    public static TripMeta getTripMeta(String tripId, String serviceDate) {
         if (tripId == null || tripId.isEmpty()) {
             return null;
         }
         
-        TripMeta cached = tripMetaCache.get(tripId);
+        // For cache key, include service date to handle same trip on different days
+        String cacheKey = tripId + ":" + (serviceDate != null ? serviceDate : "unknown");
+        TripMeta cached = tripMetaCache.get(cacheKey);
         if (cached != null) return cached;
+
+        // Use provided service date or fall back to current date
+        String startDate = serviceDate;
+        if (startDate == null) {
+            ZoneId zone = ZoneId.of("Europe/Paris");
+            LocalDate date = LocalDate.now(zone);
+            startDate = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        }
 
         String sql = "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time " +
                 "FROM trips t JOIN stop_times st ON st.trip_id = t.trip_id WHERE t.trip_id = ? GROUP BY t.trip_id, t.route_id, t.direction_id";
@@ -1175,13 +1236,58 @@ public class TripFinder {
                     String routeId = rs.getString("route_id");
                     int dir = rs.getInt(COL_DIRECTION_ID);
                     int first = rs.getInt("first_time");
-                    TripMeta meta = new TripMeta(tripId, routeId, dir, first);
-                    tripMetaCache.put(tripId, meta);
+                    TripMeta meta = new TripMeta(tripId, routeId, dir, first, startDate);
+                    tripMetaCache.put(cacheKey, meta);
                     return meta;
                 }
             }
         } catch (SQLException e) {
             logger.debug("Error getting trip metadata for trip: {}", tripId, e);
+        }
+        return null;
+    }
+    
+    /**
+     * Returns trip metadata for a given trip ID using current service date.
+     * 
+     * @param tripId The trip identifier
+     * @return TripMeta object or null if not found
+     */
+    public static TripMeta getTripMeta(String tripId) {
+        return getTripMeta(tripId, null);
+    }
+
+    /**
+     * Returns the first stop time (in seconds since midnight) for a given trip.
+     * 
+     * <p>This method retrieves the earliest arrival or departure time from the GTFS stop_times
+     * table for the specified trip. The time is returned as seconds since midnight (00:00:00).
+     * For trips that cross midnight, times can be >= 86400 (24:00:00 or later).
+     * 
+     * @param tripId The trip identifier
+     * @return The first stop time in seconds since midnight, or null if not found
+     */
+    public static Integer getFirstStopTime(String tripId) {
+        if (tripId == null || tripId.isEmpty()) {
+            return null;
+        }
+
+        String sql = "SELECT MIN(COALESCE(departure_timestamp, arrival_timestamp)) AS first_time " +
+                "FROM stop_times WHERE trip_id = ?";
+        
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, tripId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    int firstTime = rs.getInt("first_time");
+                    if (!rs.wasNull()) {
+                        return firstTime;
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("Error getting first stop time for trip: {}", tripId, e);
         }
         return null;
     }

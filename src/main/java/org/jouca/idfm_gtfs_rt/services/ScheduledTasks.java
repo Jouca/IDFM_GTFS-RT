@@ -228,10 +228,14 @@ public class ScheduledTasks {
      * policy (restart: unless-stopped or restart: always), the container will
      * automatically restart, ensuring a fresh start of the application.
      * <p>
+     * Before shutting down, this method deletes the local GTFS database file
+     * to ensure that fresh GTFS data is fetched upon restart.
+     * <p>
      * This daily restart helps to:
      * <ul>
      *   <li>Clear any memory leaks or accumulated resources</li>
      *   <li>Ensure a fresh state of the application</li>
+     *   <li>Force a refresh of GTFS static data</li>
      *   <li>Apply any configuration changes that require a restart</li>
      * </ul>
      * <p>
@@ -240,6 +244,18 @@ public class ScheduledTasks {
     @Scheduled(cron = "0 0 3 * * ?") // Every day at 3:00 AM
     public void restartApplication() {
         System.out.println("[Restart] Scheduled restart at 3:00 AM - Shutting down application...");
+        
+        // Delete the GTFS database file to force a fresh fetch on restart
+        try {
+            Path dbPath = Path.of(GTFS_FILE_PATH);
+            if (Files.exists(dbPath)) {
+                Files.delete(dbPath);
+                logger.info("Deleted GTFS database file: {}", GTFS_FILE_PATH);
+            }
+        } catch (Exception e) {
+            logger.error("Failed to delete GTFS database file: {}", e.getMessage(), e);
+        }
+        
         SpringApplication.exit(applicationContext, () -> 0);
     }
 }

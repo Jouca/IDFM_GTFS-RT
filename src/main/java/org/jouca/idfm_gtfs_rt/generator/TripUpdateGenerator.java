@@ -2,7 +2,10 @@ package org.jouca.idfm_gtfs_rt.generator;
 
 import java.sql.SQLException;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -621,11 +624,15 @@ public class TripUpdateGenerator {
         entityBuilder.setId(meta.tripId);
 
         GtfsRealtime.TripUpdate.Builder tripUpdate = entityBuilder.getTripUpdateBuilder();
-        tripUpdate.getTripBuilder()
+        GtfsRealtime.TripDescriptor.Builder tripDescriptor = tripUpdate.getTripBuilder()
                 .setTripId(meta.tripId)
                 .setRouteId(meta.routeId)
                 .setDirectionId(meta.directionId)
                 .setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
+        
+        if (meta.startDate != null && !meta.startDate.isEmpty()) {
+            tripDescriptor.setStartDate(meta.startDate);
+        }
 
         return entityBuilder.build();
     }
@@ -670,7 +677,9 @@ public class TripUpdateGenerator {
             return null;
         }
 
-        TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId);
+        // Determine service date based on the trip's theoretical GTFS schedule
+        String serviceDate = determineServiceDateFromTrip(tripId);
+        TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId, serviceDate);
         updateContextStats(context, tripMeta);
 
         TripState state = updateTripState(tripId, vehicleId);
@@ -688,6 +697,44 @@ public class TripUpdateGenerator {
      * Record to hold direction and journey note information extracted from an entity.
      */
     private record DirectionInfo(Integer directionIdForMatching, String journeyNote, boolean journeyNoteDetailled) {}
+
+    /**
+     * Determines the service date based on the trip's theoretical GTFS schedule.
+     * 
+     * <p>For trips that cross midnight (with GTFS stop times >= 24:00:00), the service date
+     * must be the date when the trip started (the previous calendar day), not the current date.
+     * 
+     * <p>This method retrieves the first stop_time from the GTFS database for the given trip.
+     * If the time is in the range [24:00:00, 32:00:00] (represented as seconds >= 86400),
+     * the service date is set to one day before the current date.
+     * 
+     * @param tripId the GTFS trip identifier
+     * @return service date in YYYYMMDD format
+     */
+    private String determineServiceDateFromTrip(String tripId) {
+        LocalDate currentDate = LocalDate.now(ZONE_ID);
+        
+        if (tripId == null || tripId.isEmpty()) {
+            return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        }
+        
+        // Get the first stop time for this trip from GTFS
+        Integer firstStopTimeSeconds = TripFinder.getFirstStopTime(tripId);
+        
+        if (firstStopTimeSeconds == null) {
+            // If we can't determine the first stop time, use current date
+            return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        }
+        
+        // If the first stop time is >= 24:00:00 (86400 seconds) and < 32:00:00 (115200 seconds),
+        // the trip belongs to the previous service day
+        if (firstStopTimeSeconds >= 86400 && firstStopTimeSeconds < 115200) {
+            return currentDate.minusDays(1).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        }
+        
+        // Otherwise, use the current date as the service date
+        return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+    }
 
     /**
      * Extracts direction and journey note information from SIRI Lite entity.
@@ -871,10 +918,15 @@ public class TripUpdateGenerator {
         int directionId = resolveDirectionId(tripMeta, directionIdForMatching, tripId);
         String routeForDescriptor = tripMeta != null && tripMeta.routeId != null ? tripMeta.routeId : lineId;
         
-        tripUpdate.getTripBuilder()
+        GtfsRealtime.TripDescriptor.Builder tripDescriptor = tripUpdate.getTripBuilder()
                 .setRouteId(routeForDescriptor)
                 .setDirectionId(directionId)
                 .setTripId(tripId);
+        
+        if (tripMeta != null && tripMeta.startDate != null && !tripMeta.startDate.isEmpty()) {
+            tripDescriptor.setStartDate(tripMeta.startDate);
+        }
+        
         tripUpdate.getVehicleBuilder().setId(state.vehicleId);
 
         addStopTimeUpdates(tripUpdate, estimatedCalls, tripId);
