@@ -38,3 +38,5 @@ gtfs.db-shm
 gtfs.db-wal
 extracted-gtfs/
 IDFM-gtfs.zip
+object_codes_extension.txt
+stop_extensions.txt

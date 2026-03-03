@@ -13,7 +13,7 @@ import org.slf4j.LoggerFactory;
  *   <li>Downloading GTFS ZIP files from a remote URL</li>
  *   <li>Extracting the ZIP archive contents</li>
  *   <li>Importing GTFS data into a SQLite database</li>
- *   <li>Processing custom extensions (stop_extensions.txt)</li>
+ *   <li>Processing custom extensions (object_codes_extension.txt)</li>
  *   <li>Creating optimized database indexes for query performance</li>
  * </ul>
  * 
@@ -35,14 +35,14 @@ public class GTFSFetcher {
      *   <li>Downloads the GTFS ZIP file from the provided URL</li>
      *   <li>Extracts the ZIP file contents to a local directory</li>
      *   <li>Imports the GTFS data into a SQLite database using gtfs-import CLI</li>
-     *   <li>Imports custom stop extensions from stop_extensions.txt</li>
+     *   <li>Imports custom object codes extension from object_codes_extension.txt</li>
      *   <li>Creates multiple database indexes for performance optimization</li>
      * </ol>
      * 
      * <p><b>Database Indexes Created:</b>
      * <ul>
-     *   <li>idx_object_id - Index on stop_extensions.object_id</li>
-     *   <li>idx_object_code - Index on stop_extensions.object_code</li>
+     *   <li>idx_object_id - Index on object_codes_extension.object_id</li>
+     *   <li>idx_object_code - Index on object_codes_extension.object_code</li>
      *   <li>idx_stop_times_trip_stop_arrival_departure_seq - Composite index for stop times queries</li>
      *   <li>idx_trips_route_direction_service - Index for trip filtering</li>
      *   <li>idx_calendar_service_dates - Index for calendar date range queries</li>
@@ -50,7 +50,7 @@ public class GTFSFetcher {
      *   <li>idx_calendar_dates_service_date_exception - Composite index for calendar exceptions</li>
      *   <li>idx_calendar_dates_date_exception - Index for date-based exception lookups</li>
      *   <li>idx_stops_stop_id - Index for stop lookups</li>
-     *   <li>idx_stop_extensions_object_code - Index for stop extension queries</li>
+     *   <li>idx_object_codes_extension_object_code - Index for object codes extension queries</li>
      *   <li>idx_stop_times_trip_id_stop_sequence - Composite index for ordered stop times</li>
      *   <li>idx_stop_times_stop_id_trip_id_sequence - Composite index for stop-based queries</li>
      *   <li>idx_stop_times_trip_id_stop_id - Composite index for trip-stop lookups</li>
@@ -123,14 +123,14 @@ public class GTFSFetcher {
         logger.info("GTFS data imported successfully.");
 
         // =============================================================================
-        // Step 4: Import custom GTFS extension file (stop_extensions.txt)
+        // Step 4: Import custom GTFS extension file (object_codes_extension.txt)
         // =============================================================================
-        // IDFM provides additional stop metadata in stop_extensions.txt that is not part
-        // of standard GTFS. This includes object_id and object_code fields used for
-        // matching real-time data with scheduled stops.
-        logger.info("Step 4/5: Importing stop extensions...");
-        importStopExtensions("./extracted-gtfs/stop_extensions.txt", outputFilePath);
-        logger.info("Stop extensions imported successfully.");
+        // IDFM provides additional object metadata in object_codes_extension.txt that is not part
+        // of standard GTFS. This replaces stop_extensions.txt and includes object_type, object_id
+        // and object_code fields used for matching real-time data with scheduled stops.
+        logger.info("Step 4/5: Importing object codes extension...");
+        importObjectCodesExtension("./extracted-gtfs/object_codes_extension.txt", outputFilePath);
+        logger.info("Object codes extension imported successfully.");
 
         // ==================================================================================
         // Step 5: Create database indexes for query performance optimization
@@ -243,21 +243,24 @@ public class GTFSFetcher {
     }
 
     /**
-     * Imports stop_extensions.txt file into the database.
+     * Imports object_codes_extension.txt file into the database.
      * 
-     * @param stopExtensionsPath Path to the stop_extensions.txt file
+     * <p>This file replaces stop_extensions.txt and contains additional object metadata
+     * including an object_type column (stop_area, stop_point, route, trip, agency, etc.).
+     * 
+     * @param objectCodesExtensionPath Path to the object_codes_extension.txt file
      * @param outputFilePath Path to the SQLite database
      * @throws IOException If an error occurs during import
      */
-    private static void importStopExtensions(String stopExtensionsPath, String outputFilePath) throws IOException {
-        java.nio.file.Path stopExtensionsFile = java.nio.file.Paths.get(stopExtensionsPath);
+    private static void importObjectCodesExtension(String objectCodesExtensionPath, String outputFilePath) throws IOException {
+        java.nio.file.Path objectCodesExtensionFile = java.nio.file.Paths.get(objectCodesExtensionPath);
         
-        if (!java.nio.file.Files.exists(stopExtensionsFile)) {
-            throw new IOException("File " + stopExtensionsPath + " does not exist.");
+        if (!java.nio.file.Files.exists(objectCodesExtensionFile)) {
+            throw new IOException("File " + objectCodesExtensionPath + " does not exist.");
         }
 
-        String command = "sqlite3 " + outputFilePath + " \".mode csv\" \".import " + stopExtensionsPath + " stop_extensions\"";
-        executeCommand(command, "Failed to import stop extensions");
+        String command = "sqlite3 " + outputFilePath + " \".mode csv\" \".import " + objectCodesExtensionPath + " object_codes_extension\"";
+        executeCommand(command, "Failed to import object codes extension");
     }
 
     /**
@@ -267,13 +270,13 @@ public class GTFSFetcher {
      * @throws IOException If an error occurs during index creation
      */
     private static void createDatabaseIndexes(String outputFilePath) throws IOException {
-        // Index 1: Fast lookups of stops by object_id
+        // Index 1: Fast lookups of objects by object_id
         createIndex(outputFilePath, "idx_object_id", 
-            "CREATE INDEX idx_object_id ON stop_extensions (object_id);");
+            "CREATE INDEX idx_object_id ON object_codes_extension (object_id);");
 
-        // Index 2: Fast lookups of stops by object_code
+        // Index 2: Fast lookups of objects by object_code
         createIndex(outputFilePath, "idx_object_code", 
-            "CREATE INDEX idx_object_code ON stop_extensions (object_code);");
+            "CREATE INDEX idx_object_code ON object_codes_extension (object_code);");
 
         // Index 3: Composite index for stop_times queries
         createIndex(outputFilePath, "idx_stop_times_trip_stop_arrival_departure_seq", 
@@ -303,9 +306,9 @@ public class GTFSFetcher {
         createIndex(outputFilePath, "idx_stops_stop_id", 
             "CREATE INDEX idx_stops_stop_id ON stops (stop_id);");
 
-        // Index 10: Fast lookups in stop_extensions by object_code
-        createIndex(outputFilePath, "idx_stop_extensions_object_code", 
-            "CREATE INDEX idx_stop_extensions_object_code ON stop_extensions (object_code);");
+        // Index 10: Fast lookups in object_codes_extension by object_code
+        createIndex(outputFilePath, "idx_object_codes_extension_object_code", 
+            "CREATE INDEX idx_object_codes_extension_object_code ON object_codes_extension (object_code);");
 
         // Index 11: Composite index for ordered retrieval of stops for a trip
         createIndex(outputFilePath, "idx_stop_times_trip_id_stop_sequence", 

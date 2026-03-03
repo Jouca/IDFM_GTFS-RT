@@ -73,9 +73,9 @@ class TripFinderTest {
     }
 
     @Test
-    void testCheckIfStopExtensionsTableExists() {
+    void testCheckIfObjectCodesExtensionTableExists() {
         // This will return false if database doesn't exist or table doesn't exist
-        boolean result = TripFinder.checkIfStopExtensionsTableExists();
+        boolean result = TripFinder.checkIfObjectCodesExtensionTableExists();
         
         // Result should be boolean (test database connection)
         assertTrue(result || !result); // Verifies method executes without exception

@@ -467,26 +467,56 @@ public class TripFinder {
 
     /**
      * Finds the best matching trip from the candidate trips within the defined time windows.
-     * Time windows are progressively expanded to handle various delay scenarios in Île-de-France:
-     * - Short delays: ±2-5 minutes (typical for metro/tram)
-     * - Medium delays: up to +15 minutes (typical for buses/RER)
-     * - Large delays: up to +45 minutes (for major disruptions)
-     * - Very large delays: up to +60 minutes (extreme cases)
+     * Time windows are progressively expanded to handle various delay scenarios in Île-de-France.
+     * Windows are adapted based on the route type (metro/tram are more punctual than buses).
+     * 
+     * @param tripStopTimes Map of candidate trips with their stop times
+     * @param estimatedCalls List of real-time estimated calls
+     * @param zone Time zone for conversions
+     * @param routeType GTFS route type (0=Tram, 1=Metro, 2=Rail, 3=Bus, etc.)
+     * @return The best matching trip ID, or null if no match found
      */
     private static String findBestMatchingTrip(
         Map<String, Map<String, List<Integer>>> tripStopTimes,
         List<EstimatedCall> estimatedCalls,
-        ZoneId zone
+        ZoneId zone,
+        int routeType
     ) {
-        int[][] windows = {
-            {-2, 2},   // ±2 minutes: strict matching for on-time services
-            {-3, 5},   // -3 to +5 minutes: normal delays
-            {-5, 10},  // -5 to +10 minutes: moderate delays (typical for buses)
-            {-5, 15},  // -5 to +15 minutes: significant delays
-            {-5, 30},  // -5 to +30 minutes: major delays (rush hour, incidents)
-            {-5, 45},  // -5 to +45 minutes: severe delays
-            {-5, 60}   // -5 to +60 minutes: extreme delays (major disruptions)
-        };
+        // Adapt time windows based on route type
+        // Metro (1) and Tram (0): stricter windows (more punctual)
+        // Bus (3): more lenient windows (more subject to traffic delays)
+        // Rail (2): moderate windows
+        int[][] windows;
+        
+        if (routeType == 0 || routeType == 1) {
+            // Metro/Tram: strict matching
+            windows = new int[][]{
+                {-1, 1},   // ±1 minute: strict matching
+                {-2, 3},   // -2 to +3 minutes: small delays
+                {-3, 5},   // -3 to +5 minutes: moderate delays
+                {-5, 10},  // -5 to +10 minutes: significant delays
+                {-5, 15}   // -5 to +15 minutes: major delays (max for metro/tram)
+            };
+        } else if (routeType == 3) {
+            // Bus: more lenient matching
+            windows = new int[][]{
+                {-2, 2},   // ±2 minutes: strict matching
+                {-3, 5},   // -3 to +5 minutes: normal delays
+                {-5, 10},  // -5 to +10 minutes: moderate delays
+                {-5, 15},  // -5 to +15 minutes: significant delays
+                {-5, 20},  // -5 to +20 minutes: major delays
+                {-5, 30}   // -5 to +30 minutes: severe delays (max for buses)
+            };
+        } else {
+            // Rail/Other: moderate matching
+            windows = new int[][]{
+                {-2, 2},   // ±2 minutes: strict matching
+                {-3, 5},   // -3 to +5 minutes: normal delays
+                {-5, 10},  // -5 to +10 minutes: moderate delays
+                {-5, 15},  // -5 to +15 minutes: significant delays
+                {-5, 20}   // -5 to +20 minutes: major delays
+            };
+        }
 
         List<TripMatch> allMatches = new ArrayList<>();
 
@@ -629,8 +659,11 @@ public class TripFinder {
             return null;
         }
 
+        // Get route type to adapt matching windows
+        int routeType = getRouteType(routeId);
+
         // Find best matching trip
-        return findBestMatchingTrip(tripStopTimes, estimatedCalls, zone);
+        return findBestMatchingTrip(tripStopTimes, estimatedCalls, zone, routeType);
     }
 
     /**
@@ -667,6 +700,38 @@ public class TripFinder {
         }
 
         return tripStopTimes;
+    }
+
+    /**
+     * Retrieves the route type for a given route ID from the GTFS routes table.
+     * Route types follow the GTFS specification:
+     * 0 = Tram, 1 = Metro, 2 = Rail, 3 = Bus, 4 = Ferry, etc.
+     * 
+     * @param routeId The GTFS route ID
+     * @return The route type, or 3 (Bus) as default if not found
+     */
+    private static int getRouteType(String routeId) {
+        if (routeId == null || routeId.isEmpty()) {
+            return 3; // Default to Bus
+        }
+        
+        String query = "SELECT route_type FROM routes WHERE route_id = ?";
+        
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+            
+            stmt.setString(1, routeId);
+            
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getInt("route_type");
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("Error getting route type for route: {}", routeId, e);
+        }
+        
+        return 3; // Default to Bus if not found
     }
 
     /**
@@ -791,13 +856,13 @@ public class TripFinder {
     }
 
     /**
-     * Finds a child stop ID from the stop_extensions table for a given parent stop and trip.
+     * Finds a child stop ID from the object_codes_extension table for a given parent stop and trip.
      * 
      * <p>Some GTFS feeds have hierarchical stop structures where a parent stop (like a station)
      * has multiple child stops (like platforms). This method finds the specific child stop
      * that is used in a particular trip.
      * 
-     * @param stopId The parent stop identifier (object_code in stop_extensions)
+     * @param stopId The parent stop identifier (object_code in object_codes_extension)
      * @param tripId The trip identifier to search within
      * @return The child stop ID (object_id), or null if not found
      */
@@ -809,9 +874,10 @@ public class TripFinder {
         String childStopId = null;
         String query = """
             SELECT se.object_id
-            FROM stop_extensions se
+            FROM object_codes_extension se
             JOIN stop_times st ON se.object_id = st.stop_id
-            WHERE se.object_code = ? AND st.trip_id = ? LIMIT 1;
+            WHERE se.object_code = ? AND st.trip_id = ?
+            AND se.object_type IN ('stop_area', 'stop_point') LIMIT 1;
         """;
 
         try (Connection conn = dataSource.getConnection();
@@ -833,22 +899,23 @@ public class TripFinder {
     }
 
     /**
-     * Checks if the stop_extensions table exists in the GTFS database.
+     * Checks if the object_codes_extension table exists in the GTFS database.
      * 
-     * <p>The stop_extensions table is a custom extension used by some GTFS feeds
-     * to store additional stop metadata, particularly for hierarchical stop structures.
+     * <p>The object_codes_extension table is a custom extension used by IDFM GTFS feeds
+     * to store additional object metadata (stops, routes, trips, agencies, etc.).
+     * It replaces the former stop_extensions table.
      * 
-     * @return true if the stop_extensions table exists, false otherwise
+     * @return true if the object_codes_extension table exists, false otherwise
      */
-    public static boolean checkIfStopExtensionsTableExists() {
-        String query = "SELECT name FROM sqlite_master WHERE type='table' AND name='stop_extensions';";
+    public static boolean checkIfObjectCodesExtensionTableExists() {
+        String query = "SELECT name FROM sqlite_master WHERE type='table' AND name='object_codes_extension';";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query);
              ResultSet rs = stmt.executeQuery()) {
 
             return rs.next();
         } catch (Exception e) {
-            logger.debug("Error checking if stop_extensions table exists", e);
+            logger.debug("Error checking if object_codes_extension table exists", e);
             return false;
         }
     }
@@ -886,11 +953,11 @@ public class TripFinder {
     }
 
     /**
-     * Finds a stop ID from the stop_extensions table using a stop extension code.
+     * Finds a stop ID from the object_codes_extension table using a stop extension code.
      * 
-     * <p>This method searches the stop_extensions table for entries matching the given
-     * stop extension code in the 'netex_zder_quay' object system. This is specific to
-     * certain GTFS feeds that use NeTEx extensions.
+     * <p>This method searches the object_codes_extension table for stop_point entries
+     * matching the given stop extension code in the 'netex_zder_quay' object system.
+     * This is specific to certain GTFS feeds that use NeTEx extensions.
      * 
      * @param stopExtension The stop extension code to search for
      * @return The object ID (stop ID), or null if not found
@@ -900,7 +967,7 @@ public class TripFinder {
             return null;
         }
         
-        String query = "SELECT object_id FROM stop_extensions WHERE object_code LIKE ? AND object_system LIKE 'netex_zder_quay' LIMIT 1;";
+        String query = "SELECT object_id FROM object_codes_extension WHERE object_code LIKE ? AND object_system LIKE 'netex_zder_quay' AND object_type = 'stop_point' LIMIT 1;";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
 
@@ -960,7 +1027,7 @@ public class TripFinder {
      * <p>This method first checks the cache, then attempts to find the stop ID:
      * <ol>
      *   <li>By searching the stops table for a matching stop code</li>
-     *   <li>By searching the stop_extensions table if the first method fails</li>
+     *   <li>By searching the object_codes_extension table if the first method fails</li>
      * </ol>
      * 
      * <p>Results are cached to improve performance for repeated lookups.

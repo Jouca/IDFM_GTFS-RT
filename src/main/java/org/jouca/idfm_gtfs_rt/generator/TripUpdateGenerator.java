@@ -8,6 +8,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -93,6 +94,16 @@ public class TripUpdateGenerator {
     
     /** Status value indicating a cancelled stop or trip in SIRI Lite data */
     private static final String STATUS_CANCELLED = "CANCELLED";
+    
+    /** SIRI Lite JSON field name for operator reference */
+    private static final String FIELD_OPERATOR_REF = "OperatorRef";
+    
+    /** Blacklist of operator IDs to exclude from GTFS-RT feed and trip matching */
+    private static final Set<String> OPERATOR_BLACKLIST = Set.of(
+        "MeC_Bus_PC:Operator:*",
+        "RATP-SIV:*"
+        // Add more operator IDs here as needed
+    );
 
     /** Flag to enable debug file output (configured via application properties) */
     @Value("${gtfsrt.debug.dump:false}")
@@ -222,8 +233,8 @@ public class TripUpdateGenerator {
 
         saveSiriLiteDataToFile(siriLiteData, "sirilite_data.json");
 
-        // Check if stop_extensions table exists in SQLite database
-        if (!TripFinder.checkIfStopExtensionsTableExists()) {
+        // Check if object_codes_extension table exists in SQLite database
+        if (!TripFinder.checkIfObjectCodesExtensionTableExists()) {
             return;
         }
 
@@ -268,6 +279,8 @@ public class TripUpdateGenerator {
      * <ul>
      *   <li>Extracts EstimatedVehicleJourney entities from SIRI Lite data</li>
      *   <li>Sorts entities by earliest departure/arrival time</li>
+     *   <li>Collects current vehicle IDs from SIRI data</li>
+     *   <li>Cleans up vehicle-to-trip cache for vehicles not present in current SIRI data</li>
      *   <li>Processes entities in parallel using a thread pool</li>
      *   <li>Maintains original order in the output feed</li>
      *   <li>Cleans up stale trip states (older than 15 minutes)</li>
@@ -284,6 +297,12 @@ public class TripUpdateGenerator {
     
         sortEntitiesByTime(entities);
         System.out.println("Processing " + entities.size() + " entities...");
+
+        // Collect current vehicle IDs from SIRI data
+        Set<String> currentVehicleIds = extractVehicleIds(entities);
+        
+        // Clean up vehicle-to-trip cache for vehicles not present in current SIRI data
+        cleanupAbsentVehicles(currentVehicleIds);
 
         Map<String, JsonNode> entitiesTrips = dumpDebugFiles ? new ConcurrentHashMap<>() : null;
         List<IndexedEntity> builtEntities = processEntitiesInParallel(entities, entitiesTrips, context);
@@ -306,6 +325,30 @@ public class TripUpdateGenerator {
         siriLiteData.get("Siri").get("ServiceDelivery").get("EstimatedTimetableDelivery").get(0)
                 .get("EstimatedJourneyVersionFrame").get(0).get("EstimatedVehicleJourney").forEach(entities::add);
         return entities;
+    }
+
+    /**
+     * Extracts vehicle IDs from SIRI Lite entities.
+     * 
+     * @param entities the list of SIRI Lite entities
+     * @return set of vehicle IDs present in the current SIRI data
+     */
+    private Set<String> extractVehicleIds(List<JsonNode> entities) {
+        return entities.stream()
+                .filter(entity -> entity.has("DatedVehicleJourneyRef"))
+                .map(entity -> entity.get("DatedVehicleJourneyRef").get(FIELD_VALUE).asText())
+                .collect(Collectors.toSet());
+    }
+
+    /**
+     * Cleans up vehicle-to-trip cache for vehicles that are no longer present in SIRI data.
+     * This ensures that when a vehicle disappears from SIRI, it will be removed from the cache
+     * and will need to go through trip matching again if it reappears with a different trip.
+     * 
+     * @param currentVehicleIds the set of vehicle IDs present in the current SIRI data
+     */
+    private void cleanupAbsentVehicles(Set<String> currentVehicleIds) {
+        vehicleToTrip.keySet().removeIf(vehicleId -> !currentVehicleIds.contains(vehicleId));
     }
 
     /**
@@ -402,6 +445,7 @@ public class TripUpdateGenerator {
      * @param feedMessage the feed message builder
      */
     private void addEntitiesToFeed(List<IndexedEntity> builtEntities, GtfsRealtime.FeedMessage.Builder feedMessage) {
+        // Add all entities to feed in sorted order
         builtEntities.stream()
             .sorted(Comparator.comparingInt(IndexedEntity::index))
             .forEach(indexed -> feedMessage.addEntity(indexed.entity()));
@@ -643,8 +687,8 @@ public class TripUpdateGenerator {
      * <p>This method performs the core trip matching and entity building:
      * <ol>
      *   <li>Extracts line, vehicle, destination, and direction information</li>
-     *   <li>Builds a list of estimated calls (stop predictions)</li>
-     *   <li>Matches the real-time data to a theoretical GTFS trip</li>
+     *   <li>Checks if vehicle already has a cached trip assignment</li>
+     *   <li>If not cached, builds a list of estimated calls and matches to a theoretical GTFS trip</li>
      *   <li>Updates trip state and vehicle associations</li>
      *   <li>Builds a GTFS-RT TripUpdate entity with stop time predictions</li>
      *   <li>Handles canceled trips and skipped stops</li>
@@ -657,6 +701,11 @@ public class TripUpdateGenerator {
      * @return an IndexedEntity containing the built GTFS-RT entity, or null if processing fails
      */
     private IndexedEntity processEntity(JsonNode entity, int index, Map<String, JsonNode> entitiesTrips, ProcessingContext context) {
+        // Check if operator is blacklisted
+        if (isOperatorBlacklisted(entity)) {
+            return null;
+        }
+        
         String lineId = "IDFM:" + entity.get("LineRef").get(FIELD_VALUE).asText().split(":")[3];
         String vehicleId = entity.get("DatedVehicleJourneyRef").get(FIELD_VALUE).asText();
 
@@ -672,9 +721,24 @@ public class TripUpdateGenerator {
             return null;
         }
 
-        String tripId = findTripId(lineId, estimatedCallList, estimatedCalls, destinationId, directionInfo);
-        if (tripId == null || tripId.isEmpty()) {
-            return null;
+        // Check if this vehicle already has a cached trip assignment
+        String tripId = vehicleToTrip.get(vehicleId);
+        
+        if (tripId != null) {
+            // Verify the cached trip is still valid (exists in GTFS, matches the line, and is temporally close)
+            if (!isCachedTripValid(tripId, lineId, estimatedCalls)) {
+                vehicleToTrip.remove(vehicleId);
+                tripStates.remove(tripId);
+                tripId = null;
+            }
+        }
+        
+        // If no cached trip or cache was invalid, perform trip matching
+        if (tripId == null) {
+            tripId = findTripId(lineId, estimatedCallList, estimatedCalls, destinationId, directionInfo);
+            if (tripId == null || tripId.isEmpty()) {
+                return null;
+            }
         }
 
         // Determine service date based on the trip's theoretical GTFS schedule
@@ -693,6 +757,139 @@ public class TripUpdateGenerator {
         return new IndexedEntity(index, feedEntity);
     }
 
+    /**
+     * Validates that a cached trip ID is still valid.
+     * Checks if the trip exists in the trip states, belongs to the expected line,
+     * and is temporally close to the current real-time data.
+     * 
+     * @param tripId the cached trip ID to validate
+     * @param expectedLineId the expected line ID
+     * @param estimatedCalls the current estimated calls from SIRI
+     * @return true if the cached trip is valid, false otherwise
+     */
+    private boolean isCachedTripValid(String tripId, String expectedLineId, List<JsonNode> estimatedCalls) {
+        if (tripId == null || expectedLineId == null || estimatedCalls == null || estimatedCalls.isEmpty()) {
+            return false;
+        }
+        
+        // Check if trip exists in our state
+        TripState state = tripStates.get(tripId);
+        if (state == null) {
+            return false;
+        }
+        
+        // Verify the trip belongs to the expected line by getting trip metadata
+        String serviceDate = determineServiceDateFromTrip(tripId);
+        TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId, serviceDate);
+        if (tripMeta == null || tripMeta.routeId == null) {
+            return false;
+        }
+        
+        // Check if the route matches the expected line
+        if (!tripMeta.routeId.equals(expectedLineId)) {
+            return false;
+        }
+        
+        // Verify temporal consistency: the cached trip should still be close in time to current SIRI data
+        // Get the first stop time from SIRI
+        JsonNode firstCall = estimatedCalls.get(0);
+        String siriTime = extractTimeFromCall(firstCall);
+        if (siriTime == null) {
+            return false;
+        }
+        
+        long siriEpochSeconds = Instant.parse(siriTime).atZone(ZONE_ID).toEpochSecond();
+        
+        // Get the first stop time from the theoretical trip
+        Integer firstStopTimeSeconds = TripFinder.getFirstStopTime(tripId);
+        if (firstStopTimeSeconds == null) {
+            return false;
+        }
+        
+        // Convert theoretical time to epoch seconds for today's service date
+        LocalDate today = LocalDate.now(ZONE_ID);
+        if (firstStopTimeSeconds >= 86400) {
+            // Trip crosses midnight, use yesterday as service date
+            today = today.minusDays(1);
+        }
+        
+        long theoreticalEpochSeconds = today.atStartOfDay(ZONE_ID).toEpochSecond() + firstStopTimeSeconds;
+        
+        // Allow up to 10 minutes difference (600 seconds) for cached trips
+        // This is stricter than the initial matching which allows up to 60 minutes
+        long timeDifference = Math.abs(siriEpochSeconds - theoreticalEpochSeconds);
+        return timeDifference <= 600;
+    }
+
+    /**
+     * Checks if the operator of an entity is in the blacklist.
+     * Supports wildcard patterns with '*' in the blacklist entries.
+     * For example, "RATP-SIV:*" will match any operator starting with "RATP-SIV:"
+     * 
+     * @param entity the SIRI Lite entity to check
+     * @return true if the operator is blacklisted, false otherwise
+     */
+    private boolean isOperatorBlacklisted(JsonNode entity) {
+        if (!entity.has(FIELD_OPERATOR_REF)) {
+            return false;
+        }
+        
+        JsonNode operatorRef = entity.get(FIELD_OPERATOR_REF);
+        if (!operatorRef.has(FIELD_VALUE)) {
+            return false;
+        }
+        
+        String operatorId = operatorRef.get(FIELD_VALUE).asText();
+        
+        // Check for exact matches or wildcard patterns
+        for (String blacklistedPattern : OPERATOR_BLACKLIST) {
+            if (matchesPattern(operatorId, blacklistedPattern)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Checks if an operator ID matches a blacklist pattern.
+     * Supports wildcard '*' which matches any sequence of characters.
+     * 
+     * @param operatorId the operator ID to check
+     * @param pattern the blacklist pattern (may contain '*' wildcards)
+     * @return true if the operator ID matches the pattern
+     */
+    private boolean matchesPattern(String operatorId, String pattern) {
+        if (operatorId == null || pattern == null) {
+            return false;
+        }
+        
+        // If no wildcard, do exact match
+        if (!pattern.contains("*")) {
+            return operatorId.equals(pattern);
+        }
+        
+        // Convert wildcard pattern to regex
+        // Escape special regex characters except *
+        String regexPattern = pattern
+                .replace("\\", "\\\\")
+                .replace(".", "\\.")
+                .replace("+", "\\+")
+                .replace("?", "\\?")
+                .replace("(", "\\(")
+                .replace(")", "\\)")
+                .replace("[", "\\[")
+                .replace("]", "\\]")
+                .replace("{", "\\{")
+                .replace("}", "\\}")
+                .replace("^", "\\^")
+                .replace("$", "\\$")
+                .replace("|", "\\|")
+                .replace("*", ".*");  // Replace * with .* (any characters)
+        
+        return operatorId.matches(regexPattern);
+    }
+    
     /**
      * Record to hold direction and journey note information extracted from an entity.
      */
@@ -1419,26 +1616,34 @@ public class TripUpdateGenerator {
     /**
      * Clears invalid stop times in the trip update where the arrival or departure time
      * is earlier than the previous stop's time, which indicates a time progression error.
+     * Also removes stop time updates where the stop sequence is out of order (decreasing),
+     * which indicates erroneous SIRI data from other vehicles.
      * 
      * <p>This method:
      * <ul>
      *   <li>Iterates through all stop time updates in chronological order</li>
      *   <li>Tracks the maximum departure or arrival time seen so far</li>
-     *   <li>For each stop, compares its times against the previous maximum</li>
+     *   <li>Tracks the maximum stop sequence seen so far</li>
+     *   <li>For each stop, compares its times AND sequence against the previous maximums</li>
      *   <li>If either arrival or departure time is earlier than the previous maximum,
-     *       the times are cleared (marked as skipped) to maintain temporal consistency</li>
-     *   <li>Updates the maximum time tracker if the current stop's times are valid</li>
+     *       OR if the stop sequence is less than the previous maximum (out of order),
+     *       the stop time update is removed to maintain temporal and sequential consistency</li>
+     *   <li>Updates the maximum time and sequence trackers if the current stop's values are valid</li>
      * </ul>
      * 
-     * <p><strong>Use case:</strong> Handles cases where real-time data contains time errors
-     * where a later stop in a journey shows an earlier arrival/departure than the previous stop.
-     * This can occur in unreliable data sources like SIRI Lite where timestamps may be
+     * <p><strong>Use case:</strong> Handles cases where real-time SIRI data contains:
+     * <ul>
+     *   <li>Time errors where a later stop shows an earlier time than the previous stop</li>
+     *   <li>Sequence errors where SIRI mistakenly includes stop data from other vehicles with incorrect stop sequences</li>
+     * </ul>
+     * This can occur in unreliable data sources like SIRI Lite where timestamps or stop associations may be
      * incorrectly calculated or transmitted.
      * 
      * @param tripUpdate the trip update builder containing stop time updates to validate
      */
     private void clearInvalidStopTimes(GtfsRealtime.TripUpdate.Builder tripUpdate) {
         long maxTime = Long.MIN_VALUE;
+        int maxSequence = Integer.MIN_VALUE;
         List<Integer> indicesToRemove = new ArrayList<>();
         
         // Iterate through stop time updates and identify invalid ones
@@ -1446,6 +1651,16 @@ public class TripUpdateGenerator {
             GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stopTimeUpdate = tripUpdate.getStopTimeUpdateBuilder(i);
             long currentMinTime = Long.MAX_VALUE;
             boolean isInvalid = false;
+            
+            // Check if stop sequence is decreasing (out of order)
+            if (stopTimeUpdate.hasStopSequence()) {
+                int currentSequence = stopTimeUpdate.getStopSequence();
+                if (currentSequence < maxSequence) {
+                    isInvalid = true;
+                } else {
+                    maxSequence = currentSequence;
+                }
+            }
             
             // Check arrival time
             if (stopTimeUpdate.hasArrival()) {
