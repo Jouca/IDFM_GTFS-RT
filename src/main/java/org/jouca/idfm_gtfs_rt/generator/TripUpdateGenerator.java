@@ -4,11 +4,9 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -160,6 +158,12 @@ public class TripUpdateGenerator {
     public static Map<String, String> vehicleToTrip = new ConcurrentHashMap<>();
 
     /**
+     * Set of route IDs (without direction) for which at least one ADDED trip was produced.
+     * Used to suppress ALL theoretical trips (SCHEDULED and CANCELED) for those routes.
+     */
+    private Set<String> currentMatchedBlacklistedRoutes = new java.util.HashSet<>();
+
+    /**
      * Internal record to maintain the original processing order of entities.
      * Used to preserve the sorted order after parallel processing.
      */
@@ -292,24 +296,47 @@ public class TripUpdateGenerator {
      * @param context processing context for tracking trip statistics
      */
     private void processSiriLiteData(JsonNode siriLiteData, GtfsRealtime.FeedMessage.Builder feedMessage, ProcessingContext context) {
+        // Reset matched blacklisted route sets for this generation cycle
+        currentMatchedBlacklistedRoutes = new java.util.HashSet<>();
+
         List<JsonNode> entities = extractEntitiesFromSiriLite(siriLiteData);
         System.out.println(entities.size() + " entities found in SiriLite data.");
-    
-        sortEntitiesByTime(entities);
-        System.out.println("Processing " + entities.size() + " entities...");
 
-        // Collect current vehicle IDs from SIRI data
-        Set<String> currentVehicleIds = extractVehicleIds(entities);
-        
-        // Clean up vehicle-to-trip cache for vehicles not present in current SIRI data
+        // Separate blacklisted from normal entities
+        List<JsonNode> normalEntities = new ArrayList<>();
+        List<JsonNode> blacklistedEntities = new ArrayList<>();
+        for (JsonNode entity : entities) {
+            if (isOperatorBlacklisted(entity)) {
+                blacklistedEntities.add(entity);
+            } else {
+                normalEntities.add(entity);
+            }
+        }
+
+        sortEntitiesByTime(normalEntities);
+        System.out.println("Processing " + normalEntities.size() + " normal entities and "
+                + blacklistedEntities.size() + " blacklisted entities...");
+
+        // Vehicle-to-trip cache cleanup only concerns normal (non-blacklisted) vehicles
+        Set<String> currentVehicleIds = extractVehicleIds(normalEntities);
         cleanupAbsentVehicles(currentVehicleIds);
 
         Map<String, JsonNode> entitiesTrips = dumpDebugFiles ? new ConcurrentHashMap<>() : null;
-        List<IndexedEntity> builtEntities = processEntitiesInParallel(entities, entitiesTrips, context);
-        
+
+        // Process normal entities in parallel with the standard matching algorithm
+        List<IndexedEntity> builtEntities = new ArrayList<>(processEntitiesInParallel(normalEntities, entitiesTrips, context));
+
+        // Process all blacklisted entities together, grouped by line + direction so that
+        // calls spread across multiple EstimatedVehicleJourney objects are pooled and
+        // redistributed to the correct theoretical GTFS trips.
+        List<IndexedEntity> blacklistedBuilt = processAllBlacklistedEntities(
+                blacklistedEntities, entitiesTrips, context, normalEntities.size());
+
+        builtEntities.addAll(blacklistedBuilt);
+
         addEntitiesToFeed(builtEntities, feedMessage);
         cleanupStaleTripStates();
-        
+
         System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
         exportDebugData(entitiesTrips);
     }
@@ -501,23 +528,70 @@ public class TripUpdateGenerator {
      * @param context processing context containing real-time trip statistics
      */
     void appendCanceledTrips(GtfsRealtime.FeedMessage.Builder feedMessage, ProcessingContext context) {
-        if (!isValidContext(context)) {
+        if (!isValidContext(context) && currentMatchedBlacklistedRoutes.isEmpty()) {
             return;
         }
 
-        List<String> routeIds = new ArrayList<>(context.statsByRouteDirection.keySet());
-        List<TripFinder.TripMeta> theoreticalTrips = TripFinder.getActiveTripsForRoutesToday(routeIds);
-        if (theoreticalTrips == null || theoreticalTrips.isEmpty()) {
-            return;
-        }
-
-        Map<String, Map<Integer, List<TripFinder.TripMeta>>> theoreticalByRouteDirection = 
-                groupTheoreticalTripsByRouteAndDirection(theoreticalTrips);
+        // Normal routes (non-blacklisted) – standard canceled-trip detection
+        List<String> normalRouteIds = context != null
+                ? new ArrayList<>(context.statsByRouteDirection.keySet())
+                : new ArrayList<>();
+        normalRouteIds.removeAll(currentMatchedBlacklistedRoutes);
 
         Set<String> existingEntityIds = extractExistingEntityIds(feedMessage);
 
-        for (String routeId : routeIds) {
-            processCanceledTripsForRoute(routeId, context, theoreticalByRouteDirection, existingEntityIds, feedMessage);
+        if (!normalRouteIds.isEmpty()) {
+            List<TripFinder.TripMeta> theoreticalTrips = TripFinder.getActiveTripsForRoutesToday(normalRouteIds);
+            if (theoreticalTrips != null && !theoreticalTrips.isEmpty()) {
+                Map<String, Map<Integer, List<TripFinder.TripMeta>>> theoreticalByRouteDirection =
+                        groupTheoreticalTripsByRouteAndDirection(theoreticalTrips);
+                for (String routeId : normalRouteIds) {
+                    processCanceledTripsForRoute(routeId, context, theoreticalByRouteDirection,
+                            existingEntityIds, feedMessage);
+                }
+            }
+        }
+
+        // Blacklisted routes – cancel theoretical trips that were matched by the real-time
+        // pipeline (they are replaced by BL-ADDED trips) AND unmatched trips that started
+        // before the latest known real-time trip (same cutoff logic as normal routes).
+        // Only future trips beyond the coverage window are left as SCHEDULED.
+        if (!currentMatchedBlacklistedRoutes.isEmpty()) {
+            // Collect matched trip IDs and per-(route, direction) cutoff from stats.
+            Set<String> matchedTripIds = new java.util.HashSet<>();
+            Map<String, Long> cutoffByRouteDirection = new java.util.HashMap<>();
+            if (context != null) {
+                for (String routeId : currentMatchedBlacklistedRoutes) {
+                    Map<Integer, RealtimeDirectionStats> statsByDir = context.statsByRouteDirection.get(routeId);
+                    if (statsByDir != null) {
+                        for (Map.Entry<Integer, RealtimeDirectionStats> entry : statsByDir.entrySet()) {
+                            matchedTripIds.addAll(entry.getValue().tripIds);
+                            cutoffByRouteDirection.put(routeId + "|" + entry.getKey(),
+                                    entry.getValue().maxStartTime);
+                        }
+                    }
+                }
+            }
+
+            List<TripFinder.TripMeta> blacklistedTheoretical =
+                    TripFinder.getActiveTripsForRoutesToday(new ArrayList<>(currentMatchedBlacklistedRoutes));
+            if (blacklistedTheoretical != null) {
+                int canceledCount = 0;
+                for (TripFinder.TripMeta meta : blacklistedTheoretical) {
+                    boolean isMatched = matchedTripIds.contains(meta.tripId);
+                    long cutoff = cutoffByRouteDirection.getOrDefault(
+                            meta.routeId + "|" + meta.directionId, Long.MIN_VALUE);
+                    // Skip future unmatched trips – they are not covered by real-time data yet.
+                    if (!isMatched && meta.firstTimeSecOfDay > cutoff) continue;
+                    if (existingEntityIds.add(meta.tripId)) {
+                        feedMessage.addEntity(buildCanceledEntity(meta));
+                        canceledCount++;
+                    }
+                }
+                System.out.println("appendCanceledTrips: CANCELED " + canceledCount
+                        + " theoretical trips out of " + blacklistedTheoretical.size()
+                        + " active for " + currentMatchedBlacklistedRoutes.size() + " blacklisted routes.");
+            }
         }
     }
 
@@ -569,18 +643,21 @@ public class TripUpdateGenerator {
             Map<String, Map<Integer, List<TripFinder.TripMeta>>> theoreticalByRouteDirection,
             Set<String> existingEntityIds, GtfsRealtime.FeedMessage.Builder feedMessage) {
         
+        // Skip the entire route if it was handled by the blacklisted pipeline –
+        // those are processed separately in appendCanceledTrips.
+        if (currentMatchedBlacklistedRoutes.contains(routeId)) {
+            return;
+        }
+
         Map<Integer, RealtimeDirectionStats> statsByDirection = context.statsByRouteDirection.get(routeId);
         if (statsByDirection == null || statsByDirection.isEmpty()) {
             return;
         }
 
-        Map<Integer, List<TripFinder.TripMeta>> theoreticalByDirection = theoreticalByRouteDirection.get(routeId);
-        if (theoreticalByDirection == null || theoreticalByDirection.isEmpty()) {
-            return;
-        }
-
+        Map<Integer, List<TripFinder.TripMeta>> theoreticalByDirection =
+                theoreticalByRouteDirection.getOrDefault(routeId, java.util.Collections.emptyMap());
         for (Map.Entry<Integer, RealtimeDirectionStats> entry : statsByDirection.entrySet()) {
-            processCanceledTripsForDirection(entry.getKey(), entry.getValue(), 
+            processCanceledTripsForDirection(entry.getKey(), entry.getValue(),
                     theoreticalByDirection, existingEntityIds, feedMessage);
         }
     }
@@ -701,11 +778,11 @@ public class TripUpdateGenerator {
      * @return an IndexedEntity containing the built GTFS-RT entity, or null if processing fails
      */
     private IndexedEntity processEntity(JsonNode entity, int index, Map<String, JsonNode> entitiesTrips, ProcessingContext context) {
-        // Check if operator is blacklisted
+        // Blacklisted operators are handled separately by processAllBlacklistedEntities
         if (isOperatorBlacklisted(entity)) {
             return null;
         }
-        
+
         String lineId = "IDFM:" + entity.get("LineRef").get(FIELD_VALUE).asText().split(":")[3];
         String vehicleId = entity.get("DatedVehicleJourneyRef").get(FIELD_VALUE).asText();
 
@@ -1531,7 +1608,7 @@ public class TripUpdateGenerator {
      * @throws InterruptedException if the thread is interrupted while waiting for results
      * @throws ExecutionException if an entity processing task threw an exception
      */
-    private List<IndexedEntity> collectFutureResults(List<Future<IndexedEntity>> futures, int total) 
+    private List<IndexedEntity> collectFutureResults(List<Future<IndexedEntity>> futures, int total)
             throws InterruptedException, ExecutionException {
         List<IndexedEntity> builtEntities = new ArrayList<>();
         for (int i = 0; i < futures.size(); i++) {
@@ -1697,6 +1774,376 @@ public class TripUpdateGenerator {
         for (int i = indicesToRemove.size() - 1; i >= 0; i--) {
             tripUpdate.removeStopTimeUpdate(indicesToRemove.get(i));
         }
+    }
+
+    /**
+     * Processes all blacklisted operator entities together, grouped by line and direction.
+     *
+     * <p>For blacklisted operators the EstimatedCalls in an EstimatedVehicleJourney do
+     * <em>not</em> form the sequential stop sequence of a single vehicle. Rather, each call
+     * represents a distinct vehicle that happens to serve that stop around that time, and the
+     * calls for one actual vehicle are spread across <em>multiple</em> EstimatedVehicleJourney
+     * entries. The correct approach is therefore:
+     * <ol>
+     *   <li>Pool ALL EstimatedCalls from every blacklisted EstimatedVehicleJourney on the same
+     *       line + direction</li>
+     *   <li>Match each call individually to the GTFS trip that serves that stop closest in time
+     *       via {@link TripFinder#findTripForSingleStop}</li>
+     *   <li>Group matched calls by GTFS trip ID, reconstructing what each theoretical trip's
+     *       real-time data looks like</li>
+     *   <li>Emit one GTFS-RT TripUpdate per reconstructed trip</li>
+     * </ol>
+     *
+     * @param blacklistedEntities all EstimatedVehicleJourney entities from blacklisted operators
+     * @param entitiesTrips       optional debug map
+     * @param context             processing context for trip statistics
+     * @param startIndex          base index for ordering (placed after normal entities)
+     * @return list of built GTFS-RT entities
+     */
+    private List<IndexedEntity> processAllBlacklistedEntities(
+            List<JsonNode> blacklistedEntities,
+            Map<String, JsonNode> entitiesTrips,
+            ProcessingContext context,
+            int startIndex) {
+
+        if (blacklistedEntities.isEmpty()) {
+            System.out.println("Blacklisted entities: 0 found, skipping.");
+            return List.of();
+        }
+
+        System.out.println("Blacklisted entities: processing " + blacklistedEntities.size() + " entities...");
+
+        // Group entities by lineId + directionId so calls from the same line/direction
+        // are pooled together regardless of which EstimatedVehicleJourney they came from.
+        // At the same time, pre-populate currentMatchedBlacklistedRoutes: any route that
+        // has a blacklisted operator is suppressed entirely from the theoretical pipeline,
+        // regardless of whether matching later succeeds or produces any ADDED trips.
+        Map<String, List<JsonNode>> entitiesByLineDirection = new java.util.LinkedHashMap<>();
+        for (JsonNode entity : blacklistedEntities) {
+            String lineId = "IDFM:" + entity.get("LineRef").get(FIELD_VALUE).asText().split(":")[3];
+            int direction = determineDirection(entity);
+            String key = lineId + "|" + (direction != -1 ? String.valueOf(direction) : "");
+            entitiesByLineDirection.computeIfAbsent(key, k -> new ArrayList<>()).add(entity);
+            // Suppress this route unconditionally — blacklisted operator data is never
+            // compatible with the standard theoretical trip model.
+            currentMatchedBlacklistedRoutes.add(lineId);
+        }
+
+        java.util.concurrent.atomic.AtomicInteger entityIndex = new java.util.concurrent.atomic.AtomicInteger(startIndex);
+        List<IndexedEntity> results = java.util.Collections.synchronizedList(new ArrayList<>());
+
+        ExecutorService executor = Executors.newFixedThreadPool(
+                Math.max(2, Runtime.getRuntime().availableProcessors()));
+        List<Future<?>> futures = new ArrayList<>(entitiesByLineDirection.size());
+
+        for (Map.Entry<String, List<JsonNode>> groupEntry : entitiesByLineDirection.entrySet()) {
+            String[] keyParts = groupEntry.getKey().split("\\|", 2);
+            String lineId = keyParts[0];
+            Integer directionId = (keyParts.length > 1 && !keyParts[1].isEmpty())
+                    ? Integer.parseInt(keyParts[1]) : null;
+            List<JsonNode> groupEntities = groupEntry.getValue();
+
+            futures.add(executor.submit(() -> {
+                // Pool all calls from every entity in this group, match each to a GTFS trip.
+                // Also collect the first contributing entity per trip so the consumer can
+                // retrieve its SituationRef / disruption metadata via /getEntities.
+                Map<String, JsonNode> tripToEntity = entitiesTrips != null ? new java.util.HashMap<>() : null;
+                Map<String, List<JsonNode>> tripToCalls = matchAllCallsToTrips(lineId, directionId, groupEntities, tripToEntity);
+
+                System.out.println("Blacklisted line " + lineId + ", dir " + directionId
+                        + ": " + groupEntities.size() + " entities -> " + tripToCalls.size() + " theoretical trips matched");
+
+                for (Map.Entry<String, List<JsonNode>> tripEntry : tripToCalls.entrySet()) {
+                    String tripId = tripEntry.getKey();
+                    List<JsonNode> sortedCalls = tripEntry.getValue().stream()
+                            .sorted(Comparator.comparingLong(this::extractCallTimeForSorting))
+                            .collect(Collectors.toList());
+
+                    String serviceDate = determineServiceDateFromTrip(tripId);
+                    TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId, serviceDate);
+                    updateContextStats(context, tripMeta);
+
+                    GtfsRealtime.FeedEntity feedEntity = buildAddedFeedEntity(
+                            tripId, tripMeta, directionId, lineId, sortedCalls);
+                    if (feedEntity == null) continue;
+
+                    if (entitiesTrips != null) {
+                        // Use the entity that actually contributed a call to this trip
+                        // so its SituationRef reflects the correct disruption context.
+                        JsonNode representative = tripToEntity != null
+                                ? tripToEntity.getOrDefault(tripId, groupEntities.get(0))
+                                : groupEntities.get(0);
+                        entitiesTrips.put("BL-" + tripId, representative);
+                    }
+                    results.add(new IndexedEntity(entityIndex.getAndIncrement(), feedEntity));
+                }
+            }));
+        }
+
+        try {
+            for (Future<?> future : futures) {
+                future.get();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.error("Interrupted during blacklisted entity parallel processing", e);
+        } catch (ExecutionException e) {
+            logger.error("Execution error during blacklisted entity processing", e);
+        } finally {
+            shutdownExecutor(executor);
+        }
+
+        System.out.println("Blacklisted entities: " + results.size() + " ADDED trips produced.");
+        return results;
+    }
+
+    /**
+     * Pools all EstimatedCalls from every SIRI entity in a line+direction group and matches
+     * each call individually to its GTFS theoretical trip.
+     *
+     * <p>Calls are deduplicated by (stopId, iso time) so that duplicate data from different
+     * EstimatedVehicleJourney entries is counted only once. The destination resolved from each
+     * source entity is used as an additional constraint when matching, allowing correct
+     * disambiguation between route variants.
+     *
+     * @param lineId     GTFS route ID
+     * @param directionId direction filter (0 or 1), or null for either direction
+     * @param entities   all SIRI entities that belong to this line + direction group
+     * @return map of GTFS tripId → list of matched EstimatedCall JSON nodes
+     */
+    private Map<String, List<JsonNode>> matchAllCallsToTrips(
+            String lineId, Integer directionId, List<JsonNode> entities,
+            Map<String, JsonNode> tripToRepresentativeEntity) {
+
+        Map<String, List<JsonNode>> tripToCalls = new java.util.LinkedHashMap<>();
+        Set<String> processedStopTimes = new java.util.HashSet<>();
+        // Deduplicate per trip: once a stop is matched to a trip, don't add it again
+        // from a different entity (prevents duplicate stops in the same ADDED trip).
+        Set<String> tripStopCovered = new java.util.HashSet<>();
+
+        for (JsonNode entity : entities) {
+            // Use destination from each entity as a constraint, preserving route-variant accuracy
+            String destinationId = null;
+            JsonNode destRef = entity.get("DestinationRef");
+            if (destRef != null && destRef.has(FIELD_VALUE)) {
+                String destCode = destRef.get(FIELD_VALUE).asText().split(":")[3];
+                destinationId = TripFinder.resolveStopId(destCode);
+            }
+
+            List<JsonNode> calls = getSortedEstimatedCalls(entity);
+            for (JsonNode call : calls) {
+                if (!checkStopIntegrity(call)) continue;
+                if (isEstimatedCallInPast(call)) continue;
+
+                String stopCode = call.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
+                String stopId = TripFinder.resolveStopId(stopCode);
+                if (stopId == null) continue;
+
+                String isoTime = extractTimeFromCall(call);
+                if (isoTime == null) continue;
+
+                // Deduplicate: same stop + same time from different entities is one event
+                String dedupKey = stopId + "|" + isoTime;
+                if (!processedStopTimes.add(dedupKey)) continue;
+
+                try {
+                    String tripId = TripFinder.findTripForSingleStop(
+                            lineId, stopId, isoTime, directionId, destinationId);
+                    if (tripId == null) continue;
+
+                    // Deduplicate: only one call per stop per trip (first/closest match wins)
+                    if (!tripStopCovered.add(tripId + "|" + stopId)) continue;
+
+                    tripToCalls.computeIfAbsent(tripId, k -> new ArrayList<>()).add(call);
+                    // Record the first entity that contributed a call to this trip,
+                    // so the consumer can retrieve its SituationRef and other metadata.
+                    if (tripToRepresentativeEntity != null) {
+                        tripToRepresentativeEntity.putIfAbsent(tripId, entity);
+                    }
+                } catch (java.sql.SQLException e) {
+                    logger.debug("Error matching stop {} on line {}: {}", stopCode, lineId, e.getMessage());
+                }
+            }
+        }
+        return tripToCalls;
+    }
+
+    /**
+     * Builds a brand-new GTFS-RT ADDED trip entity for a reconstructed blacklisted-operator trip.
+     *
+     * <p>The trip ID in the feed is a synthetic value prefixed with {@code "BL-"} so it never
+     * collides with any trip in the static GTFS. The theoretical {@code tripId} is used only as
+     * a template to resolve stop sequences; the emitted entity is fully independent of it.
+     *
+     * @param theoreticalTripId the GTFS static trip used as a structural template
+     * @param tripMeta          metadata (route, direction, startDate) of that theoretical trip
+     * @param directionIdForMatching direction as extracted from the SIRI payload (may be null)
+     * @param lineId            GTFS route ID
+     * @param estimatedCalls    sorted list of real-time calls matched to this trip
+     * @return the built FeedEntity, or {@code null} if no stop time updates could be produced
+     */
+    private GtfsRealtime.FeedEntity buildAddedFeedEntity(
+            String theoreticalTripId,
+            TripFinder.TripMeta tripMeta,
+            Integer directionIdForMatching,
+            String lineId,
+            List<JsonNode> estimatedCalls) {
+
+        String syntheticId = "BL-" + theoreticalTripId;
+
+        GtfsRealtime.FeedEntity.Builder entityBuilder = GtfsRealtime.FeedEntity.newBuilder();
+        entityBuilder.setId(syntheticId);
+
+        GtfsRealtime.TripUpdate.Builder tripUpdate = entityBuilder.getTripUpdateBuilder();
+        int directionId = resolveDirectionId(tripMeta, directionIdForMatching, theoreticalTripId);
+        String routeForDescriptor = tripMeta != null && tripMeta.routeId != null ? tripMeta.routeId : lineId;
+
+        GtfsRealtime.TripDescriptor.Builder tripDescriptor = tripUpdate.getTripBuilder()
+                .setTripId(syntheticId)
+                .setRouteId(routeForDescriptor)
+                .setDirectionId(directionId)
+                .setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.ADDED);
+
+        if (tripMeta != null && tripMeta.startDate != null && !tripMeta.startDate.isEmpty()) {
+            tripDescriptor.setStartDate(tripMeta.startDate);
+        }
+
+        // Build a map stopId → real-time call (first/closest match wins; estimatedCalls is
+        // already sorted chronologically).  Calls that are already in the past are excluded.
+        Map<String, JsonNode> stopToRtCall = new java.util.LinkedHashMap<>();
+        for (JsonNode call : estimatedCalls) {
+            if (isEstimatedCallInPast(call)) continue;
+            String stopCode = call.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
+            String stopId = TripFinder.resolveStopId(stopCode);
+            if (stopId != null) {
+                stopToRtCall.putIfAbsent(stopId, call);
+            }
+        }
+
+        // Compute service-day start epoch for converting theoretical sec-of-day → epoch
+        long serviceDayStartEpoch = 0L;
+        if (tripMeta != null && tripMeta.startDate != null && !tripMeta.startDate.isEmpty()) {
+            try {
+                LocalDate serviceDay = LocalDate.parse(tripMeta.startDate,
+                        DateTimeFormatter.ofPattern("yyyyMMdd"));
+                serviceDayStartEpoch = serviceDay.atStartOfDay(ZONE_ID).toEpochSecond();
+            } catch (Exception ignored) {}
+        }
+        if (serviceDayStartEpoch == 0L) {
+            serviceDayStartEpoch = LocalDate.now(ZONE_ID).atStartOfDay(ZONE_ID).toEpochSecond();
+        }
+        final long svcStart = serviceDayStartEpoch;
+
+        // Walk the theoretical stop sequence as the skeleton so that no stops are skipped.
+        // For each theoretical stop: use real-time times if available, else scheduled times.
+        List<String> allTheoreticalStops = TripFinder.getAllStopTimesFromTrip(theoreticalTripId);
+
+        int seq = 1;
+        Set<String> theoreticalStopIds = new java.util.HashSet<>();
+
+        for (String row : allTheoreticalStops) {
+            String[] parts = row.split(",", 4);
+            if (parts.length < 4) continue;
+            String thStopId = parts[0];
+            String arrivalSecStr = parts[1];
+            String departureSecStr = parts[2];
+            theoreticalStopIds.add(thStopId);
+
+            JsonNode call = stopToRtCall.get(thStopId);
+
+            GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stu = tripUpdate.addStopTimeUpdateBuilder();
+            stu.setStopSequence(seq++);
+            stu.setStopId(thStopId);
+
+            if (call != null) {
+                // Real-time data available for this stop
+                boolean isDepartureCancelled = call.has(FIELD_DEPARTURE_STATUS)
+                        && call.get(FIELD_DEPARTURE_STATUS).asText().contains(STATUS_CANCELLED);
+                boolean isArrivalCancelled = call.has(FIELD_ARRIVAL_STATUS)
+                        && call.get(FIELD_ARRIVAL_STATUS).asText().contains(STATUS_CANCELLED);
+
+                if (isDepartureCancelled || isArrivalCancelled) {
+                    stu.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
+                    continue;
+                }
+
+                long arrivalTime = Long.MIN_VALUE;
+                if (call.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+                    arrivalTime = parseTime(call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
+                } else if (call.has(FIELD_AIMED_ARRIVAL_TIME)) {
+                    arrivalTime = parseTime(call.get(FIELD_AIMED_ARRIVAL_TIME).asText());
+                }
+                if (arrivalTime != Long.MIN_VALUE) {
+                    stu.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
+                }
+
+                long departureTime = Long.MIN_VALUE;
+                if (call.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+                    departureTime = parseTime(call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
+                } else if (call.has(FIELD_AIMED_DEPARTURE_TIME)) {
+                    departureTime = parseTime(call.get(FIELD_AIMED_DEPARTURE_TIME).asText());
+                }
+                if (departureTime != Long.MIN_VALUE) {
+                    stu.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
+                }
+            } else {
+                // No real-time data: use theoretical scheduled times
+                if (arrivalSecStr != null && !arrivalSecStr.equals("null") && !arrivalSecStr.isEmpty()) {
+                    try {
+                        long arrivalEpoch = svcStart + Long.parseLong(arrivalSecStr);
+                        stu.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalEpoch).build());
+                    } catch (NumberFormatException ignored) {}
+                }
+                if (departureSecStr != null && !departureSecStr.equals("null") && !departureSecStr.isEmpty()) {
+                    try {
+                        long departureEpoch = svcStart + Long.parseLong(departureSecStr);
+                        stu.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureEpoch).build());
+                    } catch (NumberFormatException ignored) {}
+                }
+            }
+        }
+
+        // Append any real-time stops that were not in the theoretical sequence (edge case)
+        for (Map.Entry<String, JsonNode> entry : stopToRtCall.entrySet()) {
+            if (theoreticalStopIds.contains(entry.getKey())) continue;
+            JsonNode call = entry.getValue();
+            String stopId = entry.getKey();
+
+            GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stu = tripUpdate.addStopTimeUpdateBuilder();
+            stu.setStopSequence(seq++);
+            stu.setStopId(stopId);
+
+            boolean isDepartureCancelled = call.has(FIELD_DEPARTURE_STATUS)
+                    && call.get(FIELD_DEPARTURE_STATUS).asText().contains(STATUS_CANCELLED);
+            boolean isArrivalCancelled = call.has(FIELD_ARRIVAL_STATUS)
+                    && call.get(FIELD_ARRIVAL_STATUS).asText().contains(STATUS_CANCELLED);
+            if (isDepartureCancelled || isArrivalCancelled) {
+                stu.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
+                continue;
+            }
+
+            if (call.has(FIELD_EXPECTED_ARRIVAL_TIME)) {
+                long t = parseTime(call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
+                if (t != Long.MIN_VALUE) stu.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(t).build());
+            } else if (call.has(FIELD_AIMED_ARRIVAL_TIME)) {
+                long t = parseTime(call.get(FIELD_AIMED_ARRIVAL_TIME).asText());
+                if (t != Long.MIN_VALUE) stu.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(t).build());
+            }
+            if (call.has(FIELD_EXPECTED_DEPARTURE_TIME)) {
+                long t = parseTime(call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
+                if (t != Long.MIN_VALUE) stu.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(t).build());
+            } else if (call.has(FIELD_AIMED_DEPARTURE_TIME)) {
+                long t = parseTime(call.get(FIELD_AIMED_DEPARTURE_TIME).asText());
+                if (t != Long.MIN_VALUE) stu.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(t).build());
+            }
+        }
+
+        // Only emit the entity if it carries at least one stop time update
+        if (tripUpdate.getStopTimeUpdateCount() == 0) {
+            return null;
+        }
+
+        return entityBuilder.build();
     }
 
     /**

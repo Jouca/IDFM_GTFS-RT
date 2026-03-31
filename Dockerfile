@@ -12,10 +12,9 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     && apt-get clean
 
-# Install Node.js 22 + npm depuis NodeSource
+# Install Node.js 22 depuis NodeSource
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g npm@latest
+    && apt-get install -y nodejs
 
 # Vérification des versions
 RUN java -version && node -v && npm -v
