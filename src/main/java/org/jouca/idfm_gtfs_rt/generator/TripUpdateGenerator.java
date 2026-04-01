@@ -4,6 +4,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -1000,12 +1001,20 @@ public class TripUpdateGenerator {
             return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         }
         
-        // If the first stop time is >= 24:00:00 (86400 seconds) and < 32:00:00 (115200 seconds),
-        // the trip belongs to the previous service day
+        // If the first stop time is >= 24:00:00 (86400 seconds), the trip crosses midnight.
+        // Whether the service day is today or yesterday depends on the current wall-clock time:
+        //   - After midnight (hour < 8): the trip's physical departure is today but belongs to
+        //     yesterday's service day → subtract 1 day.
+        //   - Before midnight (hour >= 8): the trip runs tonight into tomorrow; the service day
+        //     is still today → use current date.
         if (firstStopTimeSeconds >= 86400 && firstStopTimeSeconds < 115200) {
-            return currentDate.minusDays(1).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            ZonedDateTime nowZdt = ZonedDateTime.now(ZONE_ID);
+            if (nowZdt.getHour() < 8) {
+                return currentDate.minusDays(1).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            }
+            return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         }
-        
+
         // Otherwise, use the current date as the service date
         return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
     }
@@ -2040,6 +2049,9 @@ public class TripUpdateGenerator {
 
         int seq = 1;
         Set<String> theoreticalStopIds = new java.util.HashSet<>();
+        // Last delay observed from a real-time stop, used to propagate to stops without RT data.
+        // Long.MIN_VALUE means no delay has been observed yet.
+        long lastKnownDelaySeconds = Long.MIN_VALUE;
 
         for (String row : allTheoreticalStops) {
             String[] parts = row.split(",", 4);
@@ -2075,6 +2087,12 @@ public class TripUpdateGenerator {
                 }
                 if (arrivalTime != Long.MIN_VALUE) {
                     stu.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalTime).build());
+                    // Update last known delay from arrival time vs theoretical
+                    if (arrivalSecStr != null && !arrivalSecStr.equals("null") && !arrivalSecStr.isEmpty()) {
+                        try {
+                            lastKnownDelaySeconds = arrivalTime - (svcStart + Long.parseLong(arrivalSecStr));
+                        } catch (NumberFormatException ignored) {}
+                    }
                 }
 
                 long departureTime = Long.MIN_VALUE;
@@ -2085,18 +2103,30 @@ public class TripUpdateGenerator {
                 }
                 if (departureTime != Long.MIN_VALUE) {
                     stu.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureTime).build());
+                    // Prefer departure time to update last known delay (more precise for following stops)
+                    if (departureSecStr != null && !departureSecStr.equals("null") && !departureSecStr.isEmpty()) {
+                        try {
+                            lastKnownDelaySeconds = departureTime - (svcStart + Long.parseLong(departureSecStr));
+                        } catch (NumberFormatException ignored) {}
+                    }
                 }
             } else {
-                // No real-time data: use theoretical scheduled times
+                // No real-time data: use theoretical time + last known delay (if any)
                 if (arrivalSecStr != null && !arrivalSecStr.equals("null") && !arrivalSecStr.isEmpty()) {
                     try {
-                        long arrivalEpoch = svcStart + Long.parseLong(arrivalSecStr);
+                        long theoreticalArrival = svcStart + Long.parseLong(arrivalSecStr);
+                        long arrivalEpoch = lastKnownDelaySeconds != Long.MIN_VALUE
+                                ? theoreticalArrival + lastKnownDelaySeconds
+                                : theoreticalArrival;
                         stu.setArrival(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(arrivalEpoch).build());
                     } catch (NumberFormatException ignored) {}
                 }
                 if (departureSecStr != null && !departureSecStr.equals("null") && !departureSecStr.isEmpty()) {
                     try {
-                        long departureEpoch = svcStart + Long.parseLong(departureSecStr);
+                        long theoreticalDeparture = svcStart + Long.parseLong(departureSecStr);
+                        long departureEpoch = lastKnownDelaySeconds != Long.MIN_VALUE
+                                ? theoreticalDeparture + lastKnownDelaySeconds
+                                : theoreticalDeparture;
                         stu.setDeparture(GtfsRealtime.TripUpdate.StopTimeEvent.newBuilder().setTime(departureEpoch).build());
                     } catch (NumberFormatException ignored) {}
                 }
