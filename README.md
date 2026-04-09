@@ -355,6 +355,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🙏 Acknowledgments
 
+- [Arno Cellarier](mailto:bonjour@arnocellarier.fr) for contribution & helping with a better matching algorithm for RATP lines.
+
 - [IDFM (Île-de-France Mobilités)](https://www.iledefrance-mobilites.fr/) for providing transit data
 - [MobilityData](https://mobilitydata.org/) for GTFS-Realtime specifications
 - [OneBusAway](https://onebusaway.org/) for GTFS processing libraries

@@ -222,5 +222,4 @@ public class GTFSRTController {
             return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
-
 }

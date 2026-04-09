@@ -321,7 +321,7 @@ class TripUpdateGeneratorTest {
         
         // Create mock TripMeta
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, 0, "20231122");
         
         stats.addTrip(meta);
         
@@ -334,11 +334,11 @@ class TripUpdateGeneratorTest {
         TripUpdateGenerator.RealtimeDirectionStats stats = new TripUpdateGenerator.RealtimeDirectionStats();
         
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta1 = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, 0, "20231122");
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta2 = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip2", "route1", 1, 7200, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip2", "route1", 1, 7200, 0, "20231122");
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta3 = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip3", "route1", 1, 5400, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip3", "route1", 1, 5400, 0, "20231122");
         
         stats.addTrip(meta1);
         assertEquals(3600, stats.maxStartTime);
@@ -366,7 +366,7 @@ class TripUpdateGeneratorTest {
         
         for (int i = 1; i <= 5; i++) {
             org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-                new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip" + i, "route1", 1, i * 1000, "20231122");
+                new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip" + i, "route1", 1, i * 1000, 0, "20231122");
             stats.addTrip(meta);
         }
         
@@ -570,7 +570,7 @@ class TripUpdateGeneratorTest {
         method.setAccessible(true);
         
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, 0, "20231122");
         
         java.util.Set<String> realtimeTripIds = new java.util.HashSet<>();
         realtimeTripIds.add("trip2");
@@ -590,7 +590,7 @@ class TripUpdateGeneratorTest {
         method.setAccessible(true);
         
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, 0, "20231122");
         
         java.util.Set<String> realtimeTripIds = new java.util.HashSet<>();
         realtimeTripIds.add("trip1");
@@ -610,7 +610,7 @@ class TripUpdateGeneratorTest {
         method.setAccessible(true);
         
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 9000, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 9000, 0, "20231122");
         
         java.util.Set<String> realtimeTripIds = new java.util.HashSet<>();
         
@@ -626,7 +626,7 @@ class TripUpdateGeneratorTest {
         method.setAccessible(true);
         
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip123", "route456", 1, 3600, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip123", "route456", 1, 3600, 0, "20231122");
         
         com.google.transit.realtime.GtfsRealtime.FeedEntity entity = 
             (com.google.transit.realtime.GtfsRealtime.FeedEntity) method.invoke(generator, meta);
@@ -755,7 +755,7 @@ class TripUpdateGeneratorTest {
         method.setAccessible(true);
         
         org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta meta = 
-            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, "20231122");
+            new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 1, 3600, 0, "20231122");
         
         int result = (int) method.invoke(generator, meta, null, "trip1");
         assertEquals(1, result); // Should use tripMeta.directionId
@@ -971,23 +971,24 @@ class TripUpdateGeneratorTest {
     @Test
     void testSetArrivalTimeWithExpectedArrivalTime() throws Exception {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
-            "setArrivalTime", 
-            JsonNode.class, 
-            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+            "setArrivalTime",
+            JsonNode.class,
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class,
+            long.class);
         method.setAccessible(true);
-        
+
         String json = """
             {
                 "ExpectedArrivalTime": "2025-10-16T10:30:00Z"
             }
             """;
-        
+
         JsonNode call = objectMapper.readTree(json);
-        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder =
             com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
-        
-        method.invoke(generator, call, builder);
-        
+
+        method.invoke(generator, call, builder, Long.MIN_VALUE);
+
         assertTrue(builder.hasArrival());
         assertTrue(builder.getArrival().getTime() > 0);
     }
@@ -995,65 +996,68 @@ class TripUpdateGeneratorTest {
     @Test
     void testSetArrivalTimeWithAimedArrivalTime() throws Exception {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
-            "setArrivalTime", 
-            JsonNode.class, 
-            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+            "setArrivalTime",
+            JsonNode.class,
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class,
+            long.class);
         method.setAccessible(true);
-        
+
         String json = """
             {
                 "AimedArrivalTime": "2025-10-16T10:30:00Z"
             }
             """;
-        
+
         JsonNode call = objectMapper.readTree(json);
-        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder =
             com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
-        
-        method.invoke(generator, call, builder);
-        
+
+        method.invoke(generator, call, builder, Long.MIN_VALUE);
+
         assertTrue(builder.hasArrival());
     }
 
     @Test
     void testSetArrivalTimeWithNoArrivalTime() throws Exception {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
-            "setArrivalTime", 
-            JsonNode.class, 
-            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+            "setArrivalTime",
+            JsonNode.class,
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class,
+            long.class);
         method.setAccessible(true);
-        
+
         String json = "{}";
-        
+
         JsonNode call = objectMapper.readTree(json);
-        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder =
             com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
-        
-        method.invoke(generator, call, builder);
-        
+
+        method.invoke(generator, call, builder, Long.MIN_VALUE);
+
         assertFalse(builder.hasArrival());
     }
 
     @Test
     void testSetDepartureTimeWithExpectedDepartureTime() throws Exception {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
-            "setDepartureTime", 
-            JsonNode.class, 
-            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+            "setDepartureTime",
+            JsonNode.class,
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class,
+            long.class);
         method.setAccessible(true);
-        
+
         String json = """
             {
                 "ExpectedDepartureTime": "2025-10-16T10:35:00Z"
             }
             """;
-        
+
         JsonNode call = objectMapper.readTree(json);
-        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder =
             com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
-        
-        method.invoke(generator, call, builder);
-        
+
+        method.invoke(generator, call, builder, Long.MIN_VALUE);
+
         assertTrue(builder.hasDeparture());
         assertTrue(builder.getDeparture().getTime() > 0);
     }
@@ -1061,42 +1065,44 @@ class TripUpdateGeneratorTest {
     @Test
     void testSetDepartureTimeWithAimedDepartureTime() throws Exception {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
-            "setDepartureTime", 
-            JsonNode.class, 
-            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+            "setDepartureTime",
+            JsonNode.class,
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class,
+            long.class);
         method.setAccessible(true);
-        
+
         String json = """
             {
                 "AimedDepartureTime": "2025-10-16T10:35:00Z"
             }
             """;
-        
+
         JsonNode call = objectMapper.readTree(json);
-        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder =
             com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
-        
-        method.invoke(generator, call, builder);
-        
+
+        method.invoke(generator, call, builder, Long.MIN_VALUE);
+
         assertTrue(builder.hasDeparture());
     }
 
     @Test
     void testSetDepartureTimeWithNoDepartureTime() throws Exception {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
-            "setDepartureTime", 
-            JsonNode.class, 
-            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class);
+            "setDepartureTime",
+            JsonNode.class,
+            com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder.class,
+            long.class);
         method.setAccessible(true);
-        
+
         String json = "{}";
-        
+
         JsonNode call = objectMapper.readTree(json);
-        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder = 
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.Builder builder =
             com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder();
-        
-        method.invoke(generator, call, builder);
-        
+
+        method.invoke(generator, call, builder, Long.MIN_VALUE);
+
         assertFalse(builder.hasDeparture());
     }
 
@@ -1506,9 +1512,9 @@ class TripUpdateGeneratorTest {
         method.setAccessible(true);
         
         java.util.List<org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta> trips = new java.util.ArrayList<>();
-        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 0, 3600, "20231122"));
-        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip2", "route1", 1, 7200, "20231122"));
-        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip3", "route2", 0, 5400, "20231122"));
+        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip1", "route1", 0, 3600, 0, "20231122"));
+        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip2", "route1", 1, 7200, 0, "20231122"));
+        trips.add(new org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta("trip3", "route2", 0, 5400, 0, "20231122"));
         
         @SuppressWarnings("unchecked")
         java.util.Map<String, java.util.Map<Integer, java.util.List<org.jouca.idfm_gtfs_rt.finders.TripFinder.TripMeta>>> result = 

@@ -173,7 +173,7 @@ class TripFinderTest {
 
     @Test
     void testTripMetaConstruction() {
-        TripFinder.TripMeta meta = new TripFinder.TripMeta("trip1", "route1", 0, 3600, "20231122");
+        TripFinder.TripMeta meta = new TripFinder.TripMeta("trip1", "route1", 0, 3600, 0, "20231122");
         
         assertEquals("trip1", meta.tripId);
         assertEquals("route1", meta.routeId);

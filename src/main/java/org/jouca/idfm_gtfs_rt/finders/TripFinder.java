@@ -126,12 +126,18 @@ public class TripFinder {
          */
         public final int directionId;
         
-        /** 
+        /**
          * First stop time in seconds since start of service day (0-86399 for same-day trips,
          * may be >= 86400 for trips continuing past midnight on the same service day).
          */
         public final int firstTimeSecOfDay;
-        
+
+        /**
+         * Last stop time in seconds since start of service day.
+         * Used to check if a trip is still active at a given time.
+         */
+        public final int lastTimeSecOfDay;
+
         /**
          * The service date for this trip in YYYYMMDD format (e.g., "20231122").
          * This is used to populate the start_date field in GTFS-RT TripDescriptor.
@@ -140,18 +146,20 @@ public class TripFinder {
 
         /**
          * Constructs a new TripMeta instance.
-         * 
+         *
          * @param tripId The unique trip identifier
          * @param routeId The route identifier
          * @param directionId The direction of travel (0 or 1)
          * @param firstTimeSecOfDay First stop time in seconds since service day start
+         * @param lastTimeSecOfDay Last stop time in seconds since service day start
          * @param startDate The service date in YYYYMMDD format
          */
-        public TripMeta(String tripId, String routeId, int directionId, int firstTimeSecOfDay, String startDate) {
+        public TripMeta(String tripId, String routeId, int directionId, int firstTimeSecOfDay, int lastTimeSecOfDay, String startDate) {
             this.tripId = tripId;
             this.routeId = routeId;
             this.directionId = directionId;
             this.firstTimeSecOfDay = firstTimeSecOfDay;
+            this.lastTimeSecOfDay = lastTimeSecOfDay;
             this.startDate = startDate;
         }
     }
@@ -265,7 +273,8 @@ public class TripFinder {
         List<String> allStopIds,
         Integer directionId,
         String journeyNote,
-        boolean journeyNoteDetailled
+        boolean journeyNoteDetailled,
+        boolean partialDestination
     ) {
         StringBuilder query = new StringBuilder("""
             WITH valid_services AS (
@@ -304,21 +313,34 @@ public class TripFinder {
             query.append("AND t.direction_id = ?\n");
         }
 
-        query.append("""
-            AND (
-                st.trip_id NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM stop_times st2
-                    WHERE st2.trip_id = st.trip_id
-                    AND st2.stop_id = ?
-                    AND st2.stop_sequence = (
-                        SELECT MAX(st3.stop_sequence)
-                        FROM stop_times st3
-                        WHERE st3.trip_id = st.trip_id
+        if (partialDestination) {
+            query.append("""
+                AND (
+                    st.trip_id NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM stop_times st2
+                        WHERE st2.trip_id = st.trip_id
+                        AND st2.stop_id = ?
                     )
                 )
-            )
-        """);
+            """);
+        } else {
+            query.append("""
+                AND (
+                    st.trip_id NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM stop_times st2
+                        WHERE st2.trip_id = st.trip_id
+                        AND st2.stop_id = ?
+                        AND st2.stop_sequence = (
+                            SELECT MAX(st3.stop_sequence)
+                            FROM stop_times st3
+                            WHERE st3.trip_id = st.trip_id
+                        )
+                    )
+                )
+            """);
+        }
 
         if (journeyNote != null) {
             if (journeyNoteDetailled) {
@@ -444,6 +466,11 @@ public class TripFinder {
         int maxWindow
     ) {
         long totalDiff = 0;
+        int matchedStops = 0;
+        // Require at least half the stops (min 2) to be present in the candidate trip.
+        // This tolerates SIRI stops that are absent from the GTFS (e.g. new stops with
+        // non-standard codes like 6-digit SP:474069) without rejecting the whole trip.
+        int requiredStops = Math.max(2, (estimatedCalls.size() + 1) / 2);
 
         for (EstimatedCall ec : estimatedCalls) {
             String stopId = ec.stopId();
@@ -451,15 +478,23 @@ public class TripFinder {
 
             List<Integer> theoreticalTimes = tripStops.get(stopId);
             if (theoreticalTimes == null || theoreticalTimes.isEmpty()) {
-                return -1; // Stop not matched
+                // Stop not served by this candidate trip — skip rather than reject.
+                // The stop may be a SIRI-only code not yet in GTFS.
+                continue;
             }
 
             Integer bestTheo = findBestTheoreticalTime(theoreticalTimes, realTime, minWindow, maxWindow);
             if (bestTheo == null) {
-                return -1; // No theoretical time within window
+                // Stop IS in this trip but the time is outside the window → wrong trip.
+                return -1;
             }
-            
+
             totalDiff += Math.abs(bestTheo - realTime);
+            matchedStops++;
+        }
+
+        if (matchedStops < requiredStops) {
+            return -1; // Too few stops matched — candidate trip is not a credible match.
         }
 
         return totalDiff;
@@ -542,8 +577,42 @@ public class TripFinder {
     }
 
     /**
+     * Attempts to find a GTFS trip ID by directly matching the SIRI DatedVehicleJourneyRef
+     * against trip_id values in the database.
+     *
+     * <p>For operators like SNCF/Transilien, the SIRI {@code DatedVehicleJourneyRef} value is
+     * typically a UUID suffix that appears verbatim in the GTFS {@code trip_id}
+     * (e.g. {@code IDFM:TN:SNCF:<uuid>}). This method looks up the trip using a
+     * {@code LIKE '%<vehicleRef>'} pattern and validates that the result belongs to
+     * the expected route, avoiding false positives from other operators.
+     *
+     * @param vehicleRef the raw DatedVehicleJourneyRef value from SIRI
+     * @param routeId    the expected GTFS route ID (used to validate the match)
+     * @return the matching trip_id, or {@code null} if not found or on DB error
+     */
+    public static String findTripIdByVehicleRef(String vehicleRef, String routeId) {
+        if (vehicleRef == null || vehicleRef.isEmpty() || routeId == null) {
+            return null;
+        }
+        String query = "SELECT trip_id FROM trips WHERE trip_id LIKE ? AND route_id = ? LIMIT 1";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+            stmt.setString(1, "%" + vehicleRef);
+            stmt.setString(2, routeId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("trip_id");
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("findTripIdByVehicleRef error for vehicleRef={}: {}", vehicleRef, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
      * Finds the trip ID that best matches a sequence of real-time estimated calls.
-     * 
+     *
      * <p>This method attempts to match real-time stop data (EstimatedCalls) to scheduled trips
      * by comparing theoretical stop times with real-time estimates. It uses a progressive time
      * window approach, starting with strict matching (-1/+1 minutes) and gradually expanding
@@ -605,18 +674,56 @@ public class TripFinder {
         ZonedDateTime firstZdt = firstInstant.atZone(zone);
         boolean isEarlyMorning = firstZdt.getHour() < 8;
         
-        // Try current service day first
-        String result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId, 
-                                                   journeyNote, journeyNoteDetailled, directionId, 
-                                                   serviceDay, zone, timeColumn);
-        
+        // Try current service day first (destination must be the terminus)
+        String result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                                   journeyNote, journeyNoteDetailled, directionId,
+                                                   serviceDay, zone, timeColumn, false);
+
         // If no match and it's early morning, also try yesterday's service day
-        // (for midnight-crossing trips with times >= 24:00:00)
         if (result == null && isEarlyMorning) {
             LocalDate previousServiceDay = serviceDay.minusDays(1);
-            result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId, 
-                                              journeyNote, journeyNoteDetailled, directionId, 
-                                              previousServiceDay, zone, timeColumn);
+            result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                              journeyNote, journeyNoteDetailled, directionId,
+                                              previousServiceDay, zone, timeColumn, false);
+        }
+
+        // If still no match and a directionId was specified, retry without direction constraint.
+        // Some GTFS producers (e.g. RCASO for T12) use direction_id conventions that differ
+        // from the inbound/outbound mapping derived from SIRI DirectionRef.
+        if (result == null && directionId != null) {
+            result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                              journeyNote, journeyNoteDetailled, null,
+                                              serviceDay, zone, timeColumn, false);
+            if (result == null && isEarlyMorning) {
+                LocalDate previousServiceDay = serviceDay.minusDays(1);
+                result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                                  journeyNote, journeyNoteDetailled, null,
+                                                  previousServiceDay, zone, timeColumn, false);
+            }
+        }
+
+        // Fallback for partial trips: destination is an intermediate stop, not the terminus.
+        if (result == null && destinationId != null) {
+            result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                              journeyNote, journeyNoteDetailled, directionId,
+                                              serviceDay, zone, timeColumn, true);
+            if (result == null && isEarlyMorning) {
+                LocalDate previousServiceDay = serviceDay.minusDays(1);
+                result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                                  journeyNote, journeyNoteDetailled, directionId,
+                                                  previousServiceDay, zone, timeColumn, true);
+            }
+            if (result == null && directionId != null) {
+                result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                                  journeyNote, journeyNoteDetailled, null,
+                                                  serviceDay, zone, timeColumn, true);
+                if (result == null && isEarlyMorning) {
+                    LocalDate previousServiceDay = serviceDay.minusDays(1);
+                    result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
+                                                      journeyNote, journeyNoteDetailled, null,
+                                                      previousServiceDay, zone, timeColumn, true);
+                }
+            }
         }
         
         // Cache and return result
@@ -626,6 +733,9 @@ public class TripFinder {
 
     /**
      * Searches for matching trips for a specific service day.
+     *
+     * @param partialDestination when false, destinationId must be the last stop;
+     *                           when true, it may appear anywhere (partial/short-turn trips)
      */
     private static String searchTripsForServiceDay(
         String routeId,
@@ -637,7 +747,8 @@ public class TripFinder {
         Integer directionId,
         LocalDate serviceDay,
         ZoneId zone,
-        String timeColumn
+        String timeColumn,
+        boolean partialDestination
     ) throws SQLException {
         // Prepare query parameters
         String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
@@ -649,7 +760,7 @@ public class TripFinder {
             .toList();
 
         // Build query and fetch candidate trips from database
-        String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled);
+        String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled, partialDestination);
         TripQueryParameters queryParams = new TripQueryParameters(
             yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote
         );
@@ -710,7 +821,7 @@ public class TripFinder {
      * @param routeId The GTFS route ID
      * @return The route type, or 3 (Bus) as default if not found
      */
-    private static int getRouteType(String routeId) {
+    public static int getRouteType(String routeId) {
         if (routeId == null || routeId.isEmpty()) {
             return 3; // Default to Bus
         }
@@ -778,12 +889,22 @@ public class TripFinder {
         int secOfDay = (int) (zdt.toEpochSecond() - serviceDay.atStartOfDay(zone).toEpochSecond());
         boolean isEarlyMorning = zdt.getHour() < 8;
 
-        String result = findTripForSingleStopOnDay(routeId, stopId, secOfDay, directionId, destinationId, serviceDay);
+        String result = findTripForSingleStopOnDay(routeId, stopId, secOfDay, directionId, destinationId, false, serviceDay);
 
         if (result == null && isEarlyMorning) {
             // For midnight-crossing trips the GTFS time is >= 86400; adjust accordingly
             int secOfDayExtended = secOfDay + 86400;
-            result = findTripForSingleStopOnDay(routeId, stopId, secOfDayExtended, directionId, destinationId, serviceDay.minusDays(1));
+            result = findTripForSingleStopOnDay(routeId, stopId, secOfDayExtended, directionId, destinationId, false, serviceDay.minusDays(1));
+        }
+
+        // Fallback for partial trips: the destination is an intermediate stop, not the terminus.
+        // Relax the constraint so that destinationId can appear anywhere in the trip.
+        if (result == null && destinationId != null) {
+            result = findTripForSingleStopOnDay(routeId, stopId, secOfDay, directionId, destinationId, true, serviceDay);
+            if (result == null && isEarlyMorning) {
+                int secOfDayExtended = secOfDay + 86400;
+                result = findTripForSingleStopOnDay(routeId, stopId, secOfDayExtended, directionId, destinationId, true, serviceDay.minusDays(1));
+            }
         }
 
         findTripForSingleStopCache.put(cacheKey, result != null ? result : EMPTY_MARKER);
@@ -792,6 +913,9 @@ public class TripFinder {
 
     /**
      * Executes the single-stop trip search for a specific service day.
+     *
+     * @param partialDestination when false, destinationId must be the last stop of the trip;
+     *                           when true, it may appear anywhere (for partial/short-turn trips)
      */
     private static String findTripForSingleStopOnDay(
         String routeId,
@@ -799,6 +923,7 @@ public class TripFinder {
         int targetSecOfDay,
         Integer directionId,
         String destinationId,
+        boolean partialDestination,
         LocalDate serviceDay
     ) throws SQLException {
         String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
@@ -843,18 +968,28 @@ public class TripFinder {
             queryBuilder.append("AND t.direction_id = ?\n");
         }
         if (destinationId != null) {
-            queryBuilder.append("""
-                AND EXISTS (
-                    SELECT 1 FROM stop_times st2
-                    WHERE st2.trip_id = st.trip_id
-                    AND st2.stop_id = ?
-                    AND st2.stop_sequence = (
-                        SELECT MAX(st3.stop_sequence)
-                        FROM stop_times st3
-                        WHERE st3.trip_id = st.trip_id
+            if (partialDestination) {
+                queryBuilder.append("""
+                    AND EXISTS (
+                        SELECT 1 FROM stop_times st2
+                        WHERE st2.trip_id = st.trip_id
+                        AND st2.stop_id = ?
                     )
-                )
-            """);
+                """);
+            } else {
+                queryBuilder.append("""
+                    AND EXISTS (
+                        SELECT 1 FROM stop_times st2
+                        WHERE st2.trip_id = st.trip_id
+                        AND st2.stop_id = ?
+                        AND st2.stop_sequence = (
+                            SELECT MAX(st3.stop_sequence)
+                            FROM stop_times st3
+                            WHERE st3.trip_id = st.trip_id
+                        )
+                    )
+                """);
+            }
         }
         queryBuilder.append("ORDER BY ABS(COALESCE(st.departure_timestamp, st.arrival_timestamp) - ?) ASC\nLIMIT 1");
 
@@ -951,6 +1086,54 @@ public class TripFinder {
         }
 
         return results;
+    }
+
+    /**
+     * Builds a reverse mapping from SIRI stop codes to GTFS stop IDs for all stops in a trip.
+     *
+     * <p>Unlike {@link #resolveStopId}, which looks up an arbitrary stop code globally in the
+     * stops table (and may return a wrong sibling quai), this method enumerates all
+     * {@code object_codes_extension} codes associated with each stop that actually belongs to the
+     * given trip. The result is therefore scoped to the trip's stop set, which avoids the
+     * false-resolution problem where two stops at the same physical location share similar codes.
+     *
+     * @param tripId the GTFS trip ID whose stops are to be indexed
+     * @return map from SIRI stop code → GTFS stop_id (for stops on this trip only)
+     */
+    public static Map<String, String> buildSiriCodeToStopIdForTrip(String tripId) {
+        List<String> stopRows = getAllStopTimesFromTrip(tripId);
+        if (stopRows.isEmpty()) return java.util.Collections.emptyMap();
+
+        List<String> stopIds = new ArrayList<>();
+        Map<String, String> result = new java.util.LinkedHashMap<>();
+        for (String row : stopRows) {
+            String stopId = row.split(",", 2)[0];
+            stopIds.add(stopId);
+            // Always include the bare numeric suffix as a fallback code
+            String bare = stopId.contains(":") ? stopId.substring(stopId.lastIndexOf(':') + 1) : stopId;
+            result.put(bare, stopId);
+        }
+
+        if (stopIds.isEmpty()) return result;
+
+        // Single batch query: fetch all object codes for the trip's stop IDs at once
+        String placeholders = String.join(",", java.util.Collections.nCopies(stopIds.size(), "?"));
+        String query = "SELECT object_id, object_code FROM object_codes_extension"
+                + " WHERE object_id IN (" + placeholders + ") AND object_type = 'stop_point'";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+            for (int i = 0; i < stopIds.size(); i++) {
+                stmt.setString(i + 1, stopIds.get(i));
+            }
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    result.put(rs.getString("object_code"), rs.getString("object_id"));
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("Error building SIRI code map for trip {}: {}", tripId, e.getMessage());
+        }
+        return result;
     }
 
     /**
@@ -1352,7 +1535,27 @@ public class TripFinder {
         if (routeIds == null || routeIds.isEmpty()) return java.util.Collections.emptyList();
 
         ZoneId zone = PARIS_ZONE;
-        LocalDate date = LocalDate.now(zone);
+        LocalDate today = LocalDate.now(zone);
+        List<TripMeta> result = new ArrayList<>(getActiveTripsForRoutesOnDate(routeIds, today));
+
+        // Before 8 am, overnight trips whose service date is yesterday (firstTimeSecOfDay >= 86400)
+        // are still running — include them too.
+        if (java.time.LocalTime.now(zone).getHour() < 8) {
+            result.addAll(getActiveTripsForRoutesOnDate(routeIds, today.minusDays(1)));
+        }
+        return result;
+    }
+
+    /**
+     * Returns all active trips for the given routes on a specific service date.
+     *
+     * @param routeIds  GTFS route IDs to query
+     * @param date      service date to use for calendar lookup
+     * @return list of TripMeta, one entry per trip
+     */
+    public static List<TripMeta> getActiveTripsForRoutesOnDate(List<String> routeIds, LocalDate date) {
+        if (routeIds == null || routeIds.isEmpty()) return java.util.Collections.emptyList();
+
         String yyyymmdd = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         int dayOfWeek = date.getDayOfWeek().getValue();
         String weekday = String.valueOf(dayOfWeek == 7 ? 0 : dayOfWeek);
@@ -1380,7 +1583,7 @@ public class TripFinder {
             "    SELECT service_id FROM calendar_dates\n" +
             "    WHERE date = ? AND exception_type = 2\n" +
             ")\n" +
-            "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time\n" +
+            "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time, MAX(COALESCE(st.arrival_timestamp, st.departure_timestamp)) AS last_time\n" +
             "FROM trips t\n" +
             "JOIN stop_times st ON st.trip_id = t.trip_id\n" +
             "WHERE t.route_id IN (" + inClause + ")\n" +
@@ -1406,12 +1609,12 @@ public class TripFinder {
                     String routeId = rs.getString("route_id");
                     int dir = rs.getInt(COL_DIRECTION_ID);
                     int first = rs.getInt("first_time");
-                    // first may already be seconds since service day; keep raw value but cast into 0..int range
-                    result.add(new TripMeta(tripId, routeId, dir, first, yyyymmdd));
+                    int last = rs.getInt("last_time");
+                    result.add(new TripMeta(tripId, routeId, dir, first, last, yyyymmdd));
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error getting active trips for route IDs", e);
+            logger.debug("Error getting active trips for route IDs on date {}", date, e);
         }
         return result;
     }
@@ -1454,7 +1657,7 @@ public class TripFinder {
             startDate = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         }
 
-        String sql = "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time " +
+        String sql = "SELECT t.trip_id, t.route_id, t.direction_id, MIN(COALESCE(st.departure_timestamp, st.arrival_timestamp)) AS first_time, MAX(COALESCE(st.arrival_timestamp, st.departure_timestamp)) AS last_time " +
                 "FROM trips t JOIN stop_times st ON st.trip_id = t.trip_id WHERE t.trip_id = ? GROUP BY t.trip_id, t.route_id, t.direction_id";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(sql)) {
@@ -1464,7 +1667,8 @@ public class TripFinder {
                     String routeId = rs.getString("route_id");
                     int dir = rs.getInt(COL_DIRECTION_ID);
                     int first = rs.getInt("first_time");
-                    TripMeta meta = new TripMeta(tripId, routeId, dir, first, startDate);
+                    int last = rs.getInt("last_time");
+                    TripMeta meta = new TripMeta(tripId, routeId, dir, first, last, startDate);
                     tripMetaCache.put(cacheKey, meta);
                     return meta;
                 }
@@ -1516,6 +1720,38 @@ public class TripFinder {
             }
         } catch (SQLException e) {
             logger.debug("Error getting first stop time for trip: {}", tripId, e);
+        }
+        return null;
+    }
+
+    /**
+     * Returns the last stop time (seconds since midnight) for the given trip.
+     * For trips that cross midnight, times can be >= 86400 (24:00:00 or later).
+     *
+     * @param tripId The trip identifier
+     * @return The last stop time in seconds since midnight, or null if not found
+     */
+    public static Integer getLastStopTime(String tripId) {
+        if (tripId == null || tripId.isEmpty()) {
+            return null;
+        }
+
+        String sql = "SELECT MAX(COALESCE(arrival_timestamp, departure_timestamp)) AS last_time " +
+                "FROM stop_times WHERE trip_id = ?";
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, tripId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    int lastTime = rs.getInt("last_time");
+                    if (!rs.wasNull()) {
+                        return lastTime;
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("Error getting last stop time for trip: {}", tripId, e);
         }
         return null;
     }
