@@ -1,33 +1,39 @@
-FROM eclipse-temurin:25.0.2_10-jdk-jammy
+# ---- Build stage ----
+FROM eclipse-temurin:25.0.2_10-jdk-jammy AS builder
 
-# Set the working directory
 WORKDIR /app
 
-# Install system dependencies (maven, curl, bash, sqlite3, gnupg)
+RUN apt-get update && apt-get install -y maven && apt-get clean
+
+COPY pom.xml .
+COPY src ./src
+
+RUN mvn clean package -DskipTests
+
+# ---- Runtime stage ----
+FROM eclipse-temurin:25.0.2_10-jre-jammy
+
+LABEL project=gtfs-rt
+
+WORKDIR /app
+
+# Install only runtime dependencies (no JDK, no Maven)
 RUN apt-get update && apt-get install -y \
-    maven \
     curl \
     bash \
     sqlite3 \
     gnupg \
     && apt-get clean
 
-# Install Node.js 22 depuis NodeSource
+# Install Node.js 22 from NodeSource
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs
-
-# Vérification des versions
-RUN java -version && node -v && npm -v
+    && apt-get install -y nodejs \
+    && apt-get clean
 
 # Install gtfs-import globally using npm
 RUN npm install -g gtfs
 
-# Copy the Maven build file and the source code
-COPY pom.xml .
-COPY src ./src
+# Copy only the built jar from the builder stage
+COPY --from=builder /app/target/idfm_gtfs_rt-1.0.6.jar target/idfm_gtfs_rt-1.0.6.jar
 
-# Build the application
-RUN mvn clean package -DskipTests
-
-# Run the application
 CMD ["java", "-jar", "target/idfm_gtfs_rt-1.0.6.jar"]
