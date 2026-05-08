@@ -67,7 +67,7 @@
 		<dependency>
 			<groupId>org.onebusaway</groupId>
 			<artifactId>onebusaway-gtfs</artifactId>
-			<version>11.2.2</version>
+			<version>11.2.3</version>
 		</dependency>
 
 		<dependency>
