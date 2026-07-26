@@ -11,8 +11,12 @@ services:
       - "8507:8507"
     volumes:
       - .env:/app/.env
+      - gtfs_data:/app/gtfs-data
     networks:
       - gtfs_net
+
+volumes:
+  gtfs_data:
 
 networks:
   gtfs_net:

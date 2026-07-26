@@ -56,7 +56,7 @@ public class TripFinder {
     private static final Logger logger = LoggerFactory.getLogger(TripFinder.class);
     
     /** JDBC connection URL for the SQLite GTFS database */
-    private static final String DB_URL = "jdbc:sqlite:./gtfs.db";
+    private static final String DB_URL = "jdbc:sqlite:./gtfs-data/gtfs.db";
     
     /** Column name constant for stop_id to avoid string duplication */
     private static final String COL_STOP_ID = "stop_id";
@@ -64,44 +64,48 @@ public class TripFinder {
     /** Column name constant for direction_id to avoid string duplication */
     private static final String COL_DIRECTION_ID = "direction_id";
     
-    /** Connection pool for database access with optimized settings for concurrent operations */
-    private static final BasicDataSource dataSource = new BasicDataSource();
-    
+    /** Connection pool for database access — volatile so it can be hot-swapped without restart */
+    private static volatile BasicDataSource dataSource = createDataSource();
+
     /**
      * The timezone used for all date and time operations in the GTFS system.
      * Paris timezone is used as this is for the Île-de-France Mobilités (IDFM) transit system.
      */
     private static final ZoneId PARIS_ZONE = ZoneId.of("Europe/Paris");
-    
 
-
-    /**
-     * Static initializer block that configures the database connection pool.
-     * Sets up connection pooling parameters and SQLite pragmas for optimal performance:
-     * <ul>
-     *   <li>WAL (Write-Ahead Logging) mode for better concurrency</li>
-     *   <li>NORMAL synchronous mode for better performance with minimal safety trade-off</li>
-     *   <li>Memory-based temporary storage</li>
-     *   <li>Large cache size for frequently accessed data</li>
-     *   <li>Memory-mapped I/O for faster reads</li>
-     * </ul>
-     */
-    static {
-        dataSource.setUrl(DB_URL);
-        dataSource.setMinIdle(12); // Increase min idle connections
-        dataSource.setMaxIdle(36); // Increase max idle connections
-        dataSource.setMaxTotal(72); // Allow more total connections
-        dataSource.setMaxOpenPreparedStatements(256); // Allow more prepared statements
-        dataSource.setInitialSize(12); // Pre-initialize connections
-        dataSource.setPoolPreparedStatements(true); // Enable prepared statement pooling
-        dataSource.setDefaultQueryTimeout(Duration.ofSeconds(45));
-        dataSource.setConnectionInitSqls(Arrays.asList(
+    private static BasicDataSource createDataSource() {
+        BasicDataSource ds = new BasicDataSource();
+        ds.setUrl(DB_URL);
+        ds.setUsername("");
+        ds.setPassword("");
+        ds.setMinIdle(12);
+        ds.setMaxIdle(36);
+        ds.setMaxTotal(72);
+        ds.setMaxOpenPreparedStatements(256);
+        ds.setInitialSize(12);
+        ds.setPoolPreparedStatements(true);
+        ds.setDefaultQueryTimeout(Duration.ofSeconds(45));
+        ds.setConnectionInitSqls(Arrays.asList(
             "PRAGMA journal_mode=WAL",
             "PRAGMA synchronous=NORMAL",
             "PRAGMA temp_store=MEMORY",
             "PRAGMA cache_size=-131072",
             "PRAGMA mmap_size=268435456"
         ));
+        return ds;
+    }
+
+    /**
+     * Hot-swaps the connection pool to pick up a freshly renamed gtfs.db.
+     * Must be called while the caller holds the trip-update lock so no queries
+     * are in flight against the old pool when it is closed.
+     */
+    public static synchronized void reloadDataSource() throws Exception {
+        BasicDataSource old = dataSource;
+        dataSource = createDataSource();
+        if (old != null) {
+            old.close();
+        }
     }
 
     /**

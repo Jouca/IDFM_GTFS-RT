@@ -2,19 +2,16 @@ package org.jouca.idfm_gtfs_rt.services;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.nio.file.StandardCopyOption;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.jouca.idfm_gtfs_rt.fetchers.GTFSFetcher;
+import org.jouca.idfm_gtfs_rt.finders.TripFinder;
 import org.jouca.idfm_gtfs_rt.generator.AlertGenerator;
 import org.jouca.idfm_gtfs_rt.generator.TripUpdateGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.SpringApplication;
-import org.springframework.context.ApplicationContext;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -59,12 +56,6 @@ public class ScheduledTasks {
     private AlertGenerator alertGenerator;
 
     /**
-     * Spring application context for graceful shutdown.
-     */
-    @Autowired
-    private ApplicationContext applicationContext;
-
-    /**
      * Environment configuration loader for accessing environment variables and configuration settings.
      * Configured to not fail if the .env file is missing (for test environments).
      */
@@ -84,9 +75,19 @@ public class ScheduledTasks {
     private final ReentrantLock lockTripUpdate = new ReentrantLock();
 
     /**
-     * File path to the local SQLite database containing GTFS static data.
+     * Lock to prevent concurrent GTFS refresh runs (e.g. if a previous refresh is still in progress).
      */
-    private static final String GTFS_FILE_PATH = "./gtfs.db";
+    private final ReentrantLock lockGtfsRefresh = new ReentrantLock();
+
+    /**
+     * File path to the active SQLite database containing GTFS static data.
+     */
+    private static final String GTFS_FILE_PATH = "./gtfs-data/gtfs.db";
+
+    /**
+     * Temporary file path used while building a new GTFS database before hot-swapping it in.
+     */
+    private static final String GTFS_TEMP_FILE_PATH = "./gtfs-data/gtfs.db.new";
     
     /**
      * Environment variable key for the GTFS URL configuration.
@@ -121,26 +122,16 @@ public class ScheduledTasks {
         try {
             Path dbPath = Path.of(GTFS_FILE_PATH);
 
-            // Check if the database file exists
             if (!Files.exists(dbPath)) {
+                // No DB at all: download synchronously so the app can serve requests.
                 logger.info("SQLite database not found at {}. Fetching GTFS data from {}...", GTFS_FILE_PATH, GTFS_URL);
                 GTFSFetcher.fetchGTFS(GTFS_URL, GTFS_FILE_PATH);
                 logger.info("GTFS data fetch completed successfully.");
-                return;
-            }
-
-            // Check if the database was updated within the last 24 hours
-            BasicFileAttributes attrs = Files.readAttributes(dbPath, BasicFileAttributes.class);
-            Instant lastModifiedTime = attrs.lastModifiedTime().toInstant();
-            Instant now = Instant.now();
-            long hoursSinceUpdate = ChronoUnit.HOURS.between(lastModifiedTime, now);
-
-            if (hoursSinceUpdate > 24) {
-                logger.info("SQLite database is outdated ({} hours old). Fetching fresh GTFS data from {}...", hoursSinceUpdate, GTFS_URL);
-                GTFSFetcher.fetchGTFS(GTFS_URL, GTFS_FILE_PATH);
-                logger.info("GTFS data fetch completed successfully.");
             } else {
-                logger.info("SQLite database is up-to-date ({} hours old).", hoursSinceUpdate);
+                // DB exists from a previous run: refresh in the background so the app
+                // starts immediately and serves the old data while the new one is built.
+                logger.info("SQLite database found. Triggering background GTFS refresh...");
+                new Thread(this::refreshGTFSData, "gtfs-startup-refresh").start();
             }
         } catch (Exception e) {
             logger.error("Failed to check or update GTFS data: {}", e.getMessage(), e);
@@ -204,6 +195,7 @@ public class ScheduledTasks {
                 // Check if the SQLite is here
                 if (!Files.exists(Path.of(GTFS_FILE_PATH))) {
                     System.out.println("SQLite database not found. Skipping Trips generation.");
+                    return;
                 }
 
                 System.out.println("[Trips] Generating GTFS-RT...");
@@ -220,42 +212,40 @@ public class ScheduledTasks {
     }
 
     /**
-     * Scheduled task that restarts the application at 3 AM every day.
+     * Refreshes the GTFS static database in-place without interrupting the GTFS-RT service.
      * <p>
-     * This method is executed at 3:00 AM according to the cron schedule.
-     * It performs a graceful shutdown of the Spring application, which will
-     * cause the Docker container to exit. When combined with Docker's restart
-     * policy (restart: unless-stopped or restart: always), the container will
-     * automatically restart, ensuring a fresh start of the application.
+     * Runs at 3:00 AM, 8:00 AM, 1:00 PM and 5:00 PM to match the IDFM publication schedule.
+     * The new database is built into a temporary file first; only once the build is complete
+     * is the active database replaced atomically and the connection pool reloaded.
+     * At most one minute of trip-update generation is skipped during the swap itself.
      * <p>
-     * Before shutting down, this method deletes the local GTFS database file
-     * to ensure that fresh GTFS data is fetched upon restart.
-     * <p>
-     * This daily restart helps to:
-     * <ul>
-     *   <li>Clear any memory leaks or accumulated resources</li>
-     *   <li>Ensure a fresh state of the application</li>
-     *   <li>Force a refresh of GTFS static data</li>
-     *   <li>Apply any configuration changes that require a restart</li>
-     * </ul>
-     * <p>
-     * <strong>Schedule:</strong> Daily at 3:00 AM
+     * <strong>Schedule:</strong> Daily at 03:00, 08:00, 13:00 and 17:00
      */
-    @Scheduled(cron = "0 0 3 * * ?") // Every day at 3:00 AM
-    public void restartApplication() {
-        System.out.println("[Restart] Scheduled restart at 3:00 AM - Shutting down application...");
-        
-        // Delete the GTFS database file to force a fresh fetch on restart
+    @Scheduled(cron = "0 0 3,8,13,17 * * ?")
+    public void refreshGTFSData() {
+        if (!lockGtfsRefresh.tryLock()) {
+            logger.info("[GTFS] Refresh already in progress, skipping.");
+            return;
+        }
         try {
-            Path dbPath = Path.of(GTFS_FILE_PATH);
-            if (Files.exists(dbPath)) {
-                Files.delete(dbPath);
-                logger.info("Deleted GTFS database file: {}", GTFS_FILE_PATH);
+            logger.info("[GTFS] Starting scheduled GTFS refresh (building into {})...", GTFS_TEMP_FILE_PATH);
+            GTFSFetcher.fetchGTFS(GTFS_URL, GTFS_TEMP_FILE_PATH);
+
+            // Hold the trip-update lock only for the instant of the atomic swap so that
+            // no concurrent generation can read a half-replaced database.
+            lockTripUpdate.lock();
+            try {
+                Files.move(Path.of(GTFS_TEMP_FILE_PATH), Path.of(GTFS_FILE_PATH),
+                        StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                TripFinder.reloadDataSource();
+                logger.info("[GTFS] Database hot-swapped successfully.");
+            } finally {
+                lockTripUpdate.unlock();
             }
         } catch (Exception e) {
-            logger.error("Failed to delete GTFS database file: {}", e.getMessage(), e);
+            logger.error("[GTFS] Refresh failed: {}", e.getMessage(), e);
+        } finally {
+            lockGtfsRefresh.unlock();
         }
-        
-        SpringApplication.exit(applicationContext, () -> 0);
     }
 }

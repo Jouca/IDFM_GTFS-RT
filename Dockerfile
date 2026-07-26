@@ -36,4 +36,6 @@ RUN npm install -g gtfs
 # Copy only the built jar from the builder stage
 COPY --from=builder /app/target/idfm_gtfs_rt-1.0.6.jar target/idfm_gtfs_rt-1.0.6.jar
 
-CMD ["java", "-jar", "target/idfm_gtfs_rt-1.0.6.jar"]
+RUN mkdir -p /app/gtfs-data
+
+CMD ["java", "--enable-native-access=ALL-UNNAMED", "-jar", "target/idfm_gtfs_rt-1.0.6.jar"]

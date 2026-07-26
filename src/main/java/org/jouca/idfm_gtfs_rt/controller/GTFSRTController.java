@@ -198,7 +198,7 @@ public class GTFSRTController {
      */
     @GetMapping("/gtfs")
     public ResponseEntity<byte[]> getEnrichedGtfs() throws Exception {
-        Path filePath = Paths.get("IDFM-gtfs-enriched.zip");
+        Path filePath = Paths.get("gtfs-data/IDFM-gtfs-enriched.zip");
         if (!Files.exists(filePath)) {
             return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         }

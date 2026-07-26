@@ -43,3 +43,6 @@ IDFM-gtfs.zip
 IDFM-gtfs-enriched.zip
 object_codes_extension.txt
 stop_extensions.txt
+
+### Dashboard (privé, ne pas publier sur GitHub) ###
+src/main/java/org/jouca/idfm_gtfs_rt/dashboard/

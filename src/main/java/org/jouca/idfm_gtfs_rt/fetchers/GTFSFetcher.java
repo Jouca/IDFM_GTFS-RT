@@ -85,19 +85,22 @@ public class GTFSFetcher {
      *                       <li>External process execution (gtfs-import, sqlite3)</li>
      *                     </ul>
      */
+    private static final String DATA_DIR = "gtfs-data/";
+
     public static void fetchGTFS(String urlString, String outputFilePath) throws IOException {
         logger.info("Starting GTFS data fetch process...");
         logger.info("Source URL: {}", urlString);
         logger.info("Target database: {}", outputFilePath);
-        
+
+        java.nio.file.Files.createDirectories(java.nio.file.Paths.get(DATA_DIR));
+
         // ========================================
         // Step 1: Download GTFS ZIP file from URL
         // ========================================
-        // Opens an input stream from the URL and copies the content to a local file.
-        // Uses REPLACE_EXISTING to overwrite any previous downloads.
         logger.info("Step 1/5: Downloading GTFS ZIP file...");
+        String rawZip = DATA_DIR + "IDFM-gtfs.zip";
         try (java.io.InputStream in = java.net.URI.create(urlString).toURL().openStream()) {
-            java.nio.file.Files.copy(in, java.nio.file.Paths.get("IDFM-gtfs.zip"), 
+            java.nio.file.Files.copy(in, java.nio.file.Paths.get(rawZip),
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             logger.info("GTFS ZIP file downloaded successfully.");
         } catch (IOException e) {
@@ -107,10 +110,8 @@ public class GTFSFetcher {
         // ===================================
         // Step 1.2: Repair malformed pathways.txt header in downloaded ZIP
         // ===================================
-        // The IDFM source GTFS has pathways.txt with only 7 header columns but 12
-        // data columns, which makes gtfs-import reject the file. Fix it in-place.
         try {
-            repairPathwaysTxt("IDFM-gtfs.zip");
+            repairPathwaysTxt(rawZip);
         } catch (Exception e) {
             logger.warn("Failed to repair pathways.txt header (non-critical): {}", e.getMessage());
         }
@@ -118,28 +119,33 @@ public class GTFSFetcher {
         // ===================================
         // Step 1.5: Enrich GTFS with platform codes
         // ===================================
-        // Creates IDFM-gtfs-enriched.zip: a copy of the GTFS with platform_code filled
-        // in stops.txt from the NeTEx API. Both the /gtfs endpoint and the SQLite import
-        // below use this enriched ZIP so that platform codes are available everywhere.
         logger.info("Step 1.5/5: Generating enriched GTFS with platform codes...");
         boolean enrichmentSucceeded = false;
+        // Write to a temp file first so the live IDFM-gtfs-enriched.zip is never
+        // partially overwritten while a /gtfs download is in progress.
+        String enrichedFinal = DATA_DIR + "IDFM-gtfs-enriched.zip";
+        String enrichedTemp  = DATA_DIR + "IDFM-gtfs-enriched.zip.new";
         try {
-            GTFSEnricher.enrichGTFS("IDFM-gtfs.zip", "IDFM-gtfs-enriched.zip");
+            GTFSEnricher.enrichGTFS(rawZip, enrichedTemp);
+            java.nio.file.Files.move(java.nio.file.Paths.get(enrichedTemp),
+                    java.nio.file.Paths.get(enrichedFinal),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
             logger.info("Enriched GTFS created successfully.");
             enrichmentSucceeded = true;
         } catch (Exception e) {
             logger.warn("GTFS enrichment failed (non-critical, falling back to original ZIP): {}", e.getMessage());
+            java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(enrichedTemp));
         }
-        String gtfsZipToImport = enrichmentSucceeded ? "./IDFM-gtfs-enriched.zip" : "./IDFM-gtfs.zip";
+        String gtfsZipToImport = enrichmentSucceeded ? enrichedFinal : rawZip;
 
         // ===================================
         // Step 2: Extract the ZIP archive
         // ===================================
-        // Extracts all files from the enriched (or original) ZIP to the extracted-gtfs/ directory.
-        // Maintains directory structure and overwrites existing files.
         logger.info("Step 2/5: Extracting ZIP archive...");
+        String extractDir = DATA_DIR + "extracted-gtfs";
         try {
-            extractZipFile(gtfsZipToImport, java.nio.file.Paths.get("extracted-gtfs"));
+            extractZipFile(gtfsZipToImport, java.nio.file.Paths.get(extractDir));
             logger.info("ZIP archive extracted successfully.");
         } catch (IOException e) {
             logger.error("Failed to unzip GTFS data: {}", e.getMessage());
@@ -148,8 +154,6 @@ public class GTFSFetcher {
         // ================================================================
         // Step 3: Import GTFS data into SQLite database using gtfs-import
         // ================================================================
-        // Executes the gtfs-import CLI tool to parse GTFS files and populate the database.
-        // The gtfs-import tool creates standard GTFS tables (routes, trips, stops, stop_times, etc.).
         logger.info("Step 3/5: Importing GTFS data into SQLite database...");
         importGtfsData(gtfsZipToImport, outputFilePath);
         logger.info("GTFS data imported successfully.");
@@ -157,11 +161,8 @@ public class GTFSFetcher {
         // =============================================================================
         // Step 4: Import custom GTFS extension file (object_codes_extension.txt)
         // =============================================================================
-        // IDFM provides additional object metadata in object_codes_extension.txt that is not part
-        // of standard GTFS. This replaces stop_extensions.txt and includes object_type, object_id
-        // and object_code fields used for matching real-time data with scheduled stops.
         logger.info("Step 4/5: Importing object codes extension...");
-        importObjectCodesExtension("./extracted-gtfs/object_codes_extension.txt", outputFilePath);
+        importObjectCodesExtension(extractDir + "/object_codes_extension.txt", outputFilePath);
         logger.info("Object codes extension imported successfully.");
 
         // ==================================================================================
