@@ -3,9 +3,12 @@ package org.jouca.idfm_gtfs_rt.generator;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.google.transit.realtime.GtfsRealtime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Method;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -368,5 +371,276 @@ class AlertGeneratorTest {
         ArrayNode applicationPeriods = (ArrayNode) alert.get("applicationPeriods");
         assertNotNull(applicationPeriods);
         assertEquals(2, applicationPeriods.size());
+    }
+
+    private Map<String, Object> invokeAddInformedEntities(GtfsRealtime.Alert.Builder alertBuilder,
+                                                            String disruptionId,
+                                                            Map<String, Object> lines) throws Exception {
+        return invokeAddInformedEntities(alertBuilder, disruptionId, lines, null);
+    }
+
+    private Map<String, Object> invokeAddInformedEntities(GtfsRealtime.Alert.Builder alertBuilder,
+                                                            String disruptionId,
+                                                            Map<String, Object> lines,
+                                                            ArrayNode impactedSections) throws Exception {
+        Method method = AlertGenerator.class.getDeclaredMethod(
+            "addInformedEntities", GtfsRealtime.Alert.Builder.class, String.class, Map.class, ArrayNode.class);
+        method.setAccessible(true);
+        method.invoke(generator, alertBuilder, disruptionId, lines, impactedSections);
+        return lines;
+    }
+
+    @Test
+    void testAddInformedEntitiesPairsRouteAndStopWhenStopsImpacted() throws Exception {
+        // Reproduces the reported scenario: IDFM tags the parent line as impacted
+        // alongside the specific stops closed for construction. The alert must not
+        // carry a bare route-only selector in that case, otherwise an effect like
+        // NO_SERVICE reads as applying to the whole route instead of just those stops.
+        String linesJson = """
+            [
+                {
+                    "id": "line:IDFM:C01563",
+                    "name": "Bus 9102",
+                    "shortName": "9102",
+                    "mode": "bus",
+                    "networkId": "IDFM",
+                    "impactedObjects": [
+                        {"id": "line:IDFM:C01563", "type": "line", "disruptionIds": ["disruption1"]},
+                        {"id": "stop_point:IDFM:11341", "type": "stop_point", "disruptionIds": ["disruption1"]},
+                        {"id": "stop_point:IDFM:11342", "type": "stop_point", "disruptionIds": ["disruption1"]}
+                    ]
+                }
+            ]
+            """;
+        Map<String, Object> lines = generator.parseLines(objectMapper.readTree(linesJson));
+
+        GtfsRealtime.Alert.Builder alertBuilder = GtfsRealtime.Alert.newBuilder();
+        invokeAddInformedEntities(alertBuilder, "disruption1", lines);
+
+        assertEquals(2, alertBuilder.getInformedEntityCount());
+        for (GtfsRealtime.EntitySelector selector : alertBuilder.getInformedEntityList()) {
+            assertEquals("IDFM:C01563", selector.getRouteId());
+            assertTrue(selector.hasStopId());
+        }
+    }
+
+    @Test
+    void testAddInformedEntitiesRouteOnlyWhenNoStopsImpacted() throws Exception {
+        // A genuinely line-wide disruption (no specific stops named) should still
+        // produce a route-only selector.
+        String linesJson = """
+            [
+                {
+                    "id": "line:IDFM:C01563",
+                    "name": "Bus 9102",
+                    "shortName": "9102",
+                    "mode": "bus",
+                    "networkId": "IDFM",
+                    "impactedObjects": [
+                        {"id": "line:IDFM:C01563", "type": "line", "disruptionIds": ["disruption1"]}
+                    ]
+                }
+            ]
+            """;
+        Map<String, Object> lines = generator.parseLines(objectMapper.readTree(linesJson));
+
+        GtfsRealtime.Alert.Builder alertBuilder = GtfsRealtime.Alert.newBuilder();
+        invokeAddInformedEntities(alertBuilder, "disruption1", lines);
+
+        assertEquals(1, alertBuilder.getInformedEntityCount());
+        GtfsRealtime.EntitySelector selector = alertBuilder.getInformedEntity(0);
+        assertEquals("IDFM:C01563", selector.getRouteId());
+        assertFalse(selector.hasStopId());
+    }
+
+    private String siriDataJson(String severity) {
+        return """
+            {
+                "disruptions": [
+                    {
+                        "id": "disruption1",
+                        "applicationPeriods": [{"begin": "20260801T040000", "end": "20261010T230000"}],
+                        "cause": "TRAVAUX",
+                        "severity": "%s",
+                        "title": "TRAVAUX Avenue Charles de Gaulle ORSAY",
+                        "message": "Les arrets sont supprimes"
+                    }
+                ],
+                "lines": [
+                    {
+                        "id": "line:IDFM:C01563",
+                        "name": "Bus 9102",
+                        "shortName": "9102",
+                        "mode": "bus",
+                        "networkId": "IDFM",
+                        "impactedObjects": [
+                            {"id": "line:IDFM:C01563", "type": "line", "disruptionIds": ["disruption1"]},
+                            {"id": "stop_point:IDFM:11341", "type": "stop_point", "disruptionIds": ["disruption1"]},
+                            {"id": "stop_point:IDFM:11342", "type": "stop_point", "disruptionIds": ["disruption1"]}
+                        ]
+                    }
+                ]
+            }
+            """.formatted(severity);
+    }
+
+    @Test
+    void testComputeStopClosuresForBlockingDisruption() throws Exception {
+        // Reproduces the reported scenario end-to-end: a NO_SERVICE ("BLOQUANTE") disruption
+        // naming specific closed stops on a line should surface as a StopClosure so
+        // TripUpdateGenerator can mark the affected trips SKIPPED.
+        JsonNode siriData = objectMapper.readTree(siriDataJson("BLOQUANTE"));
+
+        List<org.jouca.idfm_gtfs_rt.records.StopClosure> closures = generator.computeStopClosures(siriData);
+
+        assertEquals(1, closures.size());
+        org.jouca.idfm_gtfs_rt.records.StopClosure closure = closures.get(0);
+        assertEquals("disruption1", closure.disruptionId());
+        assertEquals("IDFM:C01563", closure.routeId());
+        assertEquals(2, closure.stopIds().size());
+        assertTrue(closure.stopIds().contains("IDFM:11341"));
+        assertTrue(closure.stopIds().contains("IDFM:11342"));
+        assertEquals(1, closure.activePeriods().size());
+        assertTrue(closure.activePeriods().get(0).endEpochSec() > closure.activePeriods().get(0).startEpochSec());
+    }
+
+    @Test
+    void testComputeStopClosuresIgnoresReducedServiceDisruption() throws Exception {
+        // A REDUCED_SERVICE ("PERTURBEE") disruption doesn't mean the stop stops being served,
+        // so it must not produce a stop closure.
+        JsonNode siriData = objectMapper.readTree(siriDataJson("PERTURBEE"));
+
+        List<org.jouca.idfm_gtfs_rt.records.StopClosure> closures = generator.computeStopClosures(siriData);
+
+        assertTrue(closures.isEmpty());
+    }
+
+    @Test
+    void testComputeStopClosuresWithNullSiriData() {
+        assertTrue(generator.computeStopClosures(null).isEmpty());
+    }
+
+    @Test
+    void testComputeStopClosuresForWholeLineClosureWithNoStopsNamed() throws Exception {
+        // Reproduces the real Metro 6 case: IDFM tags only the line itself as impacted ("Travaux
+        // de modernisation - Trafic interrompu"), naming no specific stops or sections at all.
+        // This must surface as an entireRouteClosure so every trip on the line gets canceled,
+        // instead of silently producing no closure at all.
+        String siriData = """
+            {
+                "disruptions": [
+                    {
+                        "id": "disruption1",
+                        "applicationPeriods": [{"begin": "20260906T044500", "end": "20260907T043000"}],
+                        "cause": "TRAVAUX",
+                        "severity": "BLOQUANTE",
+                        "title": "Metro 6 : Travaux de modernisation - Trafic interrompu",
+                        "message": "Trafic interrompu"
+                    }
+                ],
+                "lines": [
+                    {
+                        "id": "line:IDFM:C01376",
+                        "name": "6",
+                        "shortName": "6",
+                        "mode": "metro",
+                        "networkId": "IDFM",
+                        "impactedObjects": [
+                            {"id": "line:IDFM:C01376", "type": "line", "disruptionIds": ["disruption1"]}
+                        ]
+                    }
+                ]
+            }
+            """;
+
+        List<org.jouca.idfm_gtfs_rt.records.StopClosure> closures =
+            generator.computeStopClosures(objectMapper.readTree(siriData));
+
+        assertEquals(1, closures.size());
+        org.jouca.idfm_gtfs_rt.records.StopClosure closure = closures.get(0);
+        assertEquals("IDFM:C01376", closure.routeId());
+        assertTrue(closure.entireRouteClosure());
+        assertTrue(closure.stopIds().isEmpty());
+        assertTrue(closure.sections().isEmpty());
+        assertEquals(1, closure.activePeriods().size());
+    }
+
+    // --- impactedSections: severe disruptions where IDFM's per-stop list can't be trusted ---
+
+    private String siriDataJsonWithSections() {
+        // Reproduces the real RER B case found in production: "trafic interrompu" between two
+        // stations, "perturbe" on the rest of the line — but IDFM's impactedObjects lists nearly
+        // every station on the line as a stop_point, not just the two truly closed ones. The
+        // disruption's impactedSections field gives the real, narrow boundary.
+        return """
+            {
+                "disruptions": [
+                    {
+                        "id": "disruption1",
+                        "applicationPeriods": [{"begin": "20260906T041551", "end": "20260906T190000"}],
+                        "cause": "PERTURBATION",
+                        "severity": "BLOQUANTE",
+                        "title": "RER B : Aeroport CDG2 <-> Parc des Expo trafic interrompu",
+                        "message": "Trafic interrompu",
+                        "impactedSections": [
+                            {
+                                "lineId": "line:IDFM:C01743",
+                                "from": {"type": "stop_area", "id": "stop_area:IDFM:73699", "name": "Aeroport CDG (Terminal 2)"},
+                                "to": {"type": "stop_area", "id": "stop_area:IDFM:73568", "name": "Parc des Expositions"}
+                            }
+                        ]
+                    }
+                ],
+                "lines": [
+                    {
+                        "id": "line:IDFM:C01743",
+                        "name": "B",
+                        "shortName": "B",
+                        "mode": "RapidTransit",
+                        "networkId": "IDFM",
+                        "impactedObjects": [
+                            {"id": "line:IDFM:C01743", "type": "line", "disruptionIds": ["disruption1"]},
+                            {"id": "stop_point:IDFM:43833", "type": "stop_point", "disruptionIds": ["disruption1"]},
+                            {"id": "stop_point:IDFM:43097", "type": "stop_point", "disruptionIds": ["disruption1"]},
+                            {"id": "stop_point:IDFM:73568", "type": "stop_point", "disruptionIds": ["disruption1"]},
+                            {"id": "stop_point:IDFM:73699", "type": "stop_point", "disruptionIds": ["disruption1"]}
+                        ]
+                    }
+                ]
+            }
+            """;
+    }
+
+    @Test
+    void testAddInformedEntitiesFallsBackToRouteOnlyWhenSectionsPresent() throws Exception {
+        JsonNode siriData = objectMapper.readTree(siriDataJsonWithSections());
+        Map<String, Object> lines = generator.parseLines(siriData.get("lines"));
+        ArrayNode impactedSections = (ArrayNode) siriData.get("disruptions").get(0).get("impactedSections");
+
+        GtfsRealtime.Alert.Builder alertBuilder = GtfsRealtime.Alert.newBuilder();
+        invokeAddInformedEntities(alertBuilder, "disruption1", lines, impactedSections);
+
+        // Must NOT pair the route with the noisy, mostly-unrelated stop list — a route-only
+        // selector is the safe fallback since GTFS-Realtime can't express "between X and Y".
+        assertEquals(1, alertBuilder.getInformedEntityCount());
+        GtfsRealtime.EntitySelector selector = alertBuilder.getInformedEntity(0);
+        assertEquals("IDFM:C01743", selector.getRouteId());
+        assertFalse(selector.hasStopId());
+    }
+
+    @Test
+    void testComputeStopClosuresUsesSectionsInsteadOfNoisyStopList() throws Exception {
+        JsonNode siriData = objectMapper.readTree(siriDataJsonWithSections());
+
+        List<org.jouca.idfm_gtfs_rt.records.StopClosure> closures = generator.computeStopClosures(siriData);
+
+        assertEquals(1, closures.size());
+        org.jouca.idfm_gtfs_rt.records.StopClosure closure = closures.get(0);
+        assertEquals("IDFM:C01743", closure.routeId());
+        assertTrue(closure.stopIds().isEmpty(), "must not use the broad per-stop list when sections are present");
+        assertEquals(1, closure.sections().size());
+        org.jouca.idfm_gtfs_rt.records.StopClosure.Section section = closure.sections().get(0);
+        assertEquals("IDFM:73699", section.fromParentStationId());
+        assertEquals("IDFM:73568", section.toParentStationId());
     }
 }

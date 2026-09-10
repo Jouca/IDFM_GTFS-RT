@@ -117,6 +117,15 @@ public class GTFSFetcher {
         }
 
         // ===================================
+        // Step 1.3: Repair trips with a missing final stop_time in stop_times.txt
+        // ===================================
+        try {
+            repairStopTimesTxt(rawZip);
+        } catch (Exception e) {
+            logger.warn("Failed to repair stop_times.txt final stop times (non-critical): {}", e.getMessage());
+        }
+
+        // ===================================
         // Step 1.5: Enrich GTFS with platform codes
         // ===================================
         logger.info("Step 1.5/5: Generating enriched GTFS with platform codes...");
@@ -136,6 +145,26 @@ public class GTFSFetcher {
         } catch (Exception e) {
             logger.warn("GTFS enrichment failed (non-critical, falling back to original ZIP): {}", e.getMessage());
             java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(enrichedTemp));
+            // The /gtfs endpoint always serves enrichedFinal specifically — if we don't refresh it
+            // here, a persistently failing enrichment source (e.g. an expired/insufficient API key
+            // for the platform-code data, independent of the main disruptions API key) leaves it
+            // serving whatever was last successfully enriched, arbitrarily far in the past, even
+            // though a fresh (and now stop_times-repaired) raw feed was just downloaded.
+            try {
+                // Same temp-file-then-atomic-move pattern as the success path above, so a /gtfs
+                // download in progress never sees a partially-written file.
+                java.nio.file.Files.copy(java.nio.file.Paths.get(rawZip),
+                        java.nio.file.Paths.get(enrichedTemp),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                java.nio.file.Files.move(java.nio.file.Paths.get(enrichedTemp),
+                        java.nio.file.Paths.get(enrichedFinal),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                logger.info("Served GTFS refreshed from the raw feed (without platform-code enrichment).");
+            } catch (IOException copyError) {
+                logger.warn("Could not refresh served GTFS from the raw feed either: {}", copyError.getMessage());
+                java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(enrichedTemp));
+            }
         }
         String gtfsZipToImport = enrichmentSucceeded ? enrichedFinal : rawZip;
 
@@ -306,6 +335,248 @@ public class GTFSFetcher {
             Files.deleteIfExists(tmp);
             throw e;
         }
+    }
+
+    /**
+     * Placeholder spacing (in seconds) assumed between consecutive stops of a trip whose final
+     * stop_time has no arrival/departure at all — most often a demand-responsive ("flex") service
+     * where only the very first stop has a real time and every other stop is pickup/drop-off on
+     * request. This value has no bearing on the real service; it exists purely to give the last
+     * stop a valid, strictly-later time than the trip's last known one, since OTP's graph builder
+     * ({@code ValidateAndInterpolateStopTimesForEachTrip}) linearly interpolates every stop
+     * strictly between two valid anchors but throws ("missing final stop time") when the very
+     * last stop of a trip has none to anchor on — a single bad trip like this fails the entire
+     * graph build, not just that trip.
+     */
+    private static final int STOP_TIMES_GAP_FILL_SECONDS = 60;
+
+    /**
+     * Repairs, in-place inside the downloaded GTFS ZIP, any trip in {@code stop_times.txt} whose
+     * final (highest stop_sequence) row has both {@code arrival_time} and {@code departure_time}
+     * empty — a known characteristic of some IDFM demand-responsive/flex lines, where only the
+     * trip's very first stop carries a real time. Left as-is, such a trip crashes OTP's graph
+     * builder outright (see this method's caller and {@link #STOP_TIMES_GAP_FILL_SECONDS}),
+     * taking down routing for the entire feed rather than just that one line.
+     * <p>
+     * {@code stop_times.txt} can be tens of millions of rows for the full IDFM network, so this
+     * never loads the file as a whole: both the analysis pass ({@link
+     * #findTripsMissingFinalStopTime}) and the rewrite pass ({@link #patchStopTimesEntry}) stream
+     * it row by row, holding at most one row (plus the small map of trip_ids actually needing a
+     * fix) in memory at a time. Both passes assume {@code stop_times.txt} groups each trip's rows
+     * contiguously (standard for GTFS exports, and true of IDFM's) — a trip whose rows were
+     * scattered non-contiguously would not be reliably detected or patched.
+     *
+     * @param zipPath path to the GTFS ZIP to repair in place
+     */
+    private static void repairStopTimesTxt(String zipPath) throws IOException {
+        Path path = Paths.get(zipPath);
+
+        Map<String, String> syntheticFinalTime = findTripsMissingFinalStopTime(path);
+        if (syntheticFinalTime.isEmpty()) {
+            return;
+        }
+        logger.info("Repairing {} trip(s) with a missing final stop_time in stop_times.txt",
+                syntheticFinalTime.size());
+
+        Path tmp = Files.createTempFile("gtfs-repair-stop-times-", ".zip");
+        try {
+            try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(path));
+                 ZipOutputStream zout = new ZipOutputStream(Files.newOutputStream(tmp))) {
+                ZipEntry entry;
+                while ((entry = zin.getNextEntry()) != null) {
+                    zout.putNextEntry(new ZipEntry(entry.getName()));
+                    if ("stop_times.txt".equals(entry.getName())) {
+                        patchStopTimesEntry(zin, zout, syntheticFinalTime);
+                    } else {
+                        zin.transferTo(zout);
+                    }
+                    zout.closeEntry();
+                    zin.closeEntry();
+                }
+            }
+            Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+    }
+
+    /**
+     * Streams {@code stop_times.txt} once to find every trip whose final row has both
+     * {@code arrival_time} and {@code departure_time} empty, computing a synthetic time for it:
+     * the trip's last known real time (arrival or departure), plus {@link
+     * #STOP_TIMES_GAP_FILL_SECONDS} for every consecutive stop since then. A trip with no real
+     * time anywhere at all (never observed in practice, but not impossible) has nothing to anchor
+     * a synthetic time on and is skipped — same as if it had not been touched.
+     *
+     * @return trip_id -&gt; synthetic {@code HH:MM:SS} time for that trip's final stop, for every
+     *         trip needing the fix; empty if none do
+     */
+    private static Map<String, String> findTripsMissingFinalStopTime(Path zipPath) throws IOException {
+        Map<String, String> fixes = new LinkedHashMap<>();
+
+        try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(zipPath))) {
+            ZipEntry entry;
+            while ((entry = zin.getNextEntry()) != null) {
+                if (!"stop_times.txt".equals(entry.getName())) {
+                    zin.closeEntry();
+                    continue;
+                }
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(zin, StandardCharsets.UTF_8));
+                String headerLine = reader.readLine();
+                if (headerLine == null) {
+                    return fixes;
+                }
+                String[] header = GTFSEnricher.parseCsvLine(headerLine);
+                int idxTripId = indexOfColumn(header, "trip_id");
+                int idxArrival = indexOfColumn(header, "arrival_time");
+                int idxDeparture = indexOfColumn(header, "departure_time");
+                if (idxTripId < 0 || idxArrival < 0 || idxDeparture < 0) {
+                    return fixes;
+                }
+
+                String currentTripId = null;
+                String lastKnownTime = null;
+                int gapCount = 0;
+                boolean lastRowWasEmpty = false;
+
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isEmpty()) {
+                        continue;
+                    }
+                    String[] fields = GTFSEnricher.parseCsvLine(line);
+                    String tripId = fields.length > idxTripId ? fields[idxTripId] : "";
+
+                    if (!tripId.equals(currentTripId)) {
+                        if (lastRowWasEmpty && lastKnownTime != null) {
+                            fixes.put(currentTripId, addSecondsToGtfsTime(lastKnownTime,
+                                    gapCount * STOP_TIMES_GAP_FILL_SECONDS));
+                        }
+                        currentTripId = tripId;
+                        lastKnownTime = null;
+                        gapCount = 0;
+                    }
+
+                    String arrival = fields.length > idxArrival ? fields[idxArrival] : "";
+                    String departure = fields.length > idxDeparture ? fields[idxDeparture] : "";
+                    String rowTime = !departure.isEmpty() ? departure : (!arrival.isEmpty() ? arrival : null);
+
+                    if (rowTime != null) {
+                        lastKnownTime = rowTime;
+                        gapCount = 0;
+                        lastRowWasEmpty = false;
+                    } else {
+                        gapCount++;
+                        lastRowWasEmpty = true;
+                    }
+                }
+                if (lastRowWasEmpty && lastKnownTime != null) {
+                    fixes.put(currentTripId, addSecondsToGtfsTime(lastKnownTime,
+                            gapCount * STOP_TIMES_GAP_FILL_SECONDS));
+                }
+
+                zin.closeEntry();
+                break;
+            }
+        }
+
+        return fixes;
+    }
+
+    /**
+     * Streams the already-open {@code stop_times.txt} zip entry from {@code zin} to {@code zout},
+     * patching only the final row of each trip named in {@code syntheticFinalTime} with its
+     * computed time. A one-row lookahead (comparing each row's trip_id to the next row's) is all
+     * that's needed to tell whether a given row is the last one of its trip.
+     */
+    private static void patchStopTimesEntry(InputStream zin, OutputStream zout,
+            Map<String, String> syntheticFinalTime) throws IOException {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(zin, StandardCharsets.UTF_8));
+        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(zout, StandardCharsets.UTF_8));
+
+        String headerLine = reader.readLine();
+        if (headerLine == null) {
+            return;
+        }
+        writer.write(headerLine);
+        writer.write("\n");
+
+        String[] header = GTFSEnricher.parseCsvLine(headerLine);
+        int idxTripId = indexOfColumn(header, "trip_id");
+        int idxArrival = indexOfColumn(header, "arrival_time");
+        int idxDeparture = indexOfColumn(header, "departure_time");
+        if (idxTripId < 0 || idxArrival < 0 || idxDeparture < 0) {
+            reader.transferTo(writer);
+            writer.flush();
+            return;
+        }
+
+        String pendingLine = null;
+        String pendingTripId = null;
+
+        String line;
+        while ((line = reader.readLine()) != null) {
+            if (line.isEmpty()) {
+                continue;
+            }
+            String[] fields = GTFSEnricher.parseCsvLine(line);
+            String tripId = fields.length > idxTripId ? fields[idxTripId] : "";
+
+            if (pendingLine != null) {
+                writeStopTimesRow(writer, pendingLine, pendingTripId, !tripId.equals(pendingTripId),
+                        syntheticFinalTime, idxArrival, idxDeparture);
+            }
+            pendingLine = line;
+            pendingTripId = tripId;
+        }
+        if (pendingLine != null) {
+            writeStopTimesRow(writer, pendingLine, pendingTripId, true, syntheticFinalTime, idxArrival, idxDeparture);
+        }
+
+        writer.flush();
+    }
+
+    private static void writeStopTimesRow(BufferedWriter writer, String line, String tripId, boolean isLastOfTrip,
+            Map<String, String> syntheticFinalTime, int idxArrival, int idxDeparture) throws IOException {
+        if (isLastOfTrip && syntheticFinalTime.containsKey(tripId)) {
+            String[] fields = GTFSEnricher.parseCsvLine(line);
+            String time = syntheticFinalTime.get(tripId);
+            fields[idxArrival] = time;
+            fields[idxDeparture] = time;
+            writer.write(GTFSEnricher.joinCsvLine(fields));
+        } else {
+            writer.write(line);
+        }
+        writer.write("\n");
+    }
+
+    /**
+     * Finds a column's index in a GTFS CSV header, or -1 if absent.
+     */
+    private static int indexOfColumn(String[] header, String columnName) {
+        for (int i = 0; i < header.length; i++) {
+            if (columnName.equals(header[i])) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Adds a number of seconds to a GTFS {@code HH:MM:SS} time, which — unlike ISO 8601 — allows
+     * an hour component &gt;= 24 for a time past midnight on the same service day, so this must
+     * not wrap at 24h.
+     */
+    private static String addSecondsToGtfsTime(String gtfsTime, int secondsToAdd) {
+        String[] parts = gtfsTime.split(":");
+        int totalSeconds = Integer.parseInt(parts[0]) * 3600 + Integer.parseInt(parts[1]) * 60
+                + Integer.parseInt(parts[2]) + secondsToAdd;
+        int hours = totalSeconds / 3600;
+        int minutes = (totalSeconds % 3600) / 60;
+        int seconds = totalSeconds % 60;
+        return String.format("%02d:%02d:%02d", hours, minutes, seconds);
     }
 
     /**

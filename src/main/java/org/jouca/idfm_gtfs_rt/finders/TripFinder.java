@@ -15,6 +15,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -99,6 +100,12 @@ public class TripFinder {
      * Hot-swaps the connection pool to pick up a freshly renamed gtfs.db.
      * Must be called while the caller holds the trip-update lock so no queries
      * are in flight against the old pool when it is closed.
+     * <p>
+     * Also clears every in-memory cache keyed off query results from the old database (trip
+     * metadata, stop times, parent-station resolution, etc.) — otherwise stale pre-refresh data
+     * (e.g. a trip's old scheduled times) lingers indefinitely and can silently disagree with the
+     * freshly reloaded schedule, since none of these caches have a TTL or other invalidation tied
+     * to the underlying data actually changing.
      */
     public static synchronized void reloadDataSource() throws Exception {
         BasicDataSource old = dataSource;
@@ -106,6 +113,22 @@ public class TripFinder {
         if (old != null) {
             old.close();
         }
+        clearQueryCaches();
+    }
+
+    /**
+     * Clears every cache populated from database query results, so the next lookup reflects the
+     * current {@link #dataSource} rather than data cached from before the last
+     * {@link #reloadDataSource()}.
+     */
+    private static void clearQueryCaches() {
+        stopCodeCache.clear();
+        tripMetaCache.clear();
+        allStopTimesCache.clear();
+        stopSequencesCache.clear();
+        parentStationChildrenCache.clear();
+        findTripCache.clear();
+        findTripForSingleStopCache.clear();
     }
 
     /**
@@ -1246,6 +1269,49 @@ public class TripFinder {
     }
 
     /**
+     * Returns every GTFS {@code stop_id} that belongs to the given parent station, i.e. every
+     * platform/quay whose {@code parent_station} column matches it, plus the given id itself
+     * (covering the case where it is already a leaf stop rather than a station).
+     * <p>
+     * Used to resolve a disruption's {@code impactedSections} boundary (given as a parent
+     * station id) down to the actual stop_ids referenced by {@code stop_times}, since GTFS trips
+     * only ever reference platform-level stops.
+     *
+     * @param parentStationId the station's GTFS id (already stripped of any IDFM namespace prefix)
+     * @return the set of matching stop_ids, possibly just {@code {parentStationId}} if it has no
+     *         children or the lookup fails
+     */
+    public static Set<String> getStopIdsForParentStation(String parentStationId) {
+        if (parentStationId == null || parentStationId.isEmpty()) {
+            return java.util.Collections.emptySet();
+        }
+
+        Set<String> cached = parentStationChildrenCache.get(parentStationId);
+        if (cached != null) {
+            return cached;
+        }
+
+        Set<String> result = new java.util.HashSet<>();
+        result.add(parentStationId);
+
+        String query = "SELECT stop_id FROM stops WHERE parent_station = ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+            stmt.setString(1, parentStationId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    result.add(rs.getString(COL_STOP_ID));
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("Error resolving stop ids for parent station: {}", parentStationId, e);
+        }
+
+        parentStationChildrenCache.put(parentStationId, result);
+        return result;
+    }
+
+    /**
      * Checks if the object_codes_extension table exists in the GTFS database.
      * 
      * <p>The object_codes_extension table is a custom extension used by IDFM GTFS feeds
@@ -1393,11 +1459,14 @@ public class TripFinder {
     /** Cache for stop times by trip (tripId -> list of stop time data strings) */
     private static final ConcurrentHashMap<String, List<String>> allStopTimesCache = new ConcurrentHashMap<>();
     
-    /** 
+    /**
      * Cache for stop sequences by trip and stop.
      * Maps tripId -> (stopId -> list of sequences as strings).
      */
     private static final ConcurrentHashMap<String, Map<String, List<String>>> stopSequencesCache = new ConcurrentHashMap<>();
+
+    /** Cache for parent station -> child stop_ids resolution (see {@link #getStopIdsForParentStation}). */
+    private static final ConcurrentHashMap<String, Set<String>> parentStationChildrenCache = new ConcurrentHashMap<>();
     
     /** Maximum size of the LRU cache for trip finding results */
     private static final int FIND_TRIP_CACHE_SIZE = 5000;

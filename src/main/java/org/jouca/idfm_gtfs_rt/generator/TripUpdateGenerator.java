@@ -24,8 +24,10 @@ import java.util.stream.Collectors;
 
 import org.jouca.idfm_gtfs_rt.fetchers.SiriLiteFetcher;
 import org.jouca.idfm_gtfs_rt.finders.TripFinder;
+import org.jouca.idfm_gtfs_rt.records.StopClosure;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -62,6 +64,14 @@ import com.google.transit.realtime.GtfsRealtime;
 @Component
 public class TripUpdateGenerator {
     private static final Logger logger = LoggerFactory.getLogger(TripUpdateGenerator.class);
+
+    /**
+     * Provides the stop-level disruption closures merged into TripUpdates as SKIPPED.
+     * May be null when this class is instantiated outside of the Spring context (e.g. in unit
+     * tests exercising other methods directly), in which case disruption merging is skipped.
+     */
+    @Autowired(required = false)
+    private AlertGenerator alertGenerator;
 
     /** Time zone for Paris, used for all time conversions */
     private static final ZoneId ZONE_ID = ZoneId.of("Europe/Paris");
@@ -348,6 +358,10 @@ public class TripUpdateGenerator {
         // Parse SiriLite data and add it to the GTFS-RT feed
         processSiriLiteData(siriLiteData, feedMessage);
 
+        // Merge stop-level disruption closures (e.g. construction) as SKIPPED, for trips
+        // that wouldn't otherwise be touched by live SIRI-Lite data
+        applyDisruptionStopClosures(feedMessage);
+
         // Build the feed once (may contain REPLACEMENT for blacklisted non-extra
         // journeys)
         GtfsRealtime.FeedMessage builtFeed = feedMessage.build();
@@ -358,6 +372,545 @@ public class TripUpdateGenerator {
         // Main feed: all REPLACEMENT converted to ADDED, then enriched with platform assignments
         GtfsRealtime.FeedMessage mainFeed = convertReplacementToAdded(builtFeed);
         generatePlatformFeed(mainFeed, siriLiteData);
+    }
+
+    /**
+     * Merges stop-level disruption closures (e.g. a construction closure of specific stops on
+     * a line) into the feed being built, as {@code SKIPPED} {@code StopTimeUpdate}s.
+     * <p>
+     * Unlike the SIRI-Lite-driven SKIPPED logic elsewhere in this class (which only fires when
+     * a vehicle's live monitoring reports a call as missed/cancelled), this covers stops closed
+     * by a planned disruption regardless of whether any live vehicle data exists for the trip —
+     * without it, a disruption like a station closed for construction would show up in the
+     * Alerts feed but nowhere in TripUpdates.
+     * <p>
+     * For every trip of an affected route scheduled today (or, before 8am, yesterday's overnight
+     * trips — see {@link TripFinder#getActiveTripsForRoutesToday}), each scheduled visit to a
+     * closed stop whose theoretical time falls within one of the disruption's active windows is
+     * marked SKIPPED — including on a trip that already has a live SIRI-Lite entry for that exact
+     * stop visit, since SIRI-Lite's per-call status has no notion of a planned disruption and
+     * would otherwise keep predicting a normal arrival at a stop that is actually closed (see
+     * {@link #markStopSkipped}).
+     *
+     * @param feedMessage the feed being built; mutated in place
+     */
+    private void applyDisruptionStopClosures(GtfsRealtime.FeedMessage.Builder feedMessage) {
+        if (alertGenerator == null) {
+            System.out.println("[Trips] Disruption stop closures skipped: AlertGenerator not wired.");
+            return;
+        }
+
+        List<StopClosure> closures = alertGenerator.getActiveStopClosures();
+        if (closures.isEmpty()) {
+            System.out.println("[Trips] Disruption stop closures: none active.");
+            return;
+        }
+
+        Map<String, List<StopClosure>> closuresByRoute = new HashMap<>();
+        for (StopClosure closure : closures) {
+            closuresByRoute.computeIfAbsent(closure.routeId(), k -> new ArrayList<>()).add(closure);
+        }
+
+        Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId = indexTripUpdatesByTripId(feedMessage);
+        int entitiesBefore = feedMessage.getEntityCount();
+
+        for (Map.Entry<String, List<StopClosure>> routeEntry : closuresByRoute.entrySet()) {
+            List<TripFinder.TripMeta> trips = TripFinder.getActiveTripsForRoutesToday(List.of(routeEntry.getKey()));
+            if (trips.isEmpty()) {
+                continue;
+            }
+
+            for (TripFinder.TripMeta trip : trips) {
+                List<String> stopTimeRows = TripFinder.getAllStopTimesFromTrip(trip.tripId);
+                if (stopTimeRows.isEmpty()) {
+                    continue;
+                }
+
+                long serviceDayStartEpoch = serviceDayStartEpoch(trip.startDate);
+
+                for (StopClosure closure : routeEntry.getValue()) {
+                    if (closure.entireRouteClosure()) {
+                        markTripCanceledIfWithinWindow(feedMessage, tripUpdatesByTripId, trip, stopTimeRows,
+                                serviceDayStartEpoch, closure.activePeriods());
+                    }
+                    for (String stopId : closure.stopIds()) {
+                        markMatchingStopVisitsSkipped(feedMessage, tripUpdatesByTripId, trip, stopId,
+                                stopTimeRows, serviceDayStartEpoch, closure.activePeriods());
+                    }
+                    for (StopClosure.Section section : closure.sections()) {
+                        markSectionSkipped(feedMessage, tripUpdatesByTripId, trip, stopTimeRows,
+                                serviceDayStartEpoch, section, closure.activePeriods());
+                    }
+                }
+            }
+        }
+
+        System.out.println("[Trips] Disruption stop closures: " + closuresByRoute.size() + " route(s) affected, "
+                + (feedMessage.getEntityCount() - entitiesBefore) + " new trip entities added.");
+    }
+
+    /**
+     * Scans a trip's theoretical stop times for every visit to {@code stopId} whose scheduled
+     * time falls within one of the given active windows, and marks each such visit SKIPPED.
+     * A looping route can visit the same stop more than once; every matching visit is skipped,
+     * not just the first.
+     */
+    private void markMatchingStopVisitsSkipped(GtfsRealtime.FeedMessage.Builder feedMessage,
+            Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, TripFinder.TripMeta trip,
+            String stopId, List<String> stopTimeRows, long serviceDayStartEpoch,
+            List<StopClosure.Window> activePeriods) {
+        for (String row : stopTimeRows) {
+            String[] parts = row.split(",", 4);
+            if (parts.length < 4 || !parts[0].equals(stopId)) {
+                continue;
+            }
+
+            int stopSequence;
+            try {
+                stopSequence = Integer.parseInt(parts[3]);
+            } catch (NumberFormatException e) {
+                continue;
+            }
+
+            if (isConfirmedServedByLiveData(tripUpdatesByTripId, trip.tripId, stopId, stopSequence)) {
+                continue;
+            }
+
+            long scheduledEpoch = parseSec(parts[1], serviceDayStartEpoch);
+            if (scheduledEpoch == Long.MIN_VALUE) {
+                scheduledEpoch = parseSec(parts[2], serviceDayStartEpoch);
+            }
+            scheduledEpoch = preferLiveEpoch(tripUpdatesByTripId, trip.tripId, stopId, stopSequence, scheduledEpoch);
+            if (scheduledEpoch == Long.MIN_VALUE || !isWithinAnyWindow(scheduledEpoch, activePeriods)) {
+                continue;
+            }
+
+            markStopSkipped(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate,
+                    stopId, stopSequence);
+        }
+    }
+
+    /**
+     * Whether SIRI-Lite already has a live, non-cancelled call for this exact stop visit — i.e.
+     * IDFM's own real-time vehicle tracking positively confirms the vehicle stops here normally.
+     * <p>
+     * Reproduces a real Ligne N case: a disruption named only "Clamart non desservie", but its
+     * structured {@code impactedSections} boundary was Meudon → Vanves-Malakoff (the two stations
+     * immediately either side of Clamart, used by IDFM merely to bracket the one closed station in
+     * between — not because Meudon and Vanves-Malakoff themselves lack service). Blindly trusting
+     * the section as inclusive marked those two neighbours SKIPPED too, even though live SIRI-Lite
+     * data for every train on the line reported them {@code ON_TIME} throughout the closure. Since
+     * IDFM doesn't expose whether a section's boundary is inclusive or exclusive, live data — the
+     * operator's own real-time truth — is the tie-breaker: a stop it already confirms as normally
+     * served must not be overridden to SKIPPED by our static-schedule-derived closure logic.
+     */
+    private boolean isConfirmedServedByLiveData(Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId,
+            String tripId, String stopId, int stopSequence) {
+        GtfsRealtime.TripUpdate.Builder tripUpdate = tripUpdatesByTripId.get(tripId);
+        if (tripUpdate == null) {
+            return false;
+        }
+
+        for (int i = 0; i < tripUpdate.getStopTimeUpdateCount(); i++) {
+            GtfsRealtime.TripUpdate.StopTimeUpdate.Builder existing = tripUpdate.getStopTimeUpdateBuilder(i);
+            if (!stopId.equals(existing.getStopId()) || existing.getStopSequence() != stopSequence) {
+                continue;
+            }
+            if (existing.getScheduleRelationship() == GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED) {
+                return false;
+            }
+            return (existing.hasArrival() && existing.getArrival().hasTime())
+                    || (existing.hasDeparture() && existing.getDeparture().hasTime());
+        }
+        return false;
+    }
+
+    /**
+     * Prefers a live SIRI-Lite-reported arrival/departure time over the static schedule's for the
+     * disruption-window check, when the trip already has a non-SKIPPED live {@code StopTimeUpdate}
+     * for this exact stop visit.
+     * <p>
+     * The static GTFS schedule can lag behind IDFM's actual current timetable (e.g. a published
+     * schedule change not yet reflected in the static feed we last imported), so a stop's static
+     * departure time can disagree with what the real vehicle is actually doing by tens of minutes.
+     * Trusting the static time alone in that case can make a train that is genuinely running fine
+     * today — SIRI-Lite already reports it {@code ON_TIME} — look like it falls inside a
+     * disruption's active window when in reality it doesn't, and get wrongly marked SKIPPED.
+     * Live data, when present, is a strictly better source of truth for "when does this vehicle
+     * actually visit this stop" than the static schedule.
+     *
+     * @param staticEpoch the static-schedule-derived epoch to fall back to if there is no better
+     *                    live time (e.g. because SIRI-Lite has no data for this trip at all —
+     *                    the core case this whole disruption-closure mechanism exists for)
+     * @return the live time if one is available, otherwise {@code staticEpoch} unchanged
+     */
+    private long preferLiveEpoch(Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, String tripId,
+            String stopId, int stopSequence, long staticEpoch) {
+        GtfsRealtime.TripUpdate.Builder tripUpdate = tripUpdatesByTripId.get(tripId);
+        if (tripUpdate == null) {
+            return staticEpoch;
+        }
+
+        for (int i = 0; i < tripUpdate.getStopTimeUpdateCount(); i++) {
+            GtfsRealtime.TripUpdate.StopTimeUpdate.Builder existing = tripUpdate.getStopTimeUpdateBuilder(i);
+            if (!stopId.equals(existing.getStopId()) || existing.getStopSequence() != stopSequence) {
+                continue;
+            }
+            if (existing.getScheduleRelationship() == GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED) {
+                break;
+            }
+            if (existing.hasArrival() && existing.getArrival().hasTime()) {
+                return existing.getArrival().getTime();
+            }
+            if (existing.hasDeparture() && existing.getDeparture().hasTime()) {
+                return existing.getDeparture().getTime();
+            }
+            break;
+        }
+        return staticEpoch;
+    }
+
+    /**
+     * Marks every stop a trip visits <em>strictly between</em> (excluding) the two boundary
+     * stations of a "no service between X and Y" section as SKIPPED, for whichever visits fall
+     * within one of the closure's active windows.
+     * <p>
+     * Unlike {@link #markMatchingStopVisitsSkipped}, this does not rely on IDFM's per-stop
+     * {@code impactedObjects} list at all — for a severe disruption ("no service between X and Y,
+     * delayed on the rest of the line") that list has been observed to enumerate most or all of
+     * the line's stations, not just the closed ones, so trusting it would mark merely-delayed
+     * stops as having no service. The section boundary, resolved to actual stop_ids via
+     * {@link TripFinder#getStopIdsForParentStation}, is the reliable source of which stops this
+     * trip actually has no service at.
+     * <p>
+     * The boundary stops {@code from} and {@code to} themselves are excluded. Across many real
+     * disruptions on many different operators — a single closed stop bracketed by its two
+     * immediate, still-served neighbours ("l'arrêt X n'est pas desservi"), or an explicit "les
+     * arrêts situés entre X et Y ne sont plus desservis" (the stops located <em>between</em> X and
+     * Y — French "entre" excludes its bounds) — {@code from}/{@code to} consistently name the
+     * stops the disruption is anchored on, not stops that are themselves unserved; IDFM has no
+     * separate structured way to say "and these two are also closed." Treating them as included
+     * was tried and wrongly canceled genuinely-served neighbouring stops on every operator that
+     * uses this pattern (RATP and several others) whenever no live SIRI-Lite data existed to
+     * override it — which, in practice, is most of the time (see {@link #isConfirmedServedByLiveData}'s
+     * javadoc for real coverage figures). A rarer, genuinely whole-corridor closure that happens to
+     * also affect its own named endpoints will still have every interior stop correctly marked;
+     * only the two endpoint stations themselves are left alone absent live confirmation otherwise
+     * — a small precision loss on two stations, far outweighed by fixing the far more common case.
+     * <p>
+     * If a trip pattern doesn't pass through both boundary stations (e.g. a different branch or
+     * a short-turn service), the section simply doesn't apply to it. On a station visited more
+     * than once by one trip (a looping route), the first (lowest stop_sequence) visit to each
+     * boundary is used — section-based closures are only known to occur on linear lines in
+     * practice.
+     * <p>
+     * A closure often only affects one direction of travel (e.g. a one-way detour around
+     * roadworks) — IDFM does not expose this as a structured field, but {@code from}/{@code to}
+     * are consistently ordered to match the affected direction's own travel order. So a section
+     * only applies to a trip that visits {@code from} <em>before</em> {@code to} in its own
+     * stop_sequence; a trip running the opposite way (which would visit {@code to} first) is
+     * simply not affected by this section, even though it passes through the same two stations.
+     * When both directions are genuinely closed, IDFM gives two reciprocal {@code Section}
+     * entries (one per direction), so each real direction is still matched correctly this way.
+     */
+    private void markSectionSkipped(GtfsRealtime.FeedMessage.Builder feedMessage,
+            Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, TripFinder.TripMeta trip,
+            List<String> stopTimeRows, long serviceDayStartEpoch, StopClosure.Section section,
+            List<StopClosure.Window> activePeriods) {
+        Set<String> fromStopIds = TripFinder.getStopIdsForParentStation(section.fromParentStationId());
+        Set<String> toStopIds = TripFinder.getStopIdsForParentStation(section.toParentStationId());
+
+        Integer fromSequence = null;
+        Integer toSequence = null;
+        for (String row : stopTimeRows) {
+            String[] parts = row.split(",", 4);
+            if (parts.length < 4) {
+                continue;
+            }
+            int seq;
+            try {
+                seq = Integer.parseInt(parts[3]);
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (fromSequence == null && fromStopIds.contains(parts[0])) {
+                fromSequence = seq;
+            }
+            if (toSequence == null && toStopIds.contains(parts[0])) {
+                toSequence = seq;
+            }
+        }
+
+        if (fromSequence == null || toSequence == null || fromSequence >= toSequence) {
+            // Either this trip's pattern doesn't reach both boundaries, or it visits them in the
+            // reverse order — meaning it runs in the direction NOT affected by this section (see
+            // the direction-matching note in this method's javadoc).
+            return;
+        }
+
+        int lo = fromSequence;
+        int hi = toSequence;
+
+        for (String row : stopTimeRows) {
+            String[] parts = row.split(",", 4);
+            if (parts.length < 4) {
+                continue;
+            }
+            int seq;
+            try {
+                seq = Integer.parseInt(parts[3]);
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (seq <= lo || seq >= hi) {
+                // The section's own boundary stops are excluded — see this method's javadoc for
+                // why IDFM's from/to consistently name the two still-served stops bracketing the
+                // actually-closed one(s), not endpoints that are themselves unserved.
+                continue;
+            }
+
+            if (isConfirmedServedByLiveData(tripUpdatesByTripId, trip.tripId, parts[0], seq)) {
+                continue;
+            }
+
+            long scheduledEpoch = parseSec(parts[1], serviceDayStartEpoch);
+            if (scheduledEpoch == Long.MIN_VALUE) {
+                scheduledEpoch = parseSec(parts[2], serviceDayStartEpoch);
+            }
+            scheduledEpoch = preferLiveEpoch(tripUpdatesByTripId, trip.tripId, parts[0], seq, scheduledEpoch);
+            if (scheduledEpoch == Long.MIN_VALUE || !isWithinAnyWindow(scheduledEpoch, activePeriods)) {
+                continue;
+            }
+
+            markStopSkipped(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate,
+                    parts[0], seq);
+        }
+    }
+
+    /**
+     * Cancels a trip outright if any part of its theoretical schedule overlaps one of the given
+     * active windows, for a disruption that closes a route entirely (e.g. a full-line closure for
+     * maintenance work) with no specific stops or sections named.
+     * <p>
+     * Unlike {@link #markMatchingStopVisitsSkipped}/{@link #markSectionSkipped}, which skip
+     * individual stop visits, this marks the whole {@code TripUpdate} as
+     * {@code ScheduleRelationship.CANCELED} — appropriate here since no part of the route has
+     * service, so no vehicle runs this trip at all.
+     *
+     * @param stopTimeRows   the trip's theoretical stop_times rows, used only to find the trip's
+     *                       first/last scheduled times
+     * @param activePeriods  the disruption's active time windows
+     */
+    private void markTripCanceledIfWithinWindow(GtfsRealtime.FeedMessage.Builder feedMessage,
+            Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, TripFinder.TripMeta trip,
+            List<String> stopTimeRows, long serviceDayStartEpoch, List<StopClosure.Window> activePeriods) {
+        long tripStartEpoch = Long.MAX_VALUE;
+        long tripEndEpoch = Long.MIN_VALUE;
+
+        for (String row : stopTimeRows) {
+            String[] parts = row.split(",", 4);
+            if (parts.length < 4) {
+                continue;
+            }
+            long arrival = parseSec(parts[1], serviceDayStartEpoch);
+            long departure = parseSec(parts[2], serviceDayStartEpoch);
+            long earliest = arrival != Long.MIN_VALUE ? arrival : departure;
+            long latest = departure != Long.MIN_VALUE ? departure : arrival;
+            if (earliest != Long.MIN_VALUE) {
+                tripStartEpoch = Math.min(tripStartEpoch, earliest);
+            }
+            if (latest != Long.MIN_VALUE) {
+                tripEndEpoch = Math.max(tripEndEpoch, latest);
+            }
+        }
+
+        if (tripStartEpoch == Long.MAX_VALUE) {
+            return;
+        }
+        if (tripEndEpoch == Long.MIN_VALUE) {
+            tripEndEpoch = tripStartEpoch;
+        }
+
+        boolean overlapsClosure = false;
+        for (StopClosure.Window window : activePeriods) {
+            if (tripStartEpoch <= window.endEpochSec() && tripEndEpoch >= window.startEpochSec()) {
+                overlapsClosure = true;
+                break;
+            }
+        }
+        if (!overlapsClosure) {
+            return;
+        }
+
+        markTripCanceled(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate);
+    }
+
+    /**
+     * Marks a trip's {@code TripUpdate} as {@code ScheduleRelationship.CANCELED}, reusing one
+     * already in the feed if present (clearing any stop_time_updates it carries, which have no
+     * meaning on a canceled trip) or creating a minimal one otherwise.
+     */
+    private void markTripCanceled(GtfsRealtime.FeedMessage.Builder feedMessage,
+            Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, String tripId, String routeId,
+            String startDate) {
+        GtfsRealtime.TripUpdate.Builder tripUpdate = tripUpdatesByTripId.get(tripId);
+        if (tripUpdate == null) {
+            GtfsRealtime.FeedEntity.Builder entityBuilder = feedMessage.addEntityBuilder().setId(tripId);
+            tripUpdate = entityBuilder.getTripUpdateBuilder();
+            tripUpdatesByTripId.put(tripId, tripUpdate);
+        }
+
+        GtfsRealtime.TripDescriptor.Builder tripDescriptor = tripUpdate.getTripBuilder()
+                .setTripId(tripId)
+                .setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
+        if (routeId != null && !routeId.isEmpty()) {
+            tripDescriptor.setRouteId(routeId);
+        }
+        if (startDate != null && !startDate.isEmpty()) {
+            tripDescriptor.setStartDate(startDate);
+        }
+
+        tripUpdate.clearStopTimeUpdate();
+    }
+
+    /**
+     * Resolves the Paris-timezone service day start (midnight) as epoch seconds for a GTFS
+     * {@code start_date} (YYYYMMDD), falling back to today if the date is missing or malformed.
+     */
+    private long serviceDayStartEpoch(String yyyymmdd) {
+        try {
+            LocalDate svcDay = (yyyymmdd != null && !yyyymmdd.isEmpty())
+                    ? LocalDate.parse(yyyymmdd, DateTimeFormatter.ofPattern("yyyyMMdd"))
+                    : LocalDate.now(ZONE_ID);
+            return svcDay.atStartOfDay(ZONE_ID).toEpochSecond();
+        } catch (Exception e) {
+            return LocalDate.now(ZONE_ID).atStartOfDay(ZONE_ID).toEpochSecond();
+        }
+    }
+
+    private boolean isWithinAnyWindow(long epochSec, List<StopClosure.Window> windows) {
+        for (StopClosure.Window window : windows) {
+            if (window.contains(epochSec)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Builds a tripId -&gt; TripUpdate.Builder index for every TripUpdate entity already present
+     * in the feed being built, so disruption-derived closures can be merged into an existing
+     * entity instead of creating a duplicate one.
+     */
+    private Map<String, GtfsRealtime.TripUpdate.Builder> indexTripUpdatesByTripId(
+            GtfsRealtime.FeedMessage.Builder feedMessage) {
+        Map<String, GtfsRealtime.TripUpdate.Builder> index = new HashMap<>();
+        for (GtfsRealtime.FeedEntity.Builder entityBuilder : feedMessage.getEntityBuilderList()) {
+            if (!entityBuilder.hasTripUpdate()) {
+                continue;
+            }
+            GtfsRealtime.TripUpdate.Builder tripUpdate = entityBuilder.getTripUpdateBuilder();
+            String tripId = tripUpdate.getTrip().getTripId();
+            if (tripId != null && !tripId.isEmpty()) {
+                index.put(tripId, tripUpdate);
+            }
+        }
+        return index;
+    }
+
+    /**
+     * Marks a single stop visit as SKIPPED, on the TripUpdate for the given trip — reusing one
+     * already in the feed if present, or creating a minimal SCHEDULED one otherwise so the
+     * closure is reflected even for trips with no live SIRI-Lite data at all.
+     * <p>
+     * IDFM's live SIRI-Lite vehicle-monitoring data does not know about planned disruptions: a
+     * stop closed for months by construction still gets an ordinary predicted arrival/departure
+     * from SIRI-Lite, because the per-call status only reflects what the vehicle itself reports.
+     * So an existing StopTimeUpdate is generally converted to SKIPPED in place rather than left
+     * alone, clearing its arrival/departure predictions (the GTFS-Realtime spec doesn't expect a
+     * SKIPPED stop_time_update to carry them) — unless it is already SKIPPED, in which case there
+     * is nothing to do.
+     * <p>
+     * Matching prefers an exact (stop_sequence, stop_id) pair — the correct, loop-safe way to
+     * identify one specific visit to a stop that a trip serves more than once. If that fails,
+     * it falls back to matching by stop_id alone anywhere in the trip: a small number of live
+     * SIRI-Lite entities have a stop_sequence that has drifted from the static GTFS numbering for
+     * a given stop (a pre-existing trip-matching quirk unrelated to disruptions), and trusting
+     * stop_sequence alone in that case would mark the wrong stop as skipped.
+     */
+    private void markStopSkipped(GtfsRealtime.FeedMessage.Builder feedMessage,
+            Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, String tripId, String routeId,
+            String startDate, String stopId, int stopSequence) {
+        GtfsRealtime.TripUpdate.Builder tripUpdate = tripUpdatesByTripId.get(tripId);
+        if (tripUpdate == null) {
+            GtfsRealtime.FeedEntity.Builder entityBuilder = feedMessage.addEntityBuilder().setId(tripId);
+            tripUpdate = entityBuilder.getTripUpdateBuilder();
+            GtfsRealtime.TripDescriptor.Builder tripDescriptor = tripUpdate.getTripBuilder()
+                    .setTripId(tripId)
+                    .setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.SCHEDULED);
+            if (routeId != null && !routeId.isEmpty()) {
+                tripDescriptor.setRouteId(routeId);
+            }
+            if (startDate != null && !startDate.isEmpty()) {
+                tripDescriptor.setStartDate(startDate);
+            }
+            tripUpdatesByTripId.put(tripId, tripUpdate);
+        }
+
+        GtfsRealtime.TripUpdate.StopTimeUpdate.Builder fallbackByStopId = null;
+        boolean stopIdAlreadyCovered = false;
+        int insertIndex = tripUpdate.getStopTimeUpdateCount();
+        boolean insertIndexFound = false;
+
+        for (int i = 0; i < tripUpdate.getStopTimeUpdateCount(); i++) {
+            GtfsRealtime.TripUpdate.StopTimeUpdate.Builder existing = tripUpdate.getStopTimeUpdateBuilder(i);
+            int existingSequence = existing.getStopSequence();
+            boolean sameStop = stopId.equals(existing.getStopId());
+
+            if (sameStop && existingSequence == stopSequence) {
+                convertToSkipped(existing);
+                return;
+            }
+            if (sameStop) {
+                stopIdAlreadyCovered = true;
+                if (fallbackByStopId == null
+                        && existing.getScheduleRelationship()
+                                != GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED) {
+                    fallbackByStopId = existing;
+                }
+            }
+            if (!insertIndexFound && existingSequence > stopSequence) {
+                insertIndex = i;
+                insertIndexFound = true;
+            }
+        }
+
+        if (fallbackByStopId != null) {
+            convertToSkipped(fallbackByStopId);
+            return;
+        }
+        if (stopIdAlreadyCovered) {
+            // Every occurrence of this stop_id in the trip is already SKIPPED.
+            return;
+        }
+
+        tripUpdate.addStopTimeUpdate(insertIndex, GtfsRealtime.TripUpdate.StopTimeUpdate.newBuilder()
+                .setStopSequence(stopSequence)
+                .setStopId(stopId)
+                .setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED)
+                .build());
+    }
+
+    /**
+     * Sets a StopTimeUpdate to SKIPPED and clears its arrival/departure predictions, unless it
+     * is already SKIPPED.
+     */
+    private void convertToSkipped(GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stu) {
+        if (stu.getScheduleRelationship() != GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED) {
+            stu.setScheduleRelationship(GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED);
+            stu.clearArrival();
+            stu.clearDeparture();
+        }
     }
 
     /**
@@ -877,16 +1430,17 @@ public class TripUpdateGenerator {
                 tripId = findTripId(lineId, estimatedCallList, estimatedCalls, destinationId, directionInfo);
             }
             if (tripId == null || tripId.isEmpty()) {
-                // If SIRI marks this as an extra journey, emit it as ADDED even without a GTFS
-                // match
-                if (entity.has("ExtraJourney") && entity.get("ExtraJourney").asBoolean()) {
-                    GtfsRealtime.FeedEntity extraEntity = buildExtraJourneyFeedEntity(
-                            vehicleId, lineId, directionInfo.directionIdForMatching(), estimatedCalls);
-                    if (extraEntity == null)
-                        return null;
-                    return new IndexedEntity(index, extraEntity);
-                }
-                return null;
+                // No GTFS trip could be matched to this real, live-tracked vehicle — emit it as
+                // ADDED rather than silently dropping it. IDFM's own ExtraJourney flag on SIRI
+                // entities is not a reliable signal to gate this on: in practice it is never set
+                // to true even for vehicles that genuinely have no GTFS counterpart, so relying
+                // on it meant real vehicles vanished from the feed with no trace whenever
+                // matching failed.
+                GtfsRealtime.FeedEntity extraEntity = buildExtraJourneyFeedEntity(
+                        vehicleId, lineId, directionInfo.directionIdForMatching(), estimatedCalls);
+                if (extraEntity == null)
+                    return null;
+                return new IndexedEntity(index, extraEntity);
             }
         }
 
@@ -2896,6 +3450,7 @@ public class TripUpdateGenerator {
         }
 
         GtfsRealtime.FeedMessage built = platformFeed.build();
+
         writeFeedToFile(built, "gtfs-rt-trips-idfm.pb");
         System.out.println("[Trips] GTFS-RT feed written (" + built.getEntityCount() + " entities, with platform assignments)");
     }
