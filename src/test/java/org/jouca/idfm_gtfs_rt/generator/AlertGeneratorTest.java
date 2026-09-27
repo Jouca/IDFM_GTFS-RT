@@ -383,10 +383,15 @@ class AlertGeneratorTest {
                                                             String disruptionId,
                                                             Map<String, Object> lines,
                                                             ArrayNode impactedSections) throws Exception {
-        Method method = AlertGenerator.class.getDeclaredMethod(
-            "addInformedEntities", GtfsRealtime.Alert.Builder.class, String.class, Map.class, ArrayNode.class);
-        method.setAccessible(true);
-        method.invoke(generator, alertBuilder, disruptionId, lines, impactedSections);
+        Method computeRouteImpacts = AlertGenerator.class.getDeclaredMethod(
+            "computeRouteImpacts", String.class, Map.class, ArrayNode.class);
+        computeRouteImpacts.setAccessible(true);
+        Object impacts = computeRouteImpacts.invoke(generator, disruptionId, lines, impactedSections);
+
+        Method addInformedEntities = AlertGenerator.class.getDeclaredMethod(
+            "addInformedEntities", GtfsRealtime.Alert.Builder.class, List.class);
+        addInformedEntities.setAccessible(true);
+        addInformedEntities.invoke(generator, alertBuilder, impacts);
         return lines;
     }
 
@@ -628,6 +633,68 @@ class AlertGeneratorTest {
         assertFalse(selector.hasStopId());
     }
 
+    private GtfsRealtime.Alert.Effect invokeResolveAlertEffect(String severity, String disruptionId,
+            Map<String, Object> lines, ArrayNode impactedSections) throws Exception {
+        Method computeRouteImpacts = AlertGenerator.class.getDeclaredMethod(
+            "computeRouteImpacts", String.class, Map.class, ArrayNode.class);
+        computeRouteImpacts.setAccessible(true);
+        Object impacts = computeRouteImpacts.invoke(generator, disruptionId, lines, impactedSections);
+
+        Method resolveAlertEffect = AlertGenerator.class.getDeclaredMethod(
+            "resolveAlertEffect", String.class, List.class);
+        resolveAlertEffect.setAccessible(true);
+        return (GtfsRealtime.Alert.Effect) resolveAlertEffect.invoke(generator, severity, impacts);
+    }
+
+    @Test
+    void testResolveAlertEffectDowngradesToModifiedServiceWhenSectionsPresent() throws Exception {
+        // Reproduces the real RER D report from a transitous/MOTIS contributor: a BLOQUANTE
+        // "trafic interrompu entre Orry-la-Ville et Creil" disruption produced a bare
+        // route-only informed_entity (line:IDFM:C01728) paired with NO_SERVICE. Under the
+        // stricter NO_SERVICE interpretation some routing engines are moving to (see
+        // google/transit#469), that combination reads as "nothing on the whole RER D line runs",
+        // even though only one segment is actually cut. Since GTFS-Realtime has no way to name
+        // just the closed stops for a sections-based impact, MODIFIED_SERVICE is the honest
+        // effect here instead -- it carries no such all-or-nothing implication. The routing-
+        // relevant part (which stops are actually skipped) is unaffected: that's driven by the
+        // TripUpdate feed's StopTimeUpdates, not by this Alert's effect field.
+        JsonNode siriData = objectMapper.readTree(siriDataJsonWithSections());
+        Map<String, Object> lines = generator.parseLines(siriData.get("lines"));
+        ArrayNode impactedSections = (ArrayNode) siriData.get("disruptions").get(0).get("impactedSections");
+
+        GtfsRealtime.Alert.Effect effect = invokeResolveAlertEffect("BLOQUANTE", "disruption1", lines,
+            impactedSections);
+
+        assertEquals(GtfsRealtime.Alert.Effect.MODIFIED_SERVICE, effect);
+    }
+
+    @Test
+    void testResolveAlertEffectKeepsNoServiceWhenStopsArePreciselyScoped() throws Exception {
+        // A BLOQUANTE disruption with a precise stop list (no sections) can safely keep
+        // NO_SERVICE -- each informed_entity already pairs the route with the exact stop,
+        // so it doesn't overclaim "whole route down" the way a bare route-only selector would.
+        String linesJson = """
+            [
+                {
+                    "id": "line:IDFM:C01563",
+                    "name": "Bus 9102",
+                    "shortName": "9102",
+                    "mode": "bus",
+                    "networkId": "IDFM",
+                    "impactedObjects": [
+                        {"id": "line:IDFM:C01563", "type": "line", "disruptionIds": ["disruption1"]},
+                        {"id": "stop_point:IDFM:11341", "type": "stop_point", "disruptionIds": ["disruption1"]}
+                    ]
+                }
+            ]
+            """;
+        Map<String, Object> lines = generator.parseLines(objectMapper.readTree(linesJson));
+
+        GtfsRealtime.Alert.Effect effect = invokeResolveAlertEffect("BLOQUANTE", "disruption1", lines, null);
+
+        assertEquals(GtfsRealtime.Alert.Effect.NO_SERVICE, effect);
+    }
+
     @Test
     void testComputeStopClosuresUsesSectionsInsteadOfNoisyStopList() throws Exception {
         JsonNode siriData = objectMapper.readTree(siriDataJsonWithSections());
@@ -642,5 +709,55 @@ class AlertGeneratorTest {
         org.jouca.idfm_gtfs_rt.records.StopClosure.Section section = closure.sections().get(0);
         assertEquals("IDFM:73699", section.fromParentStationId());
         assertEquals("IDFM:73568", section.toParentStationId());
+        assertTrue(closure.noThroughTraffic(),
+            "the message says \"trafic interrompu\" -- a rail line genuinely cannot detour past the section");
+    }
+
+    @Test
+    void testComputeStopClosuresDoesNotSetNoThroughTrafficForADetourableBusDeviation() throws Exception {
+        // Reproduces the real Bus 366 case: "la ligne est déviée" -- the bus routes around the
+        // closed section by street and continues its route normally past it, unlike a tram/train
+        // which cannot detour. Checked against 1002 real active BLOQUANTE disruptions: "dévié(e)"
+        // appears exclusively on bus lines, "interrompu" only on rail-bound ones.
+        String siriData = """
+            {
+                "disruptions": [
+                    {
+                        "id": "disruption1",
+                        "applicationPeriods": [{"begin": "20260830T071300", "end": "20261130T030000"}],
+                        "cause": "TRAVAUX",
+                        "severity": "BLOQUANTE",
+                        "title": "Bus 366 : Travaux - Arrêt(s) non desservi(s)",
+                        "message": "La ligne 366 est déviée : les arrêts situés entre Président Kennedy et Solférino ne sont plus desservis en direction de Asnières Bords de Seine.",
+                        "impactedSections": [
+                            {
+                                "lineId": "line:IDFM:C01306",
+                                "from": {"type": "stop_area", "id": "stop_area:IDFM:72276", "name": "Président Kennedy"},
+                                "to": {"type": "stop_area", "id": "stop_area:IDFM:478707", "name": "Solférino"}
+                            }
+                        ]
+                    }
+                ],
+                "lines": [
+                    {
+                        "id": "line:IDFM:C01306",
+                        "name": "366",
+                        "shortName": "366",
+                        "mode": "bus",
+                        "networkId": "IDFM",
+                        "impactedObjects": [
+                            {"id": "line:IDFM:C01306", "type": "line", "disruptionIds": ["disruption1"]}
+                        ]
+                    }
+                ]
+            }
+            """;
+
+        List<org.jouca.idfm_gtfs_rt.records.StopClosure> closures =
+            generator.computeStopClosures(objectMapper.readTree(siriData));
+
+        assertEquals(1, closures.size());
+        assertFalse(closures.get(0).noThroughTraffic(),
+            "a detourable \"déviée\" bus line continues past the section normally");
     }
 }

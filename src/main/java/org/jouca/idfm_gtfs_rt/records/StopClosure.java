@@ -28,12 +28,17 @@ import java.util.List;
  * @param entireRouteClosure whether the whole route has no service (no specific stops/sections
  *                           named), meaning trips overlapping the active periods should be
  *                           canceled entirely rather than having individual stops skipped
+ * @param noThroughTraffic  whether a {@code sections} closure is a genuine "no through traffic"
+ *                          interruption (IDFM's own wording uses "interrompu") as opposed to a
+ *                          detour ("déviée") — see {@code TripUpdateGenerator#markSectionSkipped}
+ *                          for why this changes how far past the section a trip gets marked
+ *                          unavailable. Meaningless when {@code sections} is empty.
  *
  * @author Jouca
  * @since 1.0
  */
 public record StopClosure(String disruptionId, String routeId, List<String> stopIds, List<Section> sections,
-        List<Window> activePeriods, boolean entireRouteClosure) {
+        List<Window> activePeriods, boolean entireRouteClosure, boolean noThroughTraffic) {
 
     /**
      * A single active time window, in Unix epoch seconds (inclusive bounds).

@@ -1856,9 +1856,9 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
             java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
-            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class);
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
         method.setAccessible(true);
-        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, false);
 
         com.google.transit.realtime.GtfsRealtime.TripUpdate tripUpdate =
             feedMessage.getEntityBuilder(0).getTripUpdateBuilder().build();
@@ -1902,9 +1902,9 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
             java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
-            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class);
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
         method.setAccessible(true);
-        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, false);
 
         assertEquals(0, feedMessage.getEntityCount(), "no entity should be created for an unaffected trip pattern");
     }
@@ -1939,12 +1939,264 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
             java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
-            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class);
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
         method.setAccessible(true);
-        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, false);
 
         assertEquals(0, feedMessage.getEntityCount(),
             "a trip running opposite to the section's from->to order must not be affected");
+    }
+
+    // --- noThroughTraffic: a genuine "trafic interrompu" (not a detourable "déviée") also
+    // cancels everything past the section, since the vehicle cannot continue at all ---
+
+    @Test
+    void testMarkSectionSkippedExtendsPastBoundaryWhenNoThroughTraffic() throws Exception {
+        // Reproduces the real, currently-active Tramway T3A case: "trafic interrompu" between
+        // Porte de Vincennes and Porte de Charenton. Unlike a bus, which can detour around a
+        // closed section and carry on to the rest of its route normally, a tram genuinely cannot
+        // continue past the closure at all — real IDFM disruptions describe exactly this pattern
+        // ("le train de 23h35 est terminus X puis bus de substitution"). So every stop after the
+        // section's own "to" boundary must also be SKIPPED, not just the strictly-interior ones.
+        com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder feedMessage =
+            com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.Builder> index = new java.util.HashMap<>();
+
+        java.util.List<String> stopTimeRows = java.util.List.of(
+            "STOP_BEFORE,100,100,1",
+            "FROM_STATION,200,200,2",
+            "STOP_MID,300,300,3",
+            "TO_STATION,400,400,4",
+            "STOP_AFTER_1,500,500,5",
+            "STOP_AFTER_2,600,600,6",
+            "TERMINUS,700,700,7");
+
+        TripFinder.TripMeta trip = new TripFinder.TripMeta("trip1", "IDFM:C01391", 0, 100, 700, "20260910");
+        org.jouca.idfm_gtfs_rt.records.StopClosure.Section section =
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Section("FROM_STATION", "TO_STATION");
+        java.util.List<org.jouca.idfm_gtfs_rt.records.StopClosure.Window> activePeriods = java.util.List.of(
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Window(0L, 1_000_000_000L));
+
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
+            java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
+        method.setAccessible(true);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, true);
+
+        com.google.transit.realtime.GtfsRealtime.TripUpdate tripUpdate =
+            feedMessage.getEntityBuilder(0).getTripUpdateBuilder().build();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship> byStop =
+            new java.util.HashMap<>();
+        for (com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate stu : tripUpdate.getStopTimeUpdateList()) {
+            byStop.put(stu.getStopId(), stu.getScheduleRelationship());
+        }
+
+        assertFalse(byStop.containsKey("STOP_BEFORE"), "stop before the section must be untouched");
+        assertFalse(byStop.containsKey("FROM_STATION"), "the from-boundary must not be touched");
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("STOP_MID"), "the interior stop must be skipped as usual");
+        assertFalse(byStop.containsKey("TO_STATION"),
+            "the to-boundary is the real terminus the vehicle reaches and must stay untouched");
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("STOP_AFTER_1"), "stops after the boundary must also be skipped: the vehicle can't detour");
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("STOP_AFTER_2"));
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("TERMINUS"), "even the trip's own theoretical terminus must be skipped");
+    }
+
+    @Test
+    void testMarkSectionSkippedAlsoSkipsFromBoundaryWhenItIsTheTripsOwnOrigin() throws Exception {
+        // Reproduces the real, currently-active Tramway T3A case in the Vincennes -> Charenton
+        // direction: Porte de Vincennes is both the section's "from" boundary AND this trip's own
+        // first stop (it's the line's terminus). There is nothing before it the vehicle could have
+        // arrived FROM — the sole reason this trip run would exist is to head into a section it
+        // can never traverse, so unlike the usual case (see
+        // testMarkSectionSkippedExtendsPastBoundaryWhenNoThroughTraffic, where a STOP_BEFORE
+        // exists), Vincennes itself must also be marked SKIPPED, not left looking normal.
+        com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder feedMessage =
+            com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.Builder> index = new java.util.HashMap<>();
+
+        java.util.List<String> stopTimeRows = java.util.List.of(
+            "FROM_STATION,100,100,1",
+            "STOP_MID,200,200,2",
+            "TO_STATION,300,300,3",
+            "STOP_AFTER,400,400,4");
+
+        TripFinder.TripMeta trip = new TripFinder.TripMeta("trip1", "IDFM:C01391", 0, 100, 400, "20260910");
+        org.jouca.idfm_gtfs_rt.records.StopClosure.Section section =
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Section("FROM_STATION", "TO_STATION");
+        java.util.List<org.jouca.idfm_gtfs_rt.records.StopClosure.Window> activePeriods = java.util.List.of(
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Window(0L, 1_000_000_000L));
+
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
+            java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
+        method.setAccessible(true);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, true);
+
+        com.google.transit.realtime.GtfsRealtime.TripUpdate tripUpdate =
+            feedMessage.getEntityBuilder(0).getTripUpdateBuilder().build();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship> byStop =
+            new java.util.HashMap<>();
+        for (com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate stu : tripUpdate.getStopTimeUpdateList()) {
+            byStop.put(stu.getStopId(), stu.getScheduleRelationship());
+        }
+
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("FROM_STATION"),
+            "the origin boundary must be skipped too when there's nothing before it on this trip");
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("STOP_MID"));
+        assertFalse(byStop.containsKey("TO_STATION"), "the to-boundary (real terminus reached) still stays untouched");
+        assertFalse(byStop.containsKey("STOP_AFTER"),
+            "stops past the closure must NOT be marked when from is the trip's own origin — there is no "
+                + "evidence the rest of the line beyond to is unserved, only that this trip never departs");
+    }
+
+    @Test
+    void testMarkSectionSkippedAlsoSkipsToBoundaryWhenItIsTheTripsOwnTerminus() throws Exception {
+        // Symmetric case, real Tramway T3A example: a trip travelling FROM Charenton TO Vincennes
+        // (the reciprocal direction of the section) has Vincennes as its own last stop — the
+        // line's dead-end terminus. Vincennes has exactly one track connection, which is the very
+        // section that's severed, so it's unreachable from this direction too: unlike an ordinary
+        // "to" boundary (reachable some other way, e.g. a mid-line station other trains still
+        // serve), it must be marked SKIPPED rather than left looking served.
+        com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder feedMessage =
+            com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.Builder> index = new java.util.HashMap<>();
+
+        java.util.List<String> stopTimeRows = java.util.List.of(
+            "STOP_BEFORE,100,100,1",
+            "FROM_STATION,200,200,2",
+            "STOP_MID,300,300,3",
+            "TO_STATION,400,400,4");
+
+        TripFinder.TripMeta trip = new TripFinder.TripMeta("trip1", "IDFM:C01391", 0, 100, 400, "20260910");
+        org.jouca.idfm_gtfs_rt.records.StopClosure.Section section =
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Section("FROM_STATION", "TO_STATION");
+        java.util.List<org.jouca.idfm_gtfs_rt.records.StopClosure.Window> activePeriods = java.util.List.of(
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Window(0L, 1_000_000_000L));
+
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
+            java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
+        method.setAccessible(true);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, true);
+
+        com.google.transit.realtime.GtfsRealtime.TripUpdate tripUpdate =
+            feedMessage.getEntityBuilder(0).getTripUpdateBuilder().build();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship> byStop =
+            new java.util.HashMap<>();
+        for (com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate stu : tripUpdate.getStopTimeUpdateList()) {
+            byStop.put(stu.getStopId(), stu.getScheduleRelationship());
+        }
+
+        assertFalse(byStop.containsKey("STOP_BEFORE"), "stop before the section must be untouched");
+        assertFalse(byStop.containsKey("FROM_STATION"),
+            "the from-boundary is reachable from STOP_BEFORE and must stay untouched");
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("STOP_MID"));
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("TO_STATION"),
+            "the terminus boundary must be skipped too when there's nothing after it on this trip");
+    }
+
+    @Test
+    void testMarkSectionSkippedIgnoresLiveDataWhenBoundaryIsTheTripsOwnTerminus() throws Exception {
+        // Reproduces a real RER D case: "trafic interrompu entre Villeneuve-Saint-Georges et
+        // Melun", Melun being this trip's own terminus. SIRI-Lite still reported a real
+        // EstimatedCall time for Melun -- but that's the projected theoretical arrival for a stop
+        // several stations past an already-active closure, not confirmation the train will
+        // actually get there; the projection for a dead-end terminus a train genuinely can't
+        // reach simply hadn't been retracted yet. Unlike an ordinary mid-line boundary (reachable
+        // some other way, so live data legitimately overrides the closure guess there), a trip's
+        // own unreachable terminus has no other way in at all, so live data must NOT prevent it
+        // from being marked SKIPPED here.
+        com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder feedMessage =
+            com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder();
+
+        com.google.transit.realtime.GtfsRealtime.TripUpdate.Builder existing =
+            feedMessage.addEntityBuilder().setId("trip1").getTripUpdateBuilder();
+        existing.getTripBuilder().setTripId("trip1")
+            .setScheduleRelationship(com.google.transit.realtime.GtfsRealtime.TripDescriptor.ScheduleRelationship.SCHEDULED);
+        // TO_STATION (Melun) still carries a live-projected arrival time, same as the real case.
+        existing.addStopTimeUpdateBuilder()
+            .setStopSequence(4)
+            .setStopId("TO_STATION")
+            .getArrivalBuilder().setTime(700L);
+
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.Builder> index = new java.util.HashMap<>();
+        index.put("trip1", existing);
+
+        java.util.List<String> stopTimeRows = java.util.List.of(
+            "STOP_BEFORE,100,100,1",
+            "FROM_STATION,200,200,2",
+            "STOP_MID,300,300,3",
+            "TO_STATION,400,400,4");
+
+        TripFinder.TripMeta trip = new TripFinder.TripMeta("trip1", "IDFM:C01728", 0, 100, 400, "20260925");
+        org.jouca.idfm_gtfs_rt.records.StopClosure.Section section =
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Section("FROM_STATION", "TO_STATION");
+        java.util.List<org.jouca.idfm_gtfs_rt.records.StopClosure.Window> activePeriods = java.util.List.of(
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Window(0L, 1_000_000_000L));
+
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
+            java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
+        method.setAccessible(true);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, true);
+
+        com.google.transit.realtime.GtfsRealtime.TripUpdate tripUpdate =
+            feedMessage.getEntityBuilder(0).getTripUpdateBuilder().build();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship> byStop =
+            new java.util.HashMap<>();
+        for (com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate stu : tripUpdate.getStopTimeUpdateList()) {
+            byStop.put(stu.getStopId(), stu.getScheduleRelationship());
+        }
+
+        assertEquals(com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship.SKIPPED,
+            byStop.get("TO_STATION"),
+            "a trip's own unreachable terminus must be marked SKIPPED even if SIRI still has a "
+                + "stale live projection for it -- there is no other way for this vehicle to get there");
+    }
+
+    @Test
+    void testMarkSectionSkippedDoesNotExtendPastBoundaryWhenClosureNeverAppliedToThisTrip() throws Exception {
+        // If the section never actually matched this trip (e.g. its scheduled crossing time is
+        // outside the closure's active window), noThroughTraffic must not extend anything either
+        // — there is nothing to extend from.
+        com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder feedMessage =
+            com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder();
+        java.util.Map<String, com.google.transit.realtime.GtfsRealtime.TripUpdate.Builder> index = new java.util.HashMap<>();
+
+        java.util.List<String> stopTimeRows = java.util.List.of(
+            "FROM_STATION,200,200,1",
+            "STOP_MID,300,300,2",
+            "TO_STATION,400,400,3",
+            "STOP_AFTER,500,500,4");
+
+        TripFinder.TripMeta trip = new TripFinder.TripMeta("trip1", "IDFM:C01391", 0, 200, 500, "20260910");
+        org.jouca.idfm_gtfs_rt.records.StopClosure.Section section =
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Section("FROM_STATION", "TO_STATION");
+        // Window is entirely before this trip's schedule -- the closure doesn't apply to this run.
+        java.util.List<org.jouca.idfm_gtfs_rt.records.StopClosure.Window> activePeriods = java.util.List.of(
+            new org.jouca.idfm_gtfs_rt.records.StopClosure.Window(-1000L, -500L));
+
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
+            java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
+        method.setAccessible(true);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, true);
+
+        assertEquals(0, feedMessage.getEntityCount(),
+            "no entity should be created when the closure window never matched this trip at all");
     }
 
     // --- A section's boundary stops confirmed ON_TIME by live data are never overridden
@@ -1995,9 +2247,9 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
             java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
-            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class);
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
         method.setAccessible(true);
-        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, false);
 
         com.google.transit.realtime.GtfsRealtime.TripUpdate tripUpdate =
             feedMessage.getEntityBuilder(0).getTripUpdateBuilder().build();
@@ -2085,9 +2337,9 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
             java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
-            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class);
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
         method.setAccessible(true);
-        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, false);
 
         // MID_STATION (300, already before "now" = 350) must still be marked SKIPPED; the
         // boundary stops FROM_STATION/TO_STATION are excluded regardless (see the section-
@@ -2146,9 +2398,9 @@ class TripUpdateGeneratorTest {
         java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
             "markSectionSkipped", com.google.transit.realtime.GtfsRealtime.FeedMessage.Builder.class,
             java.util.Map.class, TripFinder.TripMeta.class, java.util.List.class, long.class,
-            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class);
+            org.jouca.idfm_gtfs_rt.records.StopClosure.Section.class, java.util.List.class, boolean.class);
         method.setAccessible(true);
-        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods);
+        method.invoke(generator, feedMessage, index, trip, stopTimeRows, 0L, section, activePeriods, false);
 
         com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate updated =
             existing.getStopTimeUpdate(0);

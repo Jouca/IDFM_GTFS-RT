@@ -439,7 +439,7 @@ public class TripUpdateGenerator {
                     }
                     for (StopClosure.Section section : closure.sections()) {
                         markSectionSkipped(feedMessage, tripUpdatesByTripId, trip, stopTimeRows,
-                                serviceDayStartEpoch, section, closure.activePeriods());
+                                serviceDayStartEpoch, section, closure.activePeriods(), closure.noThroughTraffic());
                     }
                 }
             }
@@ -612,16 +612,37 @@ public class TripUpdateGenerator {
      * simply not affected by this section, even though it passes through the same two stations.
      * When both directions are genuinely closed, IDFM gives two reciprocal {@code Section}
      * entries (one per direction), so each real direction is still matched correctly this way.
+     * <p>
+     * When {@code noThroughTraffic} is true (IDFM's own wording says "interrompu" rather than
+     * "déviée" — see {@link org.jouca.idfm_gtfs_rt.generator.AlertGenerator#isNoThroughTrafficWording}),
+     * the vehicle cannot detour around the closure the way a bus can: it cannot continue past
+     * {@code to} in the affected direction at all. In that case every stop strictly after {@code
+     * to} (through the trip's theoretical terminus) is also marked SKIPPED — reflecting a real
+     * operational pattern IDFM itself describes (e.g. "le train de 23h35 est terminus X puis bus
+     * de substitution"): the trip effectively terminates at the boundary rather than skipping a
+     * few stops and carrying on. {@code to} itself is still excluded (it's the real terminus the
+     * vehicle does reach), matching this method's general boundary-exclusion behaviour — unless
+     * {@code from} (or symmetrically {@code to}) is this trip's own first (or last) stop, i.e. an
+     * end-of-line terminus with nothing before (or after) it on this trip's own pattern. IDFM's
+     * "no service between X and Y" wording implicitly assumes there's a way to reach X and Y from
+     * elsewhere — true for an ordinary station a train can be turned back at, but not for a true
+     * dead-end terminus (e.g. Porte de Vincennes on T3A) whose only track connection *is* the
+     * severed section: it becomes unreachable from that direction too, and is marked SKIPPED
+     * rather than left looking served.
      */
     private void markSectionSkipped(GtfsRealtime.FeedMessage.Builder feedMessage,
             Map<String, GtfsRealtime.TripUpdate.Builder> tripUpdatesByTripId, TripFinder.TripMeta trip,
             List<String> stopTimeRows, long serviceDayStartEpoch, StopClosure.Section section,
-            List<StopClosure.Window> activePeriods) {
+            List<StopClosure.Window> activePeriods, boolean noThroughTraffic) {
         Set<String> fromStopIds = TripFinder.getStopIdsForParentStation(section.fromParentStationId());
         Set<String> toStopIds = TripFinder.getStopIdsForParentStation(section.toParentStationId());
 
         Integer fromSequence = null;
         Integer toSequence = null;
+        Integer firstSequence = null;
+        Integer lastSequence = null;
+        String fromStopId = null;
+        String toStopId = null;
         for (String row : stopTimeRows) {
             String[] parts = row.split(",", 4);
             if (parts.length < 4) {
@@ -633,11 +654,19 @@ public class TripUpdateGenerator {
             } catch (NumberFormatException e) {
                 continue;
             }
+            if (firstSequence == null || seq < firstSequence) {
+                firstSequence = seq;
+            }
+            if (lastSequence == null || seq > lastSequence) {
+                lastSequence = seq;
+            }
             if (fromSequence == null && fromStopIds.contains(parts[0])) {
                 fromSequence = seq;
+                fromStopId = parts[0];
             }
             if (toSequence == null && toStopIds.contains(parts[0])) {
                 toSequence = seq;
+                toStopId = parts[0];
             }
         }
 
@@ -650,7 +679,12 @@ public class TripUpdateGenerator {
 
         int lo = fromSequence;
         int hi = toSequence;
+        // Whether `from`/`to` is this trip's own first/last stop — i.e. there's nothing before/
+        // after it on this trip's own pattern. See the noThroughTraffic handling below.
+        boolean fromIsTripOrigin = lo == firstSequence;
+        boolean toIsTripTerminus = hi == lastSequence;
 
+        boolean anyInteriorMarked = false;
         for (String row : stopTimeRows) {
             String[] parts = row.split(",", 4);
             if (parts.length < 4) {
@@ -684,6 +718,80 @@ public class TripUpdateGenerator {
 
             markStopSkipped(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate,
                     parts[0], seq);
+            anyInteriorMarked = true;
+        }
+
+        if (!noThroughTraffic || !anyInteriorMarked) {
+            return;
+        }
+
+        // The closure genuinely applied to this run of the trip (at least one interior stop was
+        // within the active window) and the vehicle cannot detour — it cannot continue past `to`
+        // at all for the rest of this trip. Every stop strictly after `to` is marked SKIPPED
+        // regardless of that stop's own scheduled time, since the vehicle never gets there on this
+        // run no matter when it was theoretically due.
+        // <p>
+        // But this only holds when the vehicle was actually running normally up to the closure —
+        // i.e. `from` is reached from an earlier, unaffected point on this same trip. When `from`
+        // is instead this trip's own origin, extending all the way to the trip's true end would
+        // blank out everything past `to` too — on a real line that can be most of the route (e.g.
+        // T3A's whole Charenton→Pont du Garigliano stretch for a trip whose origin, Porte de
+        // Vincennes, is the affected end). We have no evidence that stretch is actually unserved —
+        // this trip's own vehicle simply never departing is not proof nothing else covers it — so
+        // it's left alone rather than presenting a large, unverified swath of the line as having
+        // no service at all.
+        if (!fromIsTripOrigin) {
+            for (String row : stopTimeRows) {
+                String[] parts = row.split(",", 4);
+                if (parts.length < 4) {
+                    continue;
+                }
+                int seq;
+                try {
+                    seq = Integer.parseInt(parts[3]);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                if (seq <= hi) {
+                    continue;
+                }
+                if (isConfirmedServedByLiveData(tripUpdatesByTripId, trip.tripId, parts[0], seq)) {
+                    continue;
+                }
+                markStopSkipped(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate,
+                        parts[0], seq);
+            }
+        }
+
+        // `from` normally stays excluded because the vehicle genuinely reaches it FROM an earlier,
+        // unaffected point (e.g. a train arriving from further up the line before being turned
+        // back there). But when `from` is this trip's own first stop, there is no earlier point —
+        // the entire reason this trip would run is to head into the section that cannot be
+        // traversed at all, so there's no legitimate service to speak of here either.
+        // <p>
+        // Unlike the neighbour-boundary case elsewhere in this method, live data is NOT trusted as
+        // an override here (real RER D case: a train's SIRI-Lite EstimatedCalls still listed a real
+        // ETA for its own far-downstream terminus, past a "trafic interrompu" section covering the
+        // rest of its route, well after the interior stops had already been confirmed SKIPPED — the
+        // projection for a stop this far past an active closure simply hadn't been retracted yet,
+        // not a genuine confirmation the vehicle would get there). A trip's own dead-end origin/
+        // terminus has no OTHER way to be reached, unlike an ordinary mid-line boundary a different
+        // service could still legitimately serve — so once the interior is confirmed closed, there
+        // is no real-world scenario where this specific vehicle still reaches its own origin/end.
+        if (fromIsTripOrigin) {
+            markStopSkipped(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate,
+                    fromStopId, lo);
+        }
+
+        // Symmetrically, `to` normally stays excluded because it's assumed reachable some OTHER
+        // way (a real, still-served terminus a train gets turned back at — e.g. Versailles-
+        // Chantiers, reachable from other directions too). That assumption breaks down when `to`
+        // is also this trip's own last stop: a genuine end-of-line terminus (Porte de Vincennes on
+        // T3A) has exactly one track connection, and if that connection is the very section that's
+        // cut, the terminus is unreachable from this direction as well — there is no other way in.
+        if (toIsTripTerminus) {
+            markStopSkipped(feedMessage, tripUpdatesByTripId, trip.tripId, trip.routeId, trip.startDate,
+                    toStopId, hi);
         }
     }
 

@@ -285,13 +285,10 @@ public class AlertGenerator {
      * no "no service between X and Y" selector to fall back on more precisely here.
      *
      * @param alertBuilder the alert builder to add informed entities to
-     * @param disruptionId the disruption ID to match against
-     * @param lines map of line data
-     * @param impactedSections the disruption's impactedSections array, or {@code null} if absent
+     * @param impacts the routes affected by this disruption, and how
      */
-    private void addInformedEntities(GtfsRealtime.Alert.Builder alertBuilder, String disruptionId,
-            Map<String, Object> lines, ArrayNode impactedSections) {
-        for (RouteImpact impact : computeRouteImpacts(disruptionId, lines, impactedSections)) {
+    private void addInformedEntities(GtfsRealtime.Alert.Builder alertBuilder, List<RouteImpact> impacts) {
+        for (RouteImpact impact : impacts) {
             if (!impact.sections().isEmpty()) {
                 alertBuilder.addInformedEntityBuilder().setRouteId(impact.routeId());
             } else if (!impact.stopIds().isEmpty()) {
@@ -328,6 +325,34 @@ public class AlertGenerator {
     }
     
     /**
+     * Resolves the {@code effect} value to actually display on the alert, downgrading a
+     * severity-implied {@code NO_SERVICE} to {@code MODIFIED_SERVICE} whenever any affected route
+     * is impacted via a {@code sections} boundary rather than a precise stop list.
+     * <p>
+     * As {@link #addInformedEntities} explains, a section-scoped impact can only be represented
+     * with a bare route-level {@code informed_entity} — GTFS-Realtime has no "no service between
+     * X and Y" selector, so we can't name just the closed stops. Pairing that route-wide selector
+     * with {@code NO_SERVICE} would read, to a routing engine that takes the effect literally, as
+     * "nothing on this route runs at all" — when in reality only one segment of a potentially very
+     * long line (e.g. RER D) is cut and the rest keeps running. {@code MODIFIED_SERVICE} carries
+     * no such all-or-nothing implication, so it's the honest choice when precise stop scoping
+     * isn't possible (this mirrors the actual routing-affecting behavior, which is driven
+     * separately by the SKIPPED StopTimeUpdates in the TripUpdate feed, not by this Alert).
+     *
+     * @param severity the IDFM severity string driving the base effect (see {@link #mapEffect})
+     * @param impacts  the routes affected by this disruption, and how
+     * @return the effect value to set on the alert
+     */
+    private GtfsRealtime.Alert.Effect resolveAlertEffect(String severity, List<RouteImpact> impacts) {
+        GtfsRealtime.Alert.Effect effect = mapEffect(severity);
+        if (effect == GtfsRealtime.Alert.Effect.NO_SERVICE
+                && impacts.stream().anyMatch(impact -> !impact.sections().isEmpty())) {
+            return GtfsRealtime.Alert.Effect.MODIFIED_SERVICE;
+        }
+        return effect;
+    }
+
+    /**
      * Populates an alert builder with all necessary fields from the alert data.
      *
      * @param alertBuilder the alert builder to populate
@@ -342,9 +367,10 @@ public class AlertGenerator {
         String message = alert.get(FIELD_MESSAGE).toString();
         ArrayNode impactedSections = (ArrayNode) alert.get(FIELD_IMPACTED_SECTIONS);
 
-        addInformedEntities(alertBuilder, disruptionId, lines, impactedSections);
+        List<RouteImpact> impacts = computeRouteImpacts(disruptionId, lines, impactedSections);
+        addInformedEntities(alertBuilder, impacts);
         alertBuilder.setCause(mapCause(cause));
-        alertBuilder.setEffect(mapEffect(severity));
+        alertBuilder.setEffect(resolveAlertEffect(severity, impacts));
         alertBuilder.setSeverityLevel(mapSeverityLevel(severity));
         setAlertText(alertBuilder, title, message);
     }
@@ -436,6 +462,27 @@ public class AlertGenerator {
     }
 
     /**
+     * Whether a disruption's own wording describes a genuine "no through traffic" interruption
+     * rather than a detour.
+     * <p>
+     * Checked against 1002 currently active BLOQUANTE disruptions: "dévié(e)" appears in 320,
+     * exclusively on bus lines (which can route around a closed section by street and continue
+     * normally) — never on rail-bound modes. "interrompu" appears on tram/metro/train sections,
+     * where the vehicle cannot detour and genuinely cannot continue past the closure at all. IDFM
+     * exposes no structured field for this distinction; the title/message wording is the only
+     * available signal, but it is a reliable one in practice.
+     *
+     * @param alert map containing alert data, with {@code title}/{@code message} as plain strings
+     * @return true if the disruption's title or message contains "interrompu"
+     */
+    private boolean isNoThroughTrafficWording(Map<String, Object> alert) {
+        String title = (String) alert.get(FIELD_TITLE);
+        String message = (String) alert.get(FIELD_MESSAGE);
+        String combined = ((title != null ? title : "") + " " + (message != null ? message : "")).toLowerCase();
+        return combined.contains("interrompu");
+    }
+
+    /**
      * Computes the set of service closures described by the given IDFM disruption data: for
      * every disruption whose severity maps to {@link GtfsRealtime.Alert.Effect#NO_SERVICE}, one
      * {@link StopClosure} per affected route is returned, carrying the disruption's application
@@ -485,20 +532,25 @@ public class AlertGenerator {
                 windows.add(new StopClosure.Window(period.getStart(), period.getEnd()));
             }
 
+            boolean noThroughTraffic = isNoThroughTrafficWording(alert);
+
             ArrayNode impactedSections = (ArrayNode) alert.get(FIELD_IMPACTED_SECTIONS);
             for (RouteImpact impact : computeRouteImpacts(disruptionId, lines, impactedSections)) {
                 if (!impact.sections().isEmpty()) {
                     // Sections are the more reliable source when present — see
                     // computeRouteImpacts's javadoc for why the per-stop list can't be trusted
                     // on its own here.
-                    closures.add(new StopClosure(disruptionId, impact.routeId(), List.of(), impact.sections(), windows, false));
+                    closures.add(new StopClosure(disruptionId, impact.routeId(), List.of(), impact.sections(), windows,
+                            false, noThroughTraffic));
                 } else if (!impact.stopIds().isEmpty()) {
-                    closures.add(new StopClosure(disruptionId, impact.routeId(), impact.stopIds(), List.of(), windows, false));
+                    closures.add(new StopClosure(disruptionId, impact.routeId(), impact.stopIds(), List.of(), windows,
+                            false, false));
                 } else if (impact.lineImpacted()) {
                     // No specific stops or sections named at all: IDFM is describing a genuine
                     // whole-line closure (e.g. maintenance work), so every trip on the route is
                     // affected rather than just some stops on it.
-                    closures.add(new StopClosure(disruptionId, impact.routeId(), List.of(), List.of(), windows, true));
+                    closures.add(new StopClosure(disruptionId, impact.routeId(), List.of(), List.of(), windows,
+                            true, false));
                 }
             }
         }

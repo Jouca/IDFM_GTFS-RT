@@ -412,11 +412,12 @@ public class GTFSEnricher {
         if (headerLine == null) return new byte[0];
 
         String[] headers = parseCsvLine(headerLine);
-        int stopIdIdx = -1, platformCodeIdx = -1;
+        int stopIdIdx = -1, platformCodeIdx = -1, parentStationIdx = -1;
         for (int i = 0; i < headers.length; i++) {
             String h = headers[i].trim();
             if ("stop_id".equals(h)) stopIdIdx = i;
             if ("platform_code".equals(h)) platformCodeIdx = i;
+            if ("parent_station".equals(h)) parentStationIdx = i;
         }
 
         boolean columnExists = platformCodeIdx >= 0;
@@ -441,6 +442,13 @@ public class GTFSEnricher {
         }
 
         Set<String> existingArrids = new HashSet<>();
+        // "IDFM:monomodalStopPlace:{zdcid}" zdcid -> that stop's own parent_station. Every such
+        // stop is itself only location_type=0 (a "logical"/representative point for the physical
+        // complex) sitting one level below the true location_type=1 GTFS Station -- so a newly
+        // created quay must be parented to THAT station, not to the monomodalStopPlace stop
+        // itself, to be a proper sibling other tooling finds by walking direct station children
+        // (and to satisfy the GTFS rule that a location_type=0 stop's parent must be a Station).
+        Map<String, String> monomodalStopPlaceParent = new HashMap<>();
         int enrichedCount = 0;
         String line;
         while ((line = reader.readLine()) != null) {
@@ -448,6 +456,15 @@ public class GTFSEnricher {
 
             String[] fields = parseCsvLine(line);
             String stopId = stopIdIdx < fields.length ? fields[stopIdIdx].trim() : "";
+
+            if (parentStationIdx >= 0 && parentStationIdx < fields.length
+                    && stopId.startsWith("IDFM:monomodalStopPlace:")) {
+                String zdcid = stopId.substring("IDFM:monomodalStopPlace:".length());
+                String parent = fields[parentStationIdx].trim();
+                if (!parent.isEmpty()) {
+                    monomodalStopPlaceParent.put(zdcid, parent);
+                }
+            }
 
             Matcher m = PURE_NUMERIC_STOP_ID.matcher(stopId);
             if (m.matches()) {
@@ -478,10 +495,20 @@ public class GTFSEnricher {
             QuayData qd = e.getValue();
             if (qd.lat().isEmpty() || qd.lon().isEmpty()) continue;
 
+            // zdcid is the Quay's ParentZoneRef (a monomodalStopPlace id) with just the numeric
+            // suffix extracted. Prefer that monomodalStopPlace stop's own parent_station (the
+            // true location_type=1 Station) so the new quay lands as its sibling; fall back to
+            // the monomodalStopPlace id itself only if that lookup is unavailable (e.g. it wasn't
+            // present in this particular stops.txt) rather than a bare "IDFM:{zdcid}", which
+            // matches no real stop at all and breaks the station→platform hierarchy for any
+            // consumer that relies on it (GTFS-RT still worked either way because trip matching
+            // resolves parent stations by their child quays directly, bypassing this field).
+            String parentStation = monomodalStopPlaceParent.getOrDefault(
+                    zdcid, "IDFM:monomodalStopPlace:" + zdcid);
             String newRow = buildNewStopRow(
                     normalizedHeaders, platformCodeIdx,
                     "IDFM:" + arrid, qd.name(), qd.lat(), qd.lon(),
-                    qd.tariffZone(), "IDFM:" + zdcid, resolvePlatformCode(qd));
+                    qd.tariffZone(), parentStation, resolvePlatformCode(qd));
             sb.append(newRow).append("\n");
             createdCount++;
         }
