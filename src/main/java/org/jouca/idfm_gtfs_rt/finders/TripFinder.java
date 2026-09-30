@@ -604,6 +604,61 @@ public class TripFinder {
     }
 
     /**
+     * How well a set of real-time calls agrees with a static trip: how many calls hit a stop of the
+     * trip and the summed absolute gap (seconds) to the closest scheduled time at that stop.
+     */
+    public record TripFit(int matchedStops, int totalCalls, long totalDiffSeconds) {
+        /** Mean gap in seconds, or {@code Double.MAX_VALUE} when nothing matched. */
+        public double meanDiff() {
+            return matchedStops == 0 ? Double.MAX_VALUE : (double) totalDiffSeconds / matchedStops;
+        }
+
+        /** True when this fit is strictly better than {@code other}: more matched stops, then smaller mean gap. */
+        public boolean betterThan(TripFit other) {
+            if (matchedStops != other.matchedStops) {
+                return matchedStops > other.matchedStops;
+            }
+            return meanDiff() < other.meanDiff();
+        }
+    }
+
+    /**
+     * Measures how well {@code estimatedCalls} fit the static schedule of {@code tripId}.
+     * Times are compared modulo the service-day rollover, so trips running past midnight
+     * (GTFS times &gt;= 24:00:00) are handled.
+     */
+    public static TripFit fitAgainstTrip(String tripId, List<EstimatedCall> estimatedCalls) {
+        Map<String, List<Integer>> scheduled = new HashMap<>();
+        for (String row : getAllStopTimesFromTrip(tripId)) {
+            String[] parts = row.split(",", 4);
+            for (int i = 1; i <= 2; i++) {
+                try {
+                    scheduled.computeIfAbsent(parts[0], k -> new ArrayList<>()).add(Integer.parseInt(parts[i]));
+                } catch (NumberFormatException e) {
+                    // missing time (stored as "null") — ignore this side of the stop
+                }
+            }
+        }
+
+        int matched = 0;
+        long total = 0;
+        for (EstimatedCall ec : estimatedCalls) {
+            List<Integer> times = scheduled.get(ec.stopId());
+            if (times == null) {
+                continue;
+            }
+            int real = convertToSecondsSinceServiceDay(ec, PARIS_ZONE);
+            int best = Integer.MAX_VALUE;
+            for (int t : times) {
+                best = Math.min(best, Math.min(Math.abs(t - real), Math.abs(t - (real + 86400))));
+            }
+            matched++;
+            total += best;
+        }
+        return new TripFit(matched, estimatedCalls.size(), total);
+    }
+
+    /**
      * Attempts to find a GTFS trip ID by directly matching the SIRI DatedVehicleJourneyRef
      * against trip_id values in the database.
      *
@@ -688,13 +743,33 @@ public class TripFinder {
         boolean journeyNoteDetailled,
         Integer directionId
     ) throws SQLException {
+        return findTripIdFromEstimatedCalls(routeId, estimatedCalls, isArrivalTime, destinationId,
+                journeyNote, journeyNoteDetailled, directionId, Set.of());
+    }
+
+    /**
+     * Same as {@link #findTripIdFromEstimatedCalls(String, List, boolean, String, String, boolean, Integer)}
+     * but never returns a trip listed in {@code excludedTripIds}. Used to give a second vehicle
+     * a different trip when the best match is already taken by another vehicle. Results with a
+     * non-empty exclusion set are not cached because they depend on the caller's context.
+     */
+    public static String findTripIdFromEstimatedCalls(
+        String routeId,
+        List<EstimatedCall> estimatedCalls,
+        boolean isArrivalTime,
+        String destinationId,
+        String journeyNote,
+        boolean journeyNoteDetailled,
+        Integer directionId,
+        Set<String> excludedTripIds
+    ) throws SQLException {
         if (routeId == null || estimatedCalls == null || estimatedCalls.isEmpty()) {
             throw new IllegalArgumentException("Inputs cannot be null or empty.");
         }
 
-        // Check cache first
+        boolean cacheable = excludedTripIds == null || excludedTripIds.isEmpty();
         String cacheKey = buildCacheKey(routeId, isArrivalTime, destinationId, journeyNote, directionId, estimatedCalls);
-        if (findTripCache.containsKey(cacheKey)) {
+        if (cacheable && findTripCache.containsKey(cacheKey)) {
             return findTripCache.get(cacheKey);
         }
 
@@ -715,14 +790,14 @@ public class TripFinder {
         // Try current service day first (destination must be the terminus)
         String result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                                    journeyNote, journeyNoteDetailled, directionId,
-                                                   serviceDay, zone, timeColumn, false);
+                                                   serviceDay, zone, timeColumn, false, excludedTripIds);
 
         // If no match and it's early morning, also try yesterday's service day
         if (result == null && isEarlyMorning) {
             LocalDate previousServiceDay = serviceDay.minusDays(1);
             result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                               journeyNote, journeyNoteDetailled, directionId,
-                                              previousServiceDay, zone, timeColumn, false);
+                                              previousServiceDay, zone, timeColumn, false, excludedTripIds);
         }
 
         // If still no match and a directionId was specified, retry without direction constraint.
@@ -731,12 +806,12 @@ public class TripFinder {
         if (result == null && directionId != null) {
             result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                               journeyNote, journeyNoteDetailled, null,
-                                              serviceDay, zone, timeColumn, false);
+                                              serviceDay, zone, timeColumn, false, excludedTripIds);
             if (result == null && isEarlyMorning) {
                 LocalDate previousServiceDay = serviceDay.minusDays(1);
                 result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                                   journeyNote, journeyNoteDetailled, null,
-                                                  previousServiceDay, zone, timeColumn, false);
+                                                  previousServiceDay, zone, timeColumn, false, excludedTripIds);
             }
         }
 
@@ -744,28 +819,29 @@ public class TripFinder {
         if (result == null && destinationId != null) {
             result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                               journeyNote, journeyNoteDetailled, directionId,
-                                              serviceDay, zone, timeColumn, true);
+                                              serviceDay, zone, timeColumn, true, excludedTripIds);
             if (result == null && isEarlyMorning) {
                 LocalDate previousServiceDay = serviceDay.minusDays(1);
                 result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                                   journeyNote, journeyNoteDetailled, directionId,
-                                                  previousServiceDay, zone, timeColumn, true);
+                                                  previousServiceDay, zone, timeColumn, true, excludedTripIds);
             }
             if (result == null && directionId != null) {
                 result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                                   journeyNote, journeyNoteDetailled, null,
-                                                  serviceDay, zone, timeColumn, true);
+                                                  serviceDay, zone, timeColumn, true, excludedTripIds);
                 if (result == null && isEarlyMorning) {
                     LocalDate previousServiceDay = serviceDay.minusDays(1);
                     result = searchTripsForServiceDay(routeId, estimatedCalls, isArrivalTime, destinationId,
                                                       journeyNote, journeyNoteDetailled, null,
-                                                      previousServiceDay, zone, timeColumn, true);
+                                                      previousServiceDay, zone, timeColumn, true, excludedTripIds);
                 }
             }
         }
         
-        // Cache and return result
-        findTripCache.put(cacheKey, result);
+        if (cacheable) {
+            findTripCache.put(cacheKey, result);
+        }
         return result;
     }
 
@@ -786,7 +862,8 @@ public class TripFinder {
         LocalDate serviceDay,
         ZoneId zone,
         String timeColumn,
-        boolean partialDestination
+        boolean partialDestination,
+        Set<String> excludedTripIds
     ) throws SQLException {
         // Prepare query parameters
         String yyyymmdd = serviceDay.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
@@ -803,6 +880,10 @@ public class TripFinder {
             yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote
         );
         Map<String, Map<String, List<Integer>>> tripStopTimes = fetchCandidateTrips(query, queryParams);
+
+        if (excludedTripIds != null && !excludedTripIds.isEmpty()) {
+            tripStopTimes.keySet().removeAll(excludedTripIds);
+        }
 
         if (tripStopTimes.isEmpty()) {
             return null;

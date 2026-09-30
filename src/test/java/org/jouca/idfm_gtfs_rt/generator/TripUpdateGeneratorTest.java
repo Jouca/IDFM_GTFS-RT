@@ -2596,4 +2596,35 @@ class TripUpdateGeneratorTest {
         assertDoesNotThrow(() -> method.invoke(generator, feedMessage));
         assertEquals(0, feedMessage.getEntityCount());
     }
+
+    @Test
+    void testCachedBlacklistedTripEntityKeepsStaticStopSequences() throws Exception {
+        java.lang.reflect.Field cacheField = TripFinder.class.getDeclaredField("allStopTimesCache");
+        cacheField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, java.util.List<String>> cache =
+            (java.util.Map<String, java.util.List<String>>) cacheField.get(null);
+        // Static GTFS numbering starting at 0, as IDFM publishes for many trips.
+        cache.put("seqTrip", java.util.List.of("IDFM:A,100,110,0", "IDFM:B,200,210,1", "IDFM:C,300,310,2"));
+        try {
+            java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+                "buildCachedBlacklistedTripEntity", TripFinder.TripMeta.class, Integer.class, String.class,
+                long.class, long.class);
+            method.setAccessible(true);
+            TripFinder.TripMeta meta = new TripFinder.TripMeta("seqTrip", "IDFM:R", 0, 100, 300, "20260901");
+
+            com.google.transit.realtime.GtfsRealtime.FeedEntity entity =
+                (com.google.transit.realtime.GtfsRealtime.FeedEntity) method.invoke(generator, meta, 0, "IDFM:R", 0L, 0L);
+
+            assertNotNull(entity);
+            com.google.transit.realtime.GtfsRealtime.TripUpdate tu = entity.getTripUpdate();
+            assertEquals(3, tu.getStopTimeUpdateCount());
+            assertEquals(0, tu.getStopTimeUpdate(0).getStopSequence());
+            assertEquals("IDFM:A", tu.getStopTimeUpdate(0).getStopId());
+            assertEquals(1, tu.getStopTimeUpdate(1).getStopSequence());
+            assertEquals(2, tu.getStopTimeUpdate(2).getStopSequence());
+        } finally {
+            cache.remove("seqTrip");
+        }
+    }
 }

@@ -1073,6 +1073,13 @@ public class TripUpdateGenerator {
             }
         }
 
+        JourneyDeduplicator.Result merged = JourneyDeduplicator.mergeMirroredJourneys(normalEntities);
+        if (merged.dropped() > 0) {
+            System.out.println("Dropped " + merged.dropped()
+                    + " journeys published twice by mirrored producers (kept the freshest).");
+            normalEntities = new ArrayList<>(merged.kept());
+        }
+
         sortEntitiesByTime(normalEntities);
         System.out.println("Processing " + normalEntities.size() + " normal entities and "
                 + blacklistedEntities.size() + " blacklisted entities...");
@@ -1103,11 +1110,30 @@ public class TripUpdateGenerator {
 
         builtEntities.addAll(blacklistedBuilt);
 
-        addEntitiesToFeed(builtEntities, feedMessage);
+        addEntitiesToFeed(dropElapsedStops(builtEntities), feedMessage);
         cleanupStaleTripStates();
 
         System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
         exportDebugData(entitiesTrips);
+    }
+
+    /** Strips elapsed stops from every entity and drops the trips that have nothing left to predict. */
+    private List<IndexedEntity> dropElapsedStops(List<IndexedEntity> entities) {
+        long now = Instant.now().getEpochSecond();
+        List<IndexedEntity> result = new ArrayList<>(entities.size());
+        int dropped = 0;
+        for (IndexedEntity indexed : entities) {
+            GtfsRealtime.FeedEntity pruned = ElapsedStopPruner.prune(indexed.entity(), now);
+            if (pruned == null) {
+                dropped++;
+            } else {
+                result.add(pruned == indexed.entity() ? indexed : new IndexedEntity(indexed.index(), pruned));
+            }
+        }
+        if (dropped > 0) {
+            System.out.println("Dropped " + dropped + " trips with no upcoming stop left.");
+        }
+        return result;
     }
 
     /**
@@ -1193,8 +1219,10 @@ public class TripUpdateGenerator {
     }
 
     /**
-     * Processes entities in parallel using a thread pool.
-     * 
+     * Processes normal entities in three steps: match every vehicle to a trip in parallel, give
+     * each trip to a single vehicle ({@link TripClaimResolver}), then build the TripUpdates in
+     * parallel.
+     *
      * @param entities      the list of entities to process
      * @param entitiesTrips optional map for debug output
      * @return list of successfully processed indexed entities
@@ -1208,8 +1236,24 @@ public class TripUpdateGenerator {
                 .newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
         List<IndexedEntity> builtEntities = new ArrayList<>();
         try {
-            List<Future<IndexedEntity>> futures = submitEntityProcessingTasks(entities, entitiesTrips, executor);
-            builtEntities = collectFutureResults(futures, total);
+            List<Future<MatchedEntity>> matchFutures = new ArrayList<>(total);
+            for (int idx = 0; idx < total; idx++) {
+                final int index = idx;
+                final JsonNode entity = entities.get(idx);
+                matchFutures.add(executor.submit(() -> matchEntity(entity, index)));
+            }
+            List<MatchedEntity> matched = collectFutureResults(matchFutures, total);
+            matched = resolveTripClaims(matched);
+
+            List<Future<IndexedEntity>> buildFutures = new ArrayList<>(matched.size());
+            for (MatchedEntity m : matched) {
+                buildFutures.add(executor.submit((Callable<IndexedEntity>) () -> buildEntityForMatch(m, entitiesTrips)));
+            }
+            for (IndexedEntity built : collectFutureResults(buildFutures, matched.size())) {
+                if (built.entity() != null) {
+                    builtEntities.add(built);
+                }
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             logger.error("Thread interrupted during parallel processing of {} SIRI Lite entities: {}", total,
@@ -1221,26 +1265,6 @@ public class TripUpdateGenerator {
             shutdownExecutor(executor);
         }
         return builtEntities;
-    }
-
-    /**
-     * Submits entity processing tasks to the executor.
-     * 
-     * @param entities      the list of entities to process
-     * @param entitiesTrips optional map for debug output
-     * @param executor      the executor service
-     * @return list of futures for the submitted tasks
-     */
-    private List<Future<IndexedEntity>> submitEntityProcessingTasks(List<JsonNode> entities,
-            Map<String, JsonNode> entitiesTrips, ExecutorService executor) {
-        List<Future<IndexedEntity>> futures = new ArrayList<>(entities.size());
-        for (int idx = 0; idx < entities.size(); idx++) {
-            final int index = idx;
-            final JsonNode entity = entities.get(idx);
-            futures.add(executor
-                    .submit((Callable<IndexedEntity>) () -> processEntity(entity, index, entitiesTrips)));
-        }
-        return futures;
     }
 
     /**
@@ -1333,7 +1357,6 @@ public class TripUpdateGenerator {
         }
         tripUpdate.getVehicleBuilder().setId(state.vehicleId);
 
-        int seq = 1;
         for (String row : allTheoreticalStops) {
             String[] parts = row.split(",", 4);
             if (parts.length < 4)
@@ -1343,7 +1366,7 @@ public class TripUpdateGenerator {
             long theoreticalDep = parseSec(parts[2], serviceDayStartEpoch);
 
             GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stu = tripUpdate.addStopTimeUpdateBuilder();
-            stu.setStopSequence(seq++);
+            stu.setStopSequence(Integer.parseInt(parts[3]));
             stu.setStopId(stopId);
 
             if (theoreticalArr != Long.MIN_VALUE) {
@@ -1392,7 +1415,6 @@ public class TripUpdateGenerator {
             tripDescriptor.setStartDate(tripMeta.startDate);
         }
 
-        int seq = 1;
         for (String row : allTheoreticalStops) {
             String[] parts = row.split(",", 4);
             if (parts.length < 4)
@@ -1402,7 +1424,7 @@ public class TripUpdateGenerator {
             long theoreticalDep = parseSec(parts[2], serviceDayStartEpoch);
 
             GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stu = tripUpdate.addStopTimeUpdateBuilder();
-            stu.setStopSequence(seq++);
+            stu.setStopSequence(Integer.parseInt(parts[3]));
             stu.setStopId(stopId);
 
             if (theoreticalArr != Long.MIN_VALUE) {
@@ -1472,29 +1494,30 @@ public class TripUpdateGenerator {
     }
 
 
+    /** Everything derived from one SIRI journey that matching and building both need. */
+    private record PreparedEntity(int index, JsonNode entity, String lineId, String vehicleId,
+            DirectionInfo directionInfo, String destinationId, List<JsonNode> estimatedCalls,
+            List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> expectedCalls,
+            List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> aimedCalls) {
+
+        /** The timetable-based call list when the journey has one, otherwise the predicted times. */
+        List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> preferredCalls() {
+            return aimedCalls != null ? aimedCalls : expectedCalls;
+        }
+    }
+
+    /** A journey with the trip it was matched to ({@code tripId} is null when nothing matched). */
+    private record MatchedEntity(PreparedEntity prepared, String tripId, TripFinder.TripFit fit,
+            boolean authoritative, boolean cached) {
+    }
+
     /**
-     * Processes a single EstimatedVehicleJourney entity from SIRI Lite data.
-     * 
-     * <p>
-     * This method performs the core trip matching and entity building:
-     * <ol>
-     * <li>Extracts line, vehicle, destination, and direction information</li>
-     * <li>Checks if vehicle already has a cached trip assignment</li>
-     * <li>If not cached, builds a list of estimated calls and matches to a
-     * theoretical GTFS trip</li>
-     * <li>Updates trip state and vehicle associations</li>
-     * <li>Builds a GTFS-RT TripUpdate entity with stop time predictions</li>
-     * <li>Handles canceled trips and skipped stops</li>
-     * </ol>
-     * 
-     * @param entity        the SIRI Lite EstimatedVehicleJourney JSON node
-     * @param index         the original position in the input list (for ordering)
-     * @param entitiesTrips optional map for debug output
-     * @param context       processing context for tracking statistics
-     * @return an IndexedEntity containing the built GTFS-RT entity, or null if
-     *         processing fails
+     * Prepares one SIRI journey and matches it to a GTFS trip. No feed entity is built and no trip
+     * state is written here: the attribution can still change when two vehicles want the same trip.
+     *
+     * @return the matched journey, or null when the journey cannot be processed
      */
-    private IndexedEntity processEntity(JsonNode entity, int index, Map<String, JsonNode> entitiesTrips) {
+    private MatchedEntity matchEntity(JsonNode entity, int index) {
         // Blacklisted operators are handled separately by processAllBlacklistedEntities
         if (isOperatorBlacklisted(entity)) {
             return null;
@@ -1510,19 +1533,25 @@ public class TripUpdateGenerator {
             return null;
 
         List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
-        List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList = buildEstimatedCallList(estimatedCalls);
+        List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> expectedCalls = buildEstimatedCallList(estimatedCalls);
 
-        if (lineId.isEmpty() || estimatedCallList.isEmpty()) {
+        if (lineId.isEmpty() || expectedCalls.isEmpty()) {
             return null;
         }
+        PreparedEntity prepared = new PreparedEntity(index, entity, lineId, vehicleId, directionInfo, destinationId,
+                estimatedCalls, expectedCalls, buildAimedCallList(estimatedCalls, expectedCalls));
 
         // Check if this vehicle already has a cached trip assignment
         String tripId = vehicleToTrip.get(vehicleId);
+        boolean cached = false;
+        boolean authoritative = false;
 
         if (tripId != null) {
             // Verify the cached trip is still valid (exists in GTFS, matches the line, and
             // is temporally close)
-            if (!isCachedTripValid(tripId, lineId, estimatedCalls)) {
+            if (isCachedTripValid(tripId, lineId, estimatedCalls)) {
+                cached = true;
+            } else {
                 vehicleToTrip.remove(vehicleId);
                 tripStates.remove(tripId);
                 tripId = null;
@@ -1534,38 +1563,96 @@ public class TripUpdateGenerator {
             // First try direct vehicle-ref lookup (works for SNCF/Transilien whose UUID
             // appears in trip_id)
             tripId = TripFinder.findTripIdByVehicleRef(vehicleId, lineId);
+            authoritative = tripId != null;
             if (tripId == null) {
-                tripId = findTripId(lineId, estimatedCallList, estimatedCalls, destinationId, directionInfo);
+                tripId = findTripId(prepared, Set.of());
             }
+        }
+        if (tripId != null && tripId.isEmpty()) {
+            tripId = null;
+        }
+
+        TripFinder.TripFit fit = tripId == null ? null
+                : TripFinder.fitAgainstTrip(tripId, prepared.preferredCalls());
+        return new MatchedEntity(prepared, tripId, fit, authoritative, cached);
+    }
+
+    /**
+     * Makes sure each trip is attributed to a single vehicle. Vehicles that lose a trip are
+     * re-matched without it, or dropped when no other trip fits them.
+     */
+    private List<MatchedEntity> resolveTripClaims(List<MatchedEntity> matched) {
+        Map<String, MatchedEntity> byVehicle = new java.util.LinkedHashMap<>();
+        List<MatchedEntity> unmatched = new ArrayList<>();
+        List<TripClaimResolver.Claim> claims = new ArrayList<>();
+        for (MatchedEntity m : matched) {
+            if (m.tripId() == null) {
+                unmatched.add(m);
+            } else if (byVehicle.putIfAbsent(m.prepared().vehicleId(), m) == null) {
+                claims.add(new TripClaimResolver.Claim(m.prepared().vehicleId(), m.tripId(), m.fit(),
+                        m.authoritative(), m.cached()));
+            }
+        }
+
+        TripClaimResolver.Outcome outcome = TripClaimResolver.resolve(claims, (vehicleId, excluded) -> {
+            PreparedEntity p = byVehicle.get(vehicleId).prepared();
+            String tripId = findTripId(p, excluded);
             if (tripId == null || tripId.isEmpty()) {
-                // No GTFS trip could be matched to this real, live-tracked vehicle — emit it as
-                // ADDED rather than silently dropping it. IDFM's own ExtraJourney flag on SIRI
-                // entities is not a reliable signal to gate this on: in practice it is never set
-                // to true even for vehicles that genuinely have no GTFS counterpart, so relying
-                // on it meant real vehicles vanished from the feed with no trace whenever
-                // matching failed.
-                GtfsRealtime.FeedEntity extraEntity = buildExtraJourneyFeedEntity(
-                        vehicleId, lineId, directionInfo.directionIdForMatching(), estimatedCalls);
-                if (extraEntity == null)
-                    return null;
-                return new IndexedEntity(index, extraEntity);
+                return null;
             }
+            return new TripClaimResolver.Claim(vehicleId, tripId,
+                    TripFinder.fitAgainstTrip(tripId, p.preferredCalls()), false, false);
+        });
+
+        List<MatchedEntity> result = new ArrayList<>(unmatched);
+        for (Map.Entry<String, TripClaimResolver.Claim> entry : outcome.assigned().entrySet()) {
+            MatchedEntity original = byVehicle.get(entry.getKey());
+            TripClaimResolver.Claim claim = entry.getValue();
+            result.add(claim.tripId().equals(original.tripId()) ? original
+                    : new MatchedEntity(original.prepared(), claim.tripId(), claim.fit(), false, false));
+        }
+        for (String vehicleId : outcome.dropped()) {
+            MatchedEntity lost = byVehicle.get(vehicleId);
+            vehicleToTrip.remove(vehicleId, lost.tripId());
+        }
+        if (!outcome.dropped().isEmpty() || outcome.reassigned() > 0) {
+            System.out.println("Trip attribution: " + outcome.reassigned() + " vehicles moved to another trip, "
+                    + outcome.dropped().size() + " dropped (trip already served by a better-fitting vehicle).");
+        }
+        return result;
+    }
+
+    /** Builds the feed entity for a journey once its trip is settled. */
+    private IndexedEntity buildEntityForMatch(MatchedEntity matched, Map<String, JsonNode> entitiesTrips) {
+        PreparedEntity p = matched.prepared();
+        String tripId = matched.tripId();
+
+        if (tripId == null) {
+            // No GTFS trip could be matched to this real, live-tracked vehicle — emit it as
+            // ADDED rather than silently dropping it. IDFM's own ExtraJourney flag on SIRI
+            // entities is not a reliable signal to gate this on: in practice it is never set
+            // to true even for vehicles that genuinely have no GTFS counterpart, so relying
+            // on it meant real vehicles vanished from the feed with no trace whenever
+            // matching failed.
+            GtfsRealtime.FeedEntity extraEntity = buildExtraJourneyFeedEntity(
+                    p.vehicleId(), p.lineId(), p.directionInfo().directionIdForMatching(), p.estimatedCalls());
+            return extraEntity == null ? null : new IndexedEntity(p.index(), extraEntity);
         }
 
         // Determine service date based on the trip's theoretical GTFS schedule
         String serviceDate = determineServiceDateFromTrip(tripId);
         TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId, serviceDate);
 
-        TripState state = updateTripState(tripId, vehicleId, tripMeta);
+        TripState state = updateTripState(tripId, p.vehicleId(), tripMeta);
 
         GtfsRealtime.FeedEntity feedEntity = buildFeedEntity(tripId, state, tripMeta,
-                directionInfo.directionIdForMatching(),
-                lineId, estimatedCalls, destinationId);
+                p.directionInfo().directionIdForMatching(),
+                p.lineId(), p.estimatedCalls(), p.destinationId());
 
         if (entitiesTrips != null) {
-            entitiesTrips.put(tripId, entity);
+            entitiesTrips.put(tripId, p.entity());
         }
-        return new IndexedEntity(index, feedEntity);
+        return new IndexedEntity(p.index(), feedEntity);
     }
 
     /**
@@ -1842,6 +1929,41 @@ public class TripUpdateGenerator {
     }
 
     /**
+     * Builds the call list from the timetable (aimed) times, falling back to the predicted time
+     * for calls that have no aimed time.
+     *
+     * @return the list, or null when no call has an aimed time or the result would equal the
+     *         predicted-time list (so there is nothing new to try)
+     */
+    private List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> buildAimedCallList(List<JsonNode> estimatedCalls,
+            List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> expectedCalls) {
+        List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> aimedCalls = new ArrayList<>();
+        boolean anyAimed = false;
+        for (JsonNode call : estimatedCalls) {
+            String stopCode = call.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
+            String stopId = TripFinder.resolveStopId(stopCode);
+            if (stopId == null)
+                continue;
+
+            String isoTime = null;
+            if (call.hasNonNull(FIELD_AIMED_ARRIVAL_TIME)) {
+                isoTime = call.get(FIELD_AIMED_ARRIVAL_TIME).asText();
+            } else if (call.hasNonNull(FIELD_AIMED_DEPARTURE_TIME)) {
+                isoTime = call.get(FIELD_AIMED_DEPARTURE_TIME).asText();
+            }
+            if (isoTime != null) {
+                anyAimed = true;
+            } else {
+                isoTime = extractTimeFromCall(call);
+            }
+            if (isoTime != null) {
+                aimedCalls.add(new org.jouca.idfm_gtfs_rt.records.EstimatedCall(stopId, isoTime));
+            }
+        }
+        return anyAimed && !aimedCalls.equals(expectedCalls) ? aimedCalls : null;
+    }
+
+    /**
      * Extracts the first available time value from an estimated call.
      * 
      * @param call the estimated call JSON node
@@ -1860,6 +1982,20 @@ public class TripUpdateGenerator {
         return null;
     }
 
+    private String findTripId(PreparedEntity p, Set<String> excludedTripIds) {
+        // The timetable times identify the course exactly, whatever the current delay; the
+        // predicted times only help when no timetable time is published or it matches nothing.
+        if (p.aimedCalls() != null) {
+            String result = findTripId(p.lineId(), p.aimedCalls(), p.estimatedCalls(), p.destinationId(),
+                    p.directionInfo(), excludedTripIds);
+            if (result != null) {
+                return result;
+            }
+        }
+        return findTripId(p.lineId(), p.expectedCalls(), p.estimatedCalls(), p.destinationId(),
+                p.directionInfo(), excludedTripIds);
+    }
+
     /**
      * Finds the GTFS trip ID that matches the real-time data.
      * 
@@ -1868,10 +2004,12 @@ public class TripUpdateGenerator {
      * @param estimatedCalls    the original JSON nodes
      * @param destinationId     the destination stop ID
      * @param directionInfo     the direction information
+     * @param excludedTripIds   trips that must not be returned (already taken)
      * @return the matched trip ID, or null if not found
      */
     private String findTripId(String lineId, List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> estimatedCallList,
-            List<JsonNode> estimatedCalls, String destinationId, DirectionInfo directionInfo) {
+            List<JsonNode> estimatedCalls, String destinationId, DirectionInfo directionInfo,
+            Set<String> excludedTripIds) {
         boolean isArrivalTime = !estimatedCallList.isEmpty() &&
                 (estimatedCalls.get(0).has(FIELD_EXPECTED_ARRIVAL_TIME) ||
                         estimatedCalls.get(0).has(FIELD_AIMED_ARRIVAL_TIME));
@@ -1879,13 +2017,13 @@ public class TripUpdateGenerator {
         try {
             String result = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime,
                     destinationId, directionInfo.journeyNote(), directionInfo.journeyNoteDetailled(),
-                    directionInfo.directionIdForMatching());
+                    directionInfo.directionIdForMatching(), excludedTripIds);
 
             // If journey-note matching failed (non-RATP notes only), retry using direction
             // instead
             if (result == null && directionInfo.journeyNote() != null && !directionInfo.journeyNoteDetailled()) {
                 result = TripFinder.findTripIdFromEstimatedCalls(lineId, estimatedCallList, isArrivalTime,
-                        destinationId, null, false, directionInfo.fallbackDirectionId());
+                        destinationId, null, false, directionInfo.fallbackDirectionId(), excludedTripIds);
             }
 
             return result;
@@ -2526,14 +2664,14 @@ public class TripUpdateGenerator {
      *                              results
      * @throws ExecutionException   if an entity processing task threw an exception
      */
-    private List<IndexedEntity> collectFutureResults(List<Future<IndexedEntity>> futures, int total)
+    private <T> List<T> collectFutureResults(List<Future<T>> futures, int total)
             throws InterruptedException, ExecutionException {
-        List<IndexedEntity> builtEntities = new ArrayList<>();
+        List<T> results = new ArrayList<>();
         for (int i = 0; i < futures.size(); i++) {
             try {
-                IndexedEntity result = futures.get(i).get();
-                if (result != null && result.entity() != null) {
-                    builtEntities.add(result);
+                T result = futures.get(i).get();
+                if (result != null) {
+                    results.add(result);
                 }
             } catch (InterruptedException e) {
                 logger.error("Thread interrupted while processing entity index {}: {}", i, e.getMessage(), e);
@@ -2543,7 +2681,7 @@ public class TripUpdateGenerator {
             }
             renderProgressBar(i + 1, total);
         }
-        return builtEntities;
+        return results;
     }
 
     /**
@@ -3084,7 +3222,6 @@ public class TripUpdateGenerator {
 
         long lastRealTime = Long.MIN_VALUE;
         long lastTheoRef = Long.MIN_VALUE;
-        int seq = 1;
 
         for (String row : stopRows) {
             String[] parts = row.split(",", 4);
@@ -3100,7 +3237,7 @@ public class TripUpdateGenerator {
             Long rtTime = refSeq != null ? trajectory.get(refSeq) : null;
 
             GtfsRealtime.TripUpdate.StopTimeUpdate.Builder stu = tripUpdate.addStopTimeUpdateBuilder();
-            stu.setStopSequence(seq++);
+            stu.setStopSequence(Integer.parseInt(parts[3]));
             stu.setStopId(stopId);
 
             if (rtTime != null) {
@@ -3439,6 +3576,21 @@ public class TripUpdateGenerator {
         }
 
         if (tripUpdate.getStopTimeUpdateCount() == 0) {
+            return null;
+        }
+
+        // An added trip has no static schedule to take its service date from: use the day of its first predicted stop
+        for (GtfsRealtime.TripUpdate.StopTimeUpdate stu : tripUpdate.getStopTimeUpdateList()) {
+            long first = stu.hasDeparture() ? stu.getDeparture().getTime()
+                    : stu.hasArrival() ? stu.getArrival().getTime() : 0;
+            if (first > 0) {
+                tripDescriptor.setStartDate(Instant.ofEpochSecond(first).atZone(ZONE_ID).toLocalDate()
+                        .format(DateTimeFormatter.BASIC_ISO_DATE));
+                break;
+            }
+        }
+        // Nothing but skipped stops: no vehicle is predicted anywhere, so there is no trip to add
+        if (tripDescriptor.getStartDate().isEmpty()) {
             return null;
         }
 

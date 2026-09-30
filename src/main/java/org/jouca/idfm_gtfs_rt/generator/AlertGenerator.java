@@ -452,7 +452,7 @@ public class AlertGenerator {
         feed.setHeader(GtfsRealtime.FeedHeader.newBuilder()
             .setGtfsRealtimeVersion("2.0")
             .setIncrementality(GtfsRealtime.FeedHeader.Incrementality.FULL_DATASET)
-            .setTimestamp(System.currentTimeMillis()));
+            .setTimestamp(System.currentTimeMillis() / 1000L));
 
         try (FileOutputStream output = new FileOutputStream("gtfs-rt-alerts-idfm.pb")) {
             feed.build().writeTo(output);
