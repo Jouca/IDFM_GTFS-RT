@@ -760,4 +760,49 @@ class AlertGeneratorTest {
         assertFalse(closures.get(0).noThroughTraffic(),
             "a detourable \"déviée\" bus line continues past the section normally");
     }
+    @Test
+    void informationSeverityIsMappedToInfoLevel() throws Exception {
+        java.lang.reflect.Method method = AlertGenerator.class.getDeclaredMethod("mapSeverityLevel", String.class);
+        method.setAccessible(true);
+        AlertGenerator alertGenerator = new AlertGenerator();
+        assertEquals(com.google.transit.realtime.GtfsRealtime.Alert.SeverityLevel.INFO, method.invoke(alertGenerator, "INFORMATION"));
+        assertEquals(com.google.transit.realtime.GtfsRealtime.Alert.SeverityLevel.SEVERE, method.invoke(alertGenerator, "BLOQUANTE"));
+        assertEquals(com.google.transit.realtime.GtfsRealtime.Alert.SeverityLevel.UNKNOWN_SEVERITY, method.invoke(alertGenerator, "AUTRE"));
+    }
+
+    @Test
+    void closureOfAnotherLineSharingTheStopsIsNotAppliedToThisLine() throws Exception {
+        // Real case: "Bus N62 : Travaux - Arrêt(s) non desservi(s)" is also attached by IDFM to the
+        // TVM, which only shares the stops; the TVM trips still call there.
+        String siriData = """
+            {
+                "disruptions": [
+                    {
+                        "id": "d1",
+                        "applicationPeriods": [{"begin": "20260906T044500", "end": "20270101T043000"}],
+                        "cause": "TRAVAUX",
+                        "severity": "BLOQUANTE",
+                        "title": "Bus N62 : Travaux - Arrêt(s) non desservi(s)",
+                        "message": "La ligne N62 est déviée"
+                    }
+                ],
+                "lines": [
+                    {
+                        "id": "line:IDFM:C01071", "name": "TVM", "shortName": "TVM", "mode": "bus", "networkId": "IDFM",
+                        "impactedObjects": [{"id": "stop_point:IDFM:26759", "type": "stop_point", "name": "Docteur Ténine", "disruptionIds": ["d1"]}]
+                    },
+                    {
+                        "id": "line:IDFM:C01403", "name": "N62", "shortName": "N62", "mode": "bus", "networkId": "IDFM",
+                        "impactedObjects": [{"id": "stop_point:IDFM:26759", "type": "stop_point", "name": "Docteur Ténine", "disruptionIds": ["d1"]}]
+                    }
+                ]
+            }
+            """;
+
+        List<org.jouca.idfm_gtfs_rt.records.StopClosure> closures =
+            generator.computeStopClosures(objectMapper.readTree(siriData));
+
+        assertEquals(1, closures.size());
+        assertEquals("IDFM:C01403", closures.get(0).routeId());
+    }
 }

@@ -301,7 +301,8 @@ public class TripFinder {
         Integer directionId,
         String journeyNote,
         boolean journeyNoteDetailled,
-        boolean partialDestination
+        boolean partialDestination,
+        boolean hasDestination
     ) {
         StringBuilder query = new StringBuilder("""
             WITH valid_services AS (
@@ -340,7 +341,8 @@ public class TripFinder {
             query.append("AND t.direction_id = ?\n");
         }
 
-        if (partialDestination) {
+        // Without a known destination stop the times alone identify the trip
+        if (hasDestination && partialDestination) {
             query.append("""
                 AND (
                     st.trip_id NOT NULL
@@ -351,7 +353,7 @@ public class TripFinder {
                     )
                 )
             """);
-        } else {
+        } else if (hasDestination) {
             query.append("""
                 AND (
                     st.trip_id NOT NULL
@@ -408,7 +410,9 @@ public class TripFinder {
             stmt.setInt(i++, params.directionId);
         }
         
-        stmt.setString(i++, params.destinationId);
+        if (params.destinationId != null) {
+            stmt.setString(i++, params.destinationId);
+        }
 
         if (params.journeyNote != null && params.journeyNote.length() == 4) {
             stmt.setString(i, params.journeyNote);
@@ -687,20 +691,35 @@ public class TripFinder {
         if (id.isEmpty()) {
             return null;
         }
-        String query = "SELECT trip_id FROM trips WHERE trip_id LIKE ? AND route_id = ? LIMIT 1";
+        String query = "SELECT trip_id FROM trips WHERE trip_id LIKE ? AND route_id = ?";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement stmt = conn.prepareStatement(query)) {
             stmt.setString(1, "%" + id);
             stmt.setString(2, routeId);
             try (ResultSet rs = stmt.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getString("trip_id");
+                while (rs.next()) {
+                    String tripId = rs.getString("trip_id");
+                    if (endsWithWholeId(tripId, id)) {
+                        return tripId;
+                    }
                 }
             }
         } catch (SQLException e) {
-            logger.debug("findTripIdByVehicleRef error for vehicleRef={}: {}", vehicleRef, e.getMessage());
+            logger.warn("findTripIdByVehicleRef error for vehicleRef={}: {}", vehicleRef, e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * True when {@code tripId} ends with {@code id} as a whole token, so that the short id
+     * {@code 2776} does not match a trip {@code ...:21882776} that is a different course.
+     */
+    static boolean endsWithWholeId(String tripId, String id) {
+        if (tripId == null || id == null || !tripId.endsWith(id)) {
+            return false;
+        }
+        int before = tripId.length() - id.length() - 1;
+        return before < 0 || !Character.isLetterOrDigit(tripId.charAt(before));
     }
 
     /**
@@ -875,7 +894,7 @@ public class TripFinder {
             .toList();
 
         // Build query and fetch candidate trips from database
-        String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled, partialDestination);
+        String query = buildTripFinderQuery(timeColumn, allStopIds, directionId, journeyNote, journeyNoteDetailled, partialDestination, destinationId != null);
         TripQueryParameters queryParams = new TripQueryParameters(
             yyyymmdd, weekday, routeId, allStopIds, directionId, destinationId, journeyNote
         );
@@ -958,7 +977,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error getting route type for route: {}", routeId, e);
+            logger.warn("Error getting route type for route: {}", routeId, e);
         }
         
         return 3; // Default to Bus if not found
@@ -1201,7 +1220,7 @@ public class TripFinder {
             // populate cache
             allStopTimesCache.put(tripId, results);
         } catch (SQLException e) {
-            logger.debug("Error getting all stop times for trip: {}", tripId, e);
+            logger.warn("Error getting all stop times for trip: {}", tripId, e);
         }
 
         return results;
@@ -1250,7 +1269,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error building SIRI code map for trip {}: {}", tripId, e.getMessage());
+            logger.warn("Error building SIRI code map for trip {}: {}", tripId, e.getMessage());
         }
         return result;
     }
@@ -1291,7 +1310,7 @@ public class TripFinder {
                     }
                 }
             } catch (SQLException e) {
-                logger.debug("Error getting stop sequences for trip: {}", tripId, e);
+                logger.warn("Error getting stop sequences for trip: {}", tripId, e);
             }
             stopSequencesCache.put(tripId, seqMap);
         }
@@ -1343,7 +1362,7 @@ public class TripFinder {
                 }
             }
         } catch (Exception e) {
-            logger.debug("Error finding child stop ID for stopId: {} and tripId: {}", stopId, tripId, e);
+            logger.warn("Error finding child stop ID for stopId: {} and tripId: {}", stopId, tripId, e);
         }
 
         return childStopId;
@@ -1385,7 +1404,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error resolving stop ids for parent station: {}", parentStationId, e);
+            logger.warn("Error resolving stop ids for parent station: {}", parentStationId, e);
         }
 
         parentStationChildrenCache.put(parentStationId, result);
@@ -1441,7 +1460,7 @@ public class TripFinder {
                 }
             }
         } catch (Exception e) {
-            logger.debug("Error finding stop ID from code: {}", stopCode, e);
+            logger.warn("Error finding stop ID from code: {}", stopCode, e);
         }
         return null;
     }
@@ -1488,7 +1507,7 @@ public class TripFinder {
                 if (rs.next()) return rs.getString(COL_STOP_ID);
             }
         } catch (Exception e) {
-            logger.debug("Error finding stop by parent+platform: stopCode={}, platform={}", stopCode, platformCode, e);
+            logger.warn("Error finding stop by parent+platform: stopCode={}, platform={}", stopCode, platformCode, e);
         }
         return null;
     }
@@ -1520,7 +1539,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error finding stop ID from extension: {}", stopExtension, e);
+            logger.warn("Error finding stop ID from extension: {}", stopExtension, e);
         }
         return null;
     }
@@ -1721,7 +1740,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error finding direction ID for trip: {}", tripId, e);
+            logger.warn("Error finding direction ID for trip: {}", tripId, e);
         }
         return null;
     }
@@ -1826,7 +1845,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error getting active trips for route IDs on date {}", date, e);
+            logger.warn("Error getting active trips for route IDs on date {}", date, e);
         }
         return result;
     }
@@ -1886,7 +1905,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error getting trip metadata for trip: {}", tripId, e);
+            logger.warn("Error getting trip metadata for trip: {}", tripId, e);
         }
         return null;
     }
@@ -1931,7 +1950,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error getting first stop time for trip: {}", tripId, e);
+            logger.warn("Error getting first stop time for trip: {}", tripId, e);
         }
         return null;
     }
@@ -1963,7 +1982,7 @@ public class TripFinder {
                 }
             }
         } catch (SQLException e) {
-            logger.debug("Error getting last stop time for trip: {}", tripId, e);
+            logger.warn("Error getting last stop time for trip: {}", tripId, e);
         }
         return null;
     }

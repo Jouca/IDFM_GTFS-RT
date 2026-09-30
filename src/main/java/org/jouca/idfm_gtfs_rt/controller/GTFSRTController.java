@@ -120,6 +120,7 @@ public class GTFSRTController {
      *         or empty, or HTTP status 500 (INTERNAL_SERVER_ERROR) if there's an error reading
      *         or parsing the data
      */
+    @org.springframework.context.annotation.Profile("debug")
     @PostMapping("/getEntities")
     public ResponseEntity<String> getEntity(@RequestParam("tripIds") String tripIdsParam) {
         HttpHeaders headers = new HttpHeaders();
@@ -276,4 +277,4 @@ public class GTFSRTController {
             return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
-}
+}

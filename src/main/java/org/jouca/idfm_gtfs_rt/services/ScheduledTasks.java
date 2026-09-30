@@ -161,7 +161,7 @@ public class ScheduledTasks {
                 alertGenerator.generateAlert();
                 System.out.println("[Alerts] GTFS-RT generated !");
             } catch (Exception e) {
-                logger.debug("Error generating alerts GTFS-RT", e);
+                logger.error("Error generating alerts GTFS-RT: {}", e.getMessage(), e);
             } finally {
                 lockAlertUpdate.unlock();
             }
@@ -202,7 +202,7 @@ public class ScheduledTasks {
                 gtfsrtGenerator.generateGTFSRT();
                 System.out.println("[Trips] GTFS-RT generated !");
             } catch (Exception e) {
-                logger.debug("Error generating trip updates GTFS-RT", e);
+                logger.error("Error generating trip updates GTFS-RT: {}", e.getMessage(), e);
             } finally {
                 lockTripUpdate.unlock();
             }

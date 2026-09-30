@@ -1145,8 +1145,22 @@ public class TripUpdateGenerator {
     private List<JsonNode> extractEntitiesFromSiriLite(JsonNode siriLiteData) {
         List<JsonNode> entities = new ArrayList<>();
         siriLiteData.get("Siri").get("ServiceDelivery").get("EstimatedTimetableDelivery").get(0)
-                .get("EstimatedJourneyVersionFrame").get(0).get("EstimatedVehicleJourney").forEach(entities::add);
+                .get("EstimatedJourneyVersionFrame").get(0).get("EstimatedVehicleJourney").forEach(entity -> {
+                    // A journey with only RecordedCalls (everything already served) has nothing to predict.
+                    if (entity.path("EstimatedCalls").path("EstimatedCall").isArray()) {
+                        entities.add(entity);
+                    }
+                });
         return entities;
+    }
+
+    /**
+     * Text of a SIRI-Lite multilingual field, whether IDFM wraps it in an array
+     * ({@code [{"value": "x"}]}) or, in the newer profile, gives the object directly ({@code {"value": "x"}}).
+     */
+    static String siriValue(JsonNode node, String defaultValue) {
+        JsonNode target = node.isArray() ? node.path(0) : node;
+        return target.path(FIELD_VALUE).asText(defaultValue);
     }
 
     /**
@@ -1528,9 +1542,9 @@ public class TripUpdateGenerator {
 
         DirectionInfo directionInfo = extractDirectionInfo(entity, vehicleId);
 
+        // A destination that is not a known stop (e.g. a boarding position of the operator) only
+        // loosens the match, it does not make the journey unusable.
         String destinationId = extractDestinationId(entity);
-        if (destinationId == null)
-            return null;
 
         List<JsonNode> estimatedCalls = getSortedEstimatedCalls(entity);
         List<org.jouca.idfm_gtfs_rt.records.EstimatedCall> expectedCalls = buildEstimatedCallList(estimatedCalls);
@@ -1819,40 +1833,48 @@ public class TripUpdateGenerator {
      * @return service date in YYYYMMDD format
      */
     private String determineServiceDateFromTrip(String tripId) {
-        LocalDate currentDate = LocalDate.now(ZONE_ID);
-
+        ZonedDateTime now = ZonedDateTime.now(ZONE_ID);
         if (tripId == null || tripId.isEmpty()) {
-            return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            return now.toLocalDate().format(DateTimeFormatter.BASIC_ISO_DATE);
         }
+        return serviceDateFor(now, TripFinder.getFirstStopTime(tripId), TripFinder.getLastStopTime(tripId));
+    }
 
-        // Get the first stop time for this trip from GTFS
-        Integer firstStopTimeSeconds = TripFinder.getFirstStopTime(tripId);
+    /** Slack around the scheduled span of a trip during which it can still be running (delays, early starts). */
+    private static final int SERVICE_DAY_EARLY_SLACK_SECONDS = 3600;
+    private static final int SERVICE_DAY_LATE_SLACK_SECONDS = 7200;
 
-        if (firstStopTimeSeconds == null) {
-            // If we can't determine the first stop time, use current date
-            return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-        }
+    /**
+     * Picks the service day of a trip that is running now: today, or yesterday when the trip belongs
+     * to the previous service day and is still running after midnight.
+     *
+     * <p>A trip with a first stop at 24:00 or later belongs to yesterday early in the morning. A trip
+     * that started before midnight (say 23:40) also belongs to yesterday when it is still running
+     * at 00:10: today's copy of it would only leave in 23 hours, so it cannot be the one in service.
+     */
+    static String serviceDateFor(ZonedDateTime now, Integer firstStopSeconds, Integer lastStopSeconds) {
+        LocalDate today = now.toLocalDate();
+        LocalDate serviceDay = today;
 
-        // If the first stop time is >= 24:00:00 (86400 seconds), the trip crosses
-        // midnight.
-        // Whether the service day is today or yesterday depends on the current
-        // wall-clock time:
-        // - After midnight (hour < 8): the trip's physical departure is today but
-        // belongs to
-        // yesterday's service day → subtract 1 day.
-        // - Before midnight (hour >= 8): the trip runs tonight into tomorrow; the
-        // service day
-        // is still today → use current date.
-        if (firstStopTimeSeconds >= 86400 && firstStopTimeSeconds < 115200) {
-            ZonedDateTime nowZdt = ZonedDateTime.now(ZONE_ID);
-            if (nowZdt.getHour() < 8) {
-                return currentDate.minusDays(1).format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        if (firstStopSeconds != null) {
+            if (firstStopSeconds >= 86400 && firstStopSeconds < 115200) {
+                if (now.getHour() < 8) {
+                    serviceDay = today.minusDays(1);
+                }
+            } else if (now.getHour() < 8) {
+                long sinceMidnight = now.toLocalTime().toSecondOfDay();
+                long last = lastStopSeconds != null ? lastStopSeconds : firstStopSeconds;
+                boolean runningToday = sinceMidnight >= firstStopSeconds - SERVICE_DAY_EARLY_SLACK_SECONDS
+                        && sinceMidnight <= last + SERVICE_DAY_LATE_SLACK_SECONDS;
+                long sinceYesterdayMidnight = sinceMidnight + 86400;
+                boolean runningYesterday = sinceYesterdayMidnight >= firstStopSeconds - SERVICE_DAY_EARLY_SLACK_SECONDS
+                        && sinceYesterdayMidnight <= last + SERVICE_DAY_LATE_SLACK_SECONDS;
+                if (runningYesterday && !runningToday) {
+                    serviceDay = today.minusDays(1);
+                }
             }
-            return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         }
-
-        // Otherwise, use the current date as the service date
-        return currentDate.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        return serviceDay.format(DateTimeFormatter.BASIC_ISO_DATE);
     }
 
     /**
@@ -2028,7 +2050,7 @@ public class TripUpdateGenerator {
 
             return result;
         } catch (SQLException e) {
-            logger.debug("Error finding trip ID for lineId: {}, destinationId: {}", lineId, destinationId, e);
+            logger.warn("Error finding trip ID for lineId: {}, destinationId: {}", lineId, destinationId, e);
             return null;
         }
     }
@@ -2141,8 +2163,7 @@ public class TripUpdateGenerator {
                             break;
                     }
                     String destName = estimatedCalls.isEmpty() ? destinationId
-                            : estimatedCalls.get(0).path("DestinationDisplay").path(0).path(FIELD_VALUE)
-                                    .asText(destinationId);
+                            : siriValue(estimatedCalls.get(0).path("DestinationDisplay"), destinationId);
                     partialTrips.put(tripId, new PartialTripInfo(
                             tripId, lineId, lineId.startsWith("IDFM:") ? lineId.substring(5) : lineId,
                             directionId, theoreticalTerminus, destinationId, destName,
@@ -2228,19 +2249,39 @@ public class TripUpdateGenerator {
             }
 
             List<String> stopTimeUpdates = new ArrayList<>();
-            for (JsonNode estimatedCall : estimatedCalls) {
-                processEstimatedCall(estimatedCall, tripUpdate, tripId, stopTimeUpdates, anchorDelay);
+            int lastDestinationCall = indexOfLastCallAt(estimatedCalls, destinationId);
+            for (int i = 0; i < estimatedCalls.size(); i++) {
+                processEstimatedCall(estimatedCalls.get(i), tripUpdate, tripId, stopTimeUpdates, anchorDelay);
                 // For partial trips: stop processing after the destination stop
-                if (destinationId != null && estimatedCall.has(FIELD_STOP_POINT_REF)) {
-                    String stopCode = estimatedCall.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
-                    String stopId = TripFinder.resolveStopId(stopCode);
-                    if (destinationId.equals(stopId))
-                        break;
+                if (i == lastDestinationCall) {
+                    break;
                 }
             }
             // Clear invalid stop times where time goes backward
             clearInvalidStopTimes(tripUpdate);
         }
+    }
+
+    /**
+     * Index of the last call at the destination stop, or -1 when there is none. It is the last one
+     * because a circular line calls at its destination stop first as well, and stopping at that
+     * first call would discard the whole journey.
+     */
+    private int indexOfLastCallAt(List<JsonNode> estimatedCalls, String destinationId) {
+        if (destinationId == null) {
+            return -1;
+        }
+        for (int i = estimatedCalls.size() - 1; i >= 0; i--) {
+            JsonNode call = estimatedCalls.get(i);
+            if (!call.has(FIELD_STOP_POINT_REF)) {
+                continue;
+            }
+            String stopCode = call.get(FIELD_STOP_POINT_REF).get(FIELD_VALUE).asText().split(":")[3];
+            if (destinationId.equals(TripFinder.resolveStopId(stopCode))) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -2339,11 +2380,10 @@ public class TripUpdateGenerator {
      * @return direction ID (0 or 1), or -1 if not found or invalid
      */
     private int parseDirectionFromName(JsonNode entity) {
-        if (!entity.has(FIELD_DIRECTION_NAME) || entity.get(FIELD_DIRECTION_NAME).size() == 0) {
+        String directionName = siriValue(entity.path(FIELD_DIRECTION_NAME), "");
+        if (directionName.isEmpty()) {
             return -1;
         }
-
-        String directionName = entity.get(FIELD_DIRECTION_NAME).get(0).get(FIELD_VALUE).asText();
 
         // IDFM specific cases (single letter)
         if ("A".equals(directionName)) {
@@ -3526,6 +3566,9 @@ public class TripUpdateGenerator {
         if (directionId != null) {
             tripDescriptor.setDirectionId(directionId);
         }
+        if (vehicleId != null && !vehicleId.isEmpty()) {
+            tripUpdate.getVehicleBuilder().setId(vehicleId);
+        }
 
         int seq = 1;
         for (JsonNode call : estimatedCalls) {
@@ -3584,8 +3627,9 @@ public class TripUpdateGenerator {
             long first = stu.hasDeparture() ? stu.getDeparture().getTime()
                     : stu.hasArrival() ? stu.getArrival().getTime() : 0;
             if (first > 0) {
-                tripDescriptor.setStartDate(Instant.ofEpochSecond(first).atZone(ZONE_ID).toLocalDate()
-                        .format(DateTimeFormatter.BASIC_ISO_DATE));
+                java.time.ZonedDateTime firstStop = Instant.ofEpochSecond(first).atZone(ZONE_ID);
+                tripDescriptor.setStartDate(firstStop.toLocalDate().format(DateTimeFormatter.BASIC_ISO_DATE));
+                tripDescriptor.setStartTime(firstStop.toLocalTime().format(DateTimeFormatter.ofPattern("HH:mm:ss")));
                 break;
             }
         }

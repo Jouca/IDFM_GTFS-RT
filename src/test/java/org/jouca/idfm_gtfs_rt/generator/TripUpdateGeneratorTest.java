@@ -2627,4 +2627,108 @@ class TripUpdateGeneratorTest {
             cache.remove("seqTrip");
         }
     }
+
+    private int lastCallAt(String destinationId, String... stopCodes) throws Exception {
+        java.util.List<JsonNode> calls = new java.util.ArrayList<>();
+        for (String code : stopCodes) {
+            calls.add(objectMapper.readTree("{\"StopPointRef\":{\"value\":\"STIF:StopPoint:Q:" + code + ":\"}}"));
+        }
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "indexOfLastCallAt", java.util.List.class, String.class);
+        method.setAccessible(true);
+        return (int) method.invoke(generator, calls, destinationId);
+    }
+
+    @Test
+    void circularJourneyStopsAtItsLastCallAtTheDestinationNotTheFirst() throws Exception {
+        TripFinder.stopCodeCache.put("100", "IDFM:100");
+        TripFinder.stopCodeCache.put("200", "IDFM:200");
+        TripFinder.stopCodeCache.put("300", "IDFM:300");
+
+        // origin and terminus are the same stop: the first call there must not end the journey
+        assertEquals(3, lastCallAt("IDFM:100", "100", "200", "300", "100"));
+        assertEquals(1, lastCallAt("IDFM:200", "100", "200", "300"));
+        assertEquals(-1, lastCallAt("IDFM:999", "100", "200"));
+        assertEquals(-1, lastCallAt(null, "100", "200"));
+    }
+    @Test
+    void addedTripCarriesItsVehicleAndLocalStartTime() throws Exception {
+        TripFinder.stopCodeCache.put("100", "IDFM:100");
+        TripFinder.stopCodeCache.put("200", "IDFM:200");
+        // 2026-09-30T10:12:00Z is 12:12:00 in Paris (CEST)
+        java.util.List<JsonNode> calls = java.util.List.of(
+            objectMapper.readTree("{\"StopPointRef\":{\"value\":\"STIF:StopPoint:Q:100:\"},"
+                + "\"AimedDepartureTime\":\"2099-09-30T10:12:00Z\",\"ExpectedDepartureTime\":\"2099-09-30T10:12:00Z\"}"),
+            objectMapper.readTree("{\"StopPointRef\":{\"value\":\"STIF:StopPoint:Q:200:\"},"
+                + "\"AimedArrivalTime\":\"2099-09-30T10:20:00Z\",\"ExpectedArrivalTime\":\"2099-09-30T10:20:00Z\"}"));
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod(
+            "buildExtraJourneyFeedEntity", String.class, String.class, Integer.class, java.util.List.class);
+        method.setAccessible(true);
+        com.google.transit.realtime.GtfsRealtime.FeedEntity entity =
+            (com.google.transit.realtime.GtfsRealtime.FeedEntity) method.invoke(generator, "OP:VehicleJourney::42:LOC", "IDFM:C1", 0, calls);
+
+        com.google.transit.realtime.GtfsRealtime.TripUpdate tu = entity.getTripUpdate();
+        assertEquals("OP:VehicleJourney::42:LOC", tu.getVehicle().getId());
+        assertEquals("20990930", tu.getTrip().getStartDate());
+        assertEquals("12:12:00", tu.getTrip().getStartTime());
+    }
+    private static java.time.ZonedDateTime parisAt(String iso) {
+        return java.time.LocalDateTime.parse(iso).atZone(java.time.ZoneId.of("Europe/Paris"));
+    }
+
+    @Test
+    void tripStartedBeforeMidnightBelongsToYesterdayWhileStillRunningAfterMidnight() {
+        // 23:40 -> 00:40 trip (86400 + 2400 = 88800), observed at 00:10
+        assertEquals("20260929", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-30T00:10:00"), 85200, 88800));
+        // the same trip observed at 23:50 is today's
+        assertEquals("20260929", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-29T23:50:00"), 85200, 88800));
+    }
+
+    @Test
+    void serviceDateStaysTodayForTripsOfTheCurrentDay() {
+        // a 00:20 -> 01:00 trip at 00:30 is today's own first trip
+        assertEquals("20260930", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-30T00:30:00"), 1200, 3600));
+        // an ordinary daytime trip
+        assertEquals("20260930", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-30T12:00:00"), 43200, 46800));
+        // unknown schedule
+        assertEquals("20260930", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-30T12:00:00"), null, null));
+    }
+
+    @Test
+    void tripBeyondTwentyFourHoursIsYesterdaysEarlyInTheMorningAndTodaysInTheEvening() {
+        assertEquals("20260929", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-30T01:00:00"), 88200, 91000));
+        assertEquals("20260930", TripUpdateGenerator.serviceDateFor(parisAt("2026-09-30T22:00:00"), 88200, 91000));
+    }
+
+    @Test
+    void siriValueReadsBothTheArrayAndTheFlattenedObjectForm() throws Exception {
+        assertEquals("Gare", TripUpdateGenerator.siriValue(objectMapper.readTree("[{\"value\":\"Gare\"}]"), "?"));
+        assertEquals("Gare", TripUpdateGenerator.siriValue(objectMapper.readTree("{\"value\":\"Gare\"}"), "?"));
+        assertEquals("?", TripUpdateGenerator.siriValue(objectMapper.readTree("{}"), "?"));
+        assertEquals("?", TripUpdateGenerator.siriValue(objectMapper.readTree("[]"), "?"));
+    }
+
+    @Test
+    void directionNameInTheFlattenedObjectFormIsStillUnderstood() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod("parseDirectionFromName", JsonNode.class);
+        method.setAccessible(true);
+        assertEquals(1, (int) method.invoke(generator, objectMapper.readTree("{\"DirectionName\":{\"value\":\"Aller\"}}")));
+        assertEquals(-1, (int) method.invoke(generator, objectMapper.readTree("{}")));
+    }
+
+    @Test
+    void journeyWithOnlyRecordedCallsIsSkippedInsteadOfBreakingTheCycle() throws Exception {
+        java.lang.reflect.Method method = TripUpdateGenerator.class.getDeclaredMethod("extractEntitiesFromSiriLite", JsonNode.class);
+        method.setAccessible(true);
+        JsonNode siri = objectMapper.readTree("""
+            {"Siri":{"ServiceDelivery":{"EstimatedTimetableDelivery":[{"EstimatedJourneyVersionFrame":[{"EstimatedVehicleJourney":[
+              {"DatedVehicleJourneyRef":{"value":"a"},"RecordedCalls":{"RecordedCall":[{"StopPointRef":{"value":"x"}}]}},
+              {"DatedVehicleJourneyRef":{"value":"b"},"EstimatedCalls":{"EstimatedCall":[{"StopPointRef":{"value":"x"}}]}}
+            ]}]}]}}}
+            """);
+        @SuppressWarnings("unchecked")
+        java.util.List<JsonNode> entities = (java.util.List<JsonNode>) method.invoke(generator, siri);
+        assertEquals(1, entities.size());
+        assertEquals("b", entities.get(0).path("DatedVehicleJourneyRef").path("value").asText());
+    }
 }

@@ -195,4 +195,17 @@ class TripFinderTest {
             java.time.ZoneId.of("Europe/Paris"));
         assertNull(result);
     }
+
+    @Test
+    void vehicleRefMatchesOnlyAWholeTripIdToken() {
+        assertTrue(TripFinder.endsWithWholeId("IDFM:TN:SNCF:51194306-913c-4f27-8712-7cbd2776a14b",
+                "51194306-913c-4f27-8712-7cbd2776a14b"));
+        assertTrue(TripFinder.endsWithWholeId("IDFM:FSQY:529-C01541-50365-9084845", "9084845"));
+        assertTrue(TripFinder.endsWithWholeId("2776", "2776"));
+        // a short numeric id must not select an unrelated course whose id merely ends with it
+        assertFalse(TripFinder.endsWithWholeId("IDFM:Transdev_Nord_Seine_Saint-Denis:21882776", "2776"));
+        assertFalse(TripFinder.endsWithWholeId("IDFM:stif:local-264688-C02847-27381", "7381"));
+        assertFalse(TripFinder.endsWithWholeId("IDFM:X:1", "22"));
+        assertFalse(TripFinder.endsWithWholeId(null, "1"));
+    }
 }

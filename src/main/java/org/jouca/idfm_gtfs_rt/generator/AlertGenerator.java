@@ -129,6 +129,8 @@ public class AlertGenerator {
                 return GtfsRealtime.Alert.SeverityLevel.SEVERE;
             case "PERTURBEE":
                 return GtfsRealtime.Alert.SeverityLevel.WARNING;
+            case "INFORMATION":
+                return GtfsRealtime.Alert.SeverityLevel.INFO;
             default:
                 return GtfsRealtime.Alert.SeverityLevel.UNKNOWN_SEVERITY;
         }
@@ -185,9 +187,31 @@ public class AlertGenerator {
      * @param lineImpacted whether the line itself was tagged as impacted by this disruption
      * @param stopIds      the specific stops on this line tagged as impacted by this disruption
      * @param sections     "no service between two stations" boundaries for this route/disruption
+     * @param lineNames    the line's name and short name, to compare against the line a title designates
      */
     private record RouteImpact(String routeId, boolean lineImpacted, List<String> stopIds,
-            List<StopClosure.Section> sections) {
+            List<StopClosure.Section> sections, List<String> lineNames) {
+    }
+
+    private static final java.util.regex.Pattern SINGLE_LINE_TITLE = java.util.regex.Pattern.compile(
+            "^(?:Bus|Tram|Métro|Metro|Noctilien)\\s+(\\S+)\\s*:", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    /**
+     * IDFM attaches a disruption to every line serving the affected stops, so "Bus N62 : ..." also
+     * shows up on a line that merely shares those stops. When the title designates one line and
+     * this route is not that line (and is not itself flagged as impacted), the closure is not
+     * this route's: its trips still call at the stops.
+     */
+    static boolean titleDesignatesAnotherLine(String title, RouteImpact impact) {
+        if (title == null || impact.lineImpacted()) {
+            return false;
+        }
+        java.util.regex.Matcher m = SINGLE_LINE_TITLE.matcher(title.trim());
+        if (!m.find()) {
+            return false;
+        }
+        String designated = m.group(1);
+        return impact.lineNames().stream().noneMatch(designated::equalsIgnoreCase);
     }
 
     /**
@@ -266,7 +290,8 @@ public class AlertGenerator {
             List<StopClosure.Section> sections = extractSectionsForRoute(impactedSections, routeId);
 
             if (lineImpacted || !impactedStopIds.isEmpty() || !sections.isEmpty()) {
-                impacts.add(new RouteImpact(routeId, lineImpacted, impactedStopIds, sections));
+                impacts.add(new RouteImpact(routeId, lineImpacted, impactedStopIds, sections,
+                        List.of((String) line.get("name"), (String) line.get("shortName"))));
             }
         }
 
@@ -536,6 +561,9 @@ public class AlertGenerator {
 
             ArrayNode impactedSections = (ArrayNode) alert.get(FIELD_IMPACTED_SECTIONS);
             for (RouteImpact impact : computeRouteImpacts(disruptionId, lines, impactedSections)) {
+                if (titleDesignatesAnotherLine((String) alert.get(FIELD_TITLE), impact)) {
+                    continue;
+                }
                 if (!impact.sections().isEmpty()) {
                     // Sections are the more reliable source when present — see
                     // computeRouteImpacts's javadoc for why the per-stop list can't be trusted
@@ -743,4 +771,4 @@ public class AlertGenerator {
 
         return linesDict;
     }
-}
+}
