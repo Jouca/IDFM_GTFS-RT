@@ -1,5 +1,7 @@
 package org.jouca.idfm_gtfs_rt.generator;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -8,6 +10,7 @@ import java.util.Map;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.transit.realtime.GtfsRealtime;
 
+import org.jouca.idfm_gtfs_rt.fetchers.CachedFetch;
 import org.jouca.idfm_gtfs_rt.fetchers.ElevatorEnricher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +40,14 @@ public class ElevatorAlertGenerator {
     private static final Logger logger = LoggerFactory.getLogger(ElevatorAlertGenerator.class);
 
     /**
+     * The elevator status is polled by every alerts cycle but only changes every few minutes: it is cached, and
+     * the last value keeps being served for up to an hour if the open-data API is temporarily down (rather than
+     * dropping every elevator alert for the duration of the outage).
+     */
+    private final CachedFetch<List<JsonNode>> elevatorStatus = new CachedFetch<>(
+            ElevatorEnricher::fetchElevators, Duration.ofMinutes(3), Duration.ofHours(1), Clock.systemUTC());
+
+    /**
      * Fetches real-time elevator status and appends one {@code ACCESSIBILITY_ISSUE}
      * alert per affected station to {@code feed}.
      *
@@ -45,7 +56,7 @@ public class ElevatorAlertGenerator {
     public void addElevatorAlertsToFeed(GtfsRealtime.FeedMessage.Builder feed) {
         List<JsonNode> elevators;
         try {
-            elevators = ElevatorEnricher.fetchElevators();
+            elevators = elevatorStatus.get();
         } catch (Exception e) {
             logger.warn("Could not fetch elevator status (non-critical): {}", e.getMessage());
             return;

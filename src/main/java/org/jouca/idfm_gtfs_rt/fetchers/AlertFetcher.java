@@ -1,10 +1,11 @@
 package org.jouca.idfm_gtfs_rt.fetchers;
 
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.zip.GZIPInputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
-import java.util.Scanner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -33,6 +34,12 @@ public class AlertFetcher {
      * The API endpoint URL for fetching disruptions from the IDFM marketplace.
      * This endpoint provides bulk disruption data in version 2 format.
      */
+    /** Time allowed to open the connection to the disruptions API. */
+    private static final int CONNECT_TIMEOUT_MS = 10_000;
+
+    /** Time allowed to wait for data from the disruptions API once connected. */
+    private static final int READ_TIMEOUT_MS = 60_000;
+
     private static final String API_URL = "https://prim.iledefrance-mobilites.fr/marketplace/disruptions_bulk/disruptions/v2";
     
     /**
@@ -66,18 +73,25 @@ public class AlertFetcher {
         // Establish HTTP connection to the API endpoint
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("GET");
+        // Without timeouts a stalled API would block the alerts task (and hold its lock) forever
+        conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(READ_TIMEOUT_MS);
         
         // Set request headers for JSON response and API authentication
-        conn.setRequestProperty("Accept-Encoding", "application/json");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("Accept-Encoding", "gzip");
         conn.setRequestProperty("apiKey", API_KEY);
 
-        // Read the response stream from the API
-        InputStream responseStream = conn.getInputStream();
+        // Read the response stream from the API (the payload is over a megabyte of JSON: ask for gzip)
         String response;
-        
-        // Use Scanner with delimiter to read the entire response as a single string
-        try (Scanner scanner = new Scanner(responseStream).useDelimiter("\\A")) {
-            response = scanner.hasNext() ? scanner.next() : "";
+        try {
+            InputStream raw = conn.getInputStream();
+            String encoding = conn.getContentEncoding();
+            try (InputStream responseStream = "gzip".equalsIgnoreCase(encoding) ? new GZIPInputStream(raw) : raw) {
+                response = new String(responseStream.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        } finally {
+            conn.disconnect();
         }
 
         // Parse the JSON response string into a JsonNode tree structure

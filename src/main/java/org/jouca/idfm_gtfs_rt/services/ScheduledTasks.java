@@ -25,7 +25,7 @@ import io.github.cdimascio.dotenv.Dotenv;
  * <p>
  * This service manages two main scheduled operations:
  * <ul>
- *   <li>Alert generation: Runs every 10 seconds to fetch alerts and generate GTFS-RT alert feeds</li>
+ *   <li>Alert generation: Runs every 30 seconds to fetch alerts and generate GTFS-RT alert feeds</li>
  *   <li>Trip updates generation: Runs every minute to fetch real-time trip updates and generate GTFS-RT trip update feeds</li>
  * </ul>
  * <p>
@@ -153,7 +153,7 @@ public class ScheduledTasks {
     /**
      * Scheduled task that fetches service alerts and generates GTFS-RT alert feeds.
      * <p>
-     * This method is executed every 10 seconds according to the cron schedule.
+     * This method is executed every 30 seconds by default according to the cron schedule.
      * It uses a reentrant lock to prevent concurrent executions. If a previous
      * execution is still in progress, the new execution is skipped.
      * <p>
@@ -161,11 +161,12 @@ public class ScheduledTasks {
      * Any exceptions during the generation process are caught and logged to prevent
      * disruption of the scheduled task execution.
      * <p>
-     * <strong>Schedule:</strong> Every 10 seconds
+     * <strong>Schedule:</strong> Every 30 seconds ({@code gtfsrt.alerts.cron} overrides it). IDFM disruptions
+     * change slowly (a handful per 10 minutes out of ~800), so polling faster only costs API quota and CPU.
      *
      * @see AlertGenerator#generateAlert()
      */
-    @Scheduled(cron = "*/10 * * * * ?") // Every 10 seconds
+    @Scheduled(cron = "${gtfsrt.alerts.cron:*/30 * * * * ?}") // Every 30 seconds unless configured otherwise
     public void fetchAlertsAndGenerateGTFSRT() {
         if (lockAlertUpdate.tryLock()) {
             try {
