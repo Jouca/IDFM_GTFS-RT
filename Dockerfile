@@ -1,5 +1,5 @@
 # ---- Build stage ----
-FROM eclipse-temurin:25.0.4_7-jdk-jammy AS builder
+FROM eclipse-temurin:25.0.5_8-jdk-jammy AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY src ./src
 RUN mvn clean package -DskipTests
 
 # ---- Runtime stage ----
-FROM eclipse-temurin:25.0.4_7-jre-jammy
+FROM eclipse-temurin:25.0.5_8-jre-jammy
 
 LABEL project=gtfs-rt
 
