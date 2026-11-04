@@ -11,7 +11,7 @@
 
 <div align="center">
    <img src="https://img.shields.io/badge/Java-21-orange?style=for-the-badge&logo=openjdk" alt="Java 21"></img>
-   <img src="https://img.shields.io/badge/Spring%20Boot-3.5.6-brightgreen?style=for-the-badge&logo=springboot" alt="Spring Boot"></img>
+   <img src="https://img.shields.io/badge/Spring%20Boot-4.1.2-brightgreen?style=for-the-badge&logo=springboot" alt="Spring Boot"></img>
    <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="License"></img>
 </div>
 
@@ -52,17 +52,15 @@ If you want to **directly get feeds messages online**, you can use my **own HTTP
 
 ## 🛠️ Technology Stack
 
-- **Java 21**: Modern Java runtime
-- **Spring Boot 3.5.6**: Application framework with scheduling support
-- **GTFS Realtime Bindings 0.0.8**: Protocol Buffer handling
-- **OneBusAway GTFS 10.2.0**: GTFS data processing
-- **SQLite 3.50.3.0**: Local database storage
+- **Java 21**: Language level of the code (the Docker image builds and runs it on Java 25 LTS)
+- **Spring Boot 4.1.2**: Application framework with scheduling support
+- **GTFS Realtime Bindings 0.2.0**: Protocol Buffer handling
+- **SQLite 3.54.1.0**: Local database storage
 - **Jackson Databind**: JSON processing
-- **OpenCSV 5.12.0**: CSV file parsing
-- **Apache Commons DBCP2 2.13.0**: Database connection pooling
+- **Apache Commons DBCP2 2.14.0**: Database connection pooling
 - **Maven**: Build and dependency management
 - **Docker**: Containerization
-- **JaCoCo 0.8.12**: Code coverage reporting
+- **JaCoCo 0.8.16**: Code coverage reporting
 
 ## 📦 Prerequisites
 
@@ -428,7 +426,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [IDFM (Île-de-France Mobilités)](https://www.iledefrance-mobilites.fr/) for providing transit data
 - [MobilityData](https://mobilitydata.org/) for GTFS-Realtime specifications
-- [OneBusAway](https://onebusaway.org/) for GTFS processing libraries
 - [NodeGTFS](https://github.com/BlinkTagInc/node-gtfs) for providing a library for decompressing a GTFS file into a SQLite database
 
 ## 📚 Resources
@@ -444,7 +441,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ### Common Issues
 
 **Application won't start**
-- Verify Java 21 is installed: `java -version`
+- Verify Java 21 or higher is installed: `java -version`
 - Check if port 8507 is available: `lsof -i :8507`
 - Ensure `.env` file is properly configured
 - Verify API_KEY is set in `.env` file

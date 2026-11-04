@@ -23,11 +23,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - name: Set up JDK 21
+      - name: Set up JDK 25 (the runtime of the Docker image)
         uses: actions/setup-java@v6
         with:
-          java-version: 21
-          distribution: 'zulu' # Alternative distribution options are available.
+          java-version: 25
+          distribution: 'temurin' # same JDK as the Docker image (eclipse-temurin:25)
       - name: Cache Maven packages
         uses: actions/cache@v6
         with:
