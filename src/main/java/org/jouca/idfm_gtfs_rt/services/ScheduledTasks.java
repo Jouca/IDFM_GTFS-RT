@@ -151,6 +151,26 @@ public class ScheduledTasks {
     }
 
     /**
+     * Generates the feeds right after startup instead of waiting for the next cron ticks, in a background thread so
+     * the application is not held up.
+     * <p>
+     * Without it the feeds are missing (404) until the next full minute, and the first trip updates are published
+     * <em>before</em> the alerts exist: the disruption stop closures are read from the alerts data, so that first
+     * feed lacks every closure until the following cycle (a minute later). Alerts therefore go first.
+     */
+    public void warmUpFeeds() {
+        Thread warmUp = new Thread(this::generateFeedsOnce, "feeds-warmup");
+        warmUp.setDaemon(true);
+        warmUp.start();
+    }
+
+    /** Alerts first (they write the disruption data the trip updates read), then the trip updates. */
+    void generateFeedsOnce() {
+        fetchAlertsAndGenerateGTFSRT();
+        fetchTripUpdatesAndGenerateGTFSRT();
+    }
+
+    /**
      * Scheduled task that fetches service alerts and generates GTFS-RT alert feeds.
      * <p>
      * This method is executed every 30 seconds by default according to the cron schedule.

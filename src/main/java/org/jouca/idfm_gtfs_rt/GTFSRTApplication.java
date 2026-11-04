@@ -77,5 +77,6 @@ public class GTFSRTApplication implements ApplicationListener<ContextRefreshedEv
     @Override
     public void onApplicationEvent(ContextRefreshedEvent event) {
         scheduledTasks.checkAndUpdateGTFSData();
+        scheduledTasks.warmUpFeeds();
     }
 }
