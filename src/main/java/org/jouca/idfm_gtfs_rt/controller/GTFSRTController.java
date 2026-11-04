@@ -3,11 +3,14 @@ package org.jouca.idfm_gtfs_rt.controller;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -36,6 +39,34 @@ import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 @RestController
 public class GTFSRTController {
     
+    /** GTFS-Realtime feeds are Protocol Buffers; clients that revalidate with {@code ETag} get an empty 304. */
+    private static final MediaType PROTOBUF = MediaType.parseMediaType("application/x-protobuf");
+
+    /**
+     * Serves a feed file with {@code ETag} and {@code Last-Modified} so that a client polling every few seconds only
+     * downloads it when it changed (Spring answers {@code 304 Not Modified} itself from those two headers), and with
+     * {@code no-cache} so intermediaries always revalidate instead of serving a stale feed.
+     * <p>
+     * The modification time is read <em>before</em> the content: if the file is replaced in between, the validator is
+     * older than the body, which only costs the client one redundant download, never a stale cached feed.
+     */
+    private ResponseEntity<byte[]> serveFeed(Path filePath) throws Exception {
+        if (!Files.exists(filePath)) {
+            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+        }
+        FileTime modified = Files.getLastModifiedTime(filePath);
+        byte[] content = Files.readAllBytes(filePath);
+        // Weak on purpose: Tomcat refuses to gzip a response that carries a strong ETag (the compressed bytes are a
+        // different representation), and the feed is the same content whatever the encoding.
+        String etag = "W/\"" + Long.toHexString(modified.toMillis()) + "-" + Long.toHexString(content.length) + "\"";
+        return ResponseEntity.ok()
+                .contentType(PROTOBUF)
+                .eTag(etag)
+                .lastModified(modified.toInstant())
+                .cacheControl(CacheControl.noCache())
+                .body(content);
+    }
+
     /**
      * Retrieves the GTFS-RT alerts feed file for IDFM.
      * 
@@ -51,20 +82,7 @@ public class GTFSRTController {
      */
     @GetMapping("/gtfs-rt-alerts-idfm")
     public ResponseEntity<byte[]> getGtfsRtAlertFile() throws Exception {
-        Path filePath = Paths.get("gtfs-rt-alerts-idfm.pb");
-        
-        // Check if the file exists
-        if (!Files.exists(filePath)) {
-            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
-        }
-
-        byte[] fileContent = Files.readAllBytes(filePath);
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.add(HttpHeaders.CONTENT_TYPE, "application/octet-stream");
-        headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=gtfs-rt-idfm.pb");
-
-        return new ResponseEntity<>(fileContent, headers, HttpStatus.OK);
+        return serveFeed(Paths.get("gtfs-rt-alerts-idfm.pb"));
     }
 
     /**
@@ -82,20 +100,7 @@ public class GTFSRTController {
      */
     @GetMapping("/gtfs-rt-trips-idfm")
     public ResponseEntity<byte[]> getGtfsRtTripFile() throws Exception {
-        Path filePath = Paths.get("gtfs-rt-trips-idfm.pb");
-        
-        // Check if the file exists
-        if (!Files.exists(filePath)) {
-            return new ResponseEntity<>(HttpStatus.NOT_FOUND);
-        }
-
-        byte[] fileContent = Files.readAllBytes(filePath);
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.add(HttpHeaders.CONTENT_TYPE, "application/octet-stream");
-        headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=gtfs-rt-idfm.pb");
-
-        return new ResponseEntity<>(fileContent, headers, HttpStatus.OK);
+        return serveFeed(Paths.get("gtfs-rt-trips-idfm.pb"));
     }
 
     /**

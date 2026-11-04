@@ -1,6 +1,5 @@
 package org.jouca.idfm_gtfs_rt.generator;
 
-import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -465,11 +464,22 @@ public class AlertGenerator {
      * @see AlertFetcher#fetchAlertData()
      */
     private void saveAlertsDataToFile(JsonNode data, String filePath) {
-        try (java.io.FileOutputStream out = new java.io.FileOutputStream(filePath)) {
-            out.write(data.toString().getBytes());
+        try {
+            writeAtomically(java.nio.file.Path.of(filePath), data.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
         } catch (java.io.IOException e) {
             System.err.println("Error writing alerts data to " + filePath + ": " + e.getMessage());
         }
+    }
+
+    /**
+     * Writes through a temporary file and an atomic move, so a concurrent reader (the HTTP endpoint serving the feed,
+     * or the trip updates generator reading the cached disruptions) never sees a half-written file.
+     */
+    static void writeAtomically(java.nio.file.Path target, byte[] bytes) throws java.io.IOException {
+        java.nio.file.Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        java.nio.file.Files.write(tmp, bytes);
+        java.nio.file.Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
     }
 
     public void generateAlert() throws Exception {
@@ -499,9 +509,7 @@ public class AlertGenerator {
             .setIncrementality(GtfsRealtime.FeedHeader.Incrementality.FULL_DATASET)
             .setTimestamp(System.currentTimeMillis() / 1000L));
 
-        try (FileOutputStream output = new FileOutputStream("gtfs-rt-alerts-idfm.pb")) {
-            feed.build().writeTo(output);
-        }
+        writeAtomically(java.nio.file.Path.of("gtfs-rt-alerts-idfm.pb"), feed.build().toByteArray());
 
         System.out.println("Alerts generated successfully!");
     }

@@ -845,4 +845,16 @@ class AlertGeneratorTest {
         open.addInformedEntityBuilder().setRouteId("IDFM:C1");
         assertTrue(AlertGenerator.isPublishable(open, 1000), "no period at all means always active");
     }
+
+    @Test
+    void writeAtomicallyReplacesTheFileAndLeavesNoTemporaryFile(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        java.nio.file.Path target = dir.resolve("alerts.pb");
+        AlertGenerator.writeAtomically(target, "first".getBytes());
+        AlertGenerator.writeAtomically(target, "second".getBytes());
+
+        assertEquals("second", java.nio.file.Files.readString(target));
+        try (var files = java.nio.file.Files.list(dir)) {
+            assertEquals(1, files.count(), "only the target remains, no .tmp");
+        }
+    }
 }
