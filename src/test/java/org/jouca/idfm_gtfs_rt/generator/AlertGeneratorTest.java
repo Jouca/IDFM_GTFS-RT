@@ -805,4 +805,44 @@ class AlertGeneratorTest {
         assertEquals(1, closures.size());
         assertEquals("IDFM:C01403", closures.get(0).routeId());
     }
+
+    @Test
+    void informationDisruptionHasNoEffectInsteadOfUnknown() throws Exception {
+        java.lang.reflect.Method m = AlertGenerator.class.getDeclaredMethod("mapEffect", String.class);
+        m.setAccessible(true);
+        assertEquals(GtfsRealtime.Alert.Effect.NO_EFFECT, m.invoke(generator, "INFORMATION"));
+        assertEquals(GtfsRealtime.Alert.Effect.UNKNOWN_EFFECT, m.invoke(generator, "SOMETHING_ELSE"));
+    }
+
+    @Test
+    void alertTextsCarryTheirLanguage() throws Exception {
+        java.lang.reflect.Method m = AlertGenerator.class.getDeclaredMethod("setAlertText",
+            GtfsRealtime.Alert.Builder.class, String.class, String.class);
+        m.setAccessible(true);
+        GtfsRealtime.Alert.Builder b = GtfsRealtime.Alert.newBuilder();
+        m.invoke(generator, b, "Titre", "Message");
+        assertEquals("fr", b.getHeaderText().getTranslation(0).getLanguage());
+        assertEquals("fr", b.getDescriptionText().getTranslation(0).getLanguage());
+    }
+
+    @Test
+    void onlyAlertsThatTargetSomethingAndAreNotOverArePublished() {
+        GtfsRealtime.Alert.Builder ok = GtfsRealtime.Alert.newBuilder();
+        ok.addInformedEntityBuilder().setRouteId("IDFM:C1");
+        ok.addActivePeriodBuilder().setStart(100).setEnd(2000);
+        assertTrue(AlertGenerator.isPublishable(ok, 1000));
+        assertFalse(AlertGenerator.isPublishable(ok, 3000), "every period ended");
+
+        GtfsRealtime.Alert.Builder twoPeriods = ok.clone();
+        twoPeriods.addActivePeriodBuilder().setStart(5000).setEnd(6000);
+        assertTrue(AlertGenerator.isPublishable(twoPeriods, 3000), "a later period is still to come");
+
+        GtfsRealtime.Alert.Builder untargeted = GtfsRealtime.Alert.newBuilder();
+        untargeted.addActivePeriodBuilder().setStart(100).setEnd(2000);
+        assertFalse(AlertGenerator.isPublishable(untargeted, 1000), "no informed_entity");
+
+        GtfsRealtime.Alert.Builder open = GtfsRealtime.Alert.newBuilder();
+        open.addInformedEntityBuilder().setRouteId("IDFM:C1");
+        assertTrue(AlertGenerator.isPublishable(open, 1000), "no period at all means always active");
+    }
 }

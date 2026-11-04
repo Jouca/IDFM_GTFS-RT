@@ -9,6 +9,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -364,7 +365,7 @@ public class TripUpdateGenerator {
 
         // Build the feed once (may contain REPLACEMENT for blacklisted non-extra
         // journeys)
-        GtfsRealtime.FeedMessage builtFeed = feedMessage.build();
+        GtfsRealtime.FeedMessage builtFeed = withUniqueEntityIds(feedMessage.build());
 
         // Beta feed: keeps REPLACEMENT as-is
         writeFeedToFile(builtFeed, "gtfs-rt-trips-idfm-beta.pb");
@@ -3651,6 +3652,45 @@ public class TripUpdateGenerator {
         }
 
         return entityBuilder.build();
+    }
+
+    /**
+     * Makes every {@code FeedEntity.id} unique. Entities are normally identified by their trip id, but the
+     * same trip can legitimately appear twice for two service dates (yesterday's late-night run and today's),
+     * and the spec requires unique entity ids. The entity with the latest start date keeps the plain trip id
+     * (so the usual id is stable); the others get {@code ":" + start_date} appended.
+     */
+    static GtfsRealtime.FeedMessage withUniqueEntityIds(GtfsRealtime.FeedMessage feed) {
+        Map<String, String> latestStartDate = new HashMap<>();
+        Set<String> duplicated = new HashSet<>();
+        Set<String> seen = new HashSet<>();
+        for (GtfsRealtime.FeedEntity entity : feed.getEntityList()) {
+            String id = entity.getId();
+            if (!seen.add(id)) {
+                duplicated.add(id);
+            }
+            String start = entity.getTripUpdate().getTrip().getStartDate();
+            latestStartDate.merge(id, start, (a, b) -> a.compareTo(b) >= 0 ? a : b);
+        }
+        if (duplicated.isEmpty()) {
+            return feed;
+        }
+        GtfsRealtime.FeedMessage.Builder out = feed.toBuilder().clearEntity();
+        Set<String> used = new HashSet<>();
+        for (GtfsRealtime.FeedEntity entity : feed.getEntityList()) {
+            String id = entity.getId();
+            String start = entity.getTripUpdate().getTrip().getStartDate();
+            if (duplicated.contains(id) && !start.equals(latestStartDate.get(id))) {
+                id = id + ":" + start;
+            }
+            // Same trip and same date twice cannot be told apart by date: keep the first, number the rest.
+            String unique = id;
+            for (int n = 2; !used.add(unique); n++) {
+                unique = id + "#" + n;
+            }
+            out.addEntity(unique.equals(entity.getId()) ? entity : entity.toBuilder().setId(unique).build());
+        }
+        return out.build();
     }
 
     /**

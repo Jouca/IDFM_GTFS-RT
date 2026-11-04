@@ -2739,4 +2739,50 @@ class TripUpdateGeneratorTest {
         assertEquals("20261002", TripUpdateGenerator.serviceDateFor(parisAt("2026-10-02T23:37:00"), 67680, 70200));
         assertEquals("20261002", TripUpdateGenerator.serviceDateFor(parisAt("2026-10-02T12:00:00"), 1020, 2700));
     }
+
+    private static com.google.transit.realtime.GtfsRealtime.FeedEntity tripEntity(String id, String startDate) {
+        var e = com.google.transit.realtime.GtfsRealtime.FeedEntity.newBuilder().setId(id);
+        e.getTripUpdateBuilder().getTripBuilder().setTripId(id).setStartDate(startDate);
+        return e.build();
+    }
+
+    @Test
+    void sameTripOnTwoServiceDatesGetsDistinctEntityIdsAndLatestKeepsThePlainId() {
+        var feed = com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder()
+            .setHeader(com.google.transit.realtime.GtfsRealtime.FeedHeader.newBuilder().setGtfsRealtimeVersion("2.0"))
+            .addEntity(tripEntity("T1", "20261104"))
+            .addEntity(tripEntity("T1", "20261103"))
+            .addEntity(tripEntity("T2", "20261104"))
+            .build();
+
+        var out = TripUpdateGenerator.withUniqueEntityIds(feed);
+
+        assertEquals(3, out.getEntityCount());
+        assertEquals("T1", out.getEntity(0).getId());
+        assertEquals("T1:20261103", out.getEntity(1).getId());
+        assertEquals("T2", out.getEntity(2).getId());
+        assertEquals("T1", out.getEntity(1).getTripUpdate().getTrip().getTripId());
+        assertEquals(3, out.getEntityList().stream().map(e -> e.getId()).distinct().count());
+    }
+
+    @Test
+    void sameTripAndSameDateTwiceStillEndsUpWithUniqueIds() {
+        var feed = com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder()
+            .setHeader(com.google.transit.realtime.GtfsRealtime.FeedHeader.newBuilder().setGtfsRealtimeVersion("2.0"))
+            .addEntity(tripEntity("T1", "20261104"))
+            .addEntity(tripEntity("T1", "20261104"))
+            .build();
+
+        var out = TripUpdateGenerator.withUniqueEntityIds(feed);
+
+        assertEquals(2, out.getEntityList().stream().map(e -> e.getId()).distinct().count());
+    }
+
+    @Test
+    void feedWithoutDuplicateIdsIsReturnedUntouched() {
+        var feed = com.google.transit.realtime.GtfsRealtime.FeedMessage.newBuilder()
+            .setHeader(com.google.transit.realtime.GtfsRealtime.FeedHeader.newBuilder().setGtfsRealtimeVersion("2.0"))
+            .addEntity(tripEntity("T1", "20261104")).addEntity(tripEntity("T2", "20261104")).build();
+        assertEquals(feed, TripUpdateGenerator.withUniqueEntityIds(feed));
+    }
 }

@@ -45,6 +45,8 @@ public class AlertGenerator {
     private static final String FIELD_CAUSE = "cause";
     private static final String FIELD_SEVERITY = "severity";
     private static final String FIELD_TITLE = "title";
+    /** Language of IDFM's disruption texts (BCP-47). */
+    private static final String ALERT_LANGUAGE = "fr";
     private static final String FIELD_MESSAGE = "message";
     private static final String FIELD_IMPACTED_OBJECTS = "impactedObjects";
     private static final String FIELD_IMPACTED_SECTIONS = "impactedSections";
@@ -108,6 +110,8 @@ public class AlertGenerator {
                 return GtfsRealtime.Alert.Effect.NO_SERVICE;
             case "PERTURBEE":
                 return GtfsRealtime.Alert.Effect.REDUCED_SERVICE;
+            case "INFORMATION":
+                return GtfsRealtime.Alert.Effect.NO_EFFECT;
             default:
                 return GtfsRealtime.Alert.Effect.UNKNOWN_EFFECT;
         }
@@ -339,13 +343,13 @@ public class AlertGenerator {
         if (title != null) {
             alertBuilder.setHeaderText(
                 GtfsRealtime.TranslatedString.newBuilder()
-                    .addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(title))
+                    .addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(title).setLanguage(ALERT_LANGUAGE))
             );
         }
         
         alertBuilder.setDescriptionText(
             GtfsRealtime.TranslatedString.newBuilder()
-                .addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(message))
+                .addTranslation(GtfsRealtime.TranslatedString.Translation.newBuilder().setText(message).setLanguage(ALERT_LANGUAGE))
         );
     }
     
@@ -414,15 +418,31 @@ public class AlertGenerator {
                                     ArrayNode applicationPeriods, Map<String, Object> lines) {
         String entityId = alert.get("id").toString();
 
-        GtfsRealtime.Alert.Builder alertBuilder = feed.addEntityBuilder()
-            .setId(entityId)
-            .getAlertBuilder();
+        GtfsRealtime.Alert.Builder alertBuilder = GtfsRealtime.Alert.newBuilder();
 
         for (JsonNode applicationPeriod : applicationPeriods) {
             alertBuilder.addActivePeriod(createTimeRange(applicationPeriod));
         }
 
         populateAlertBuilder(alertBuilder, alert, lines);
+
+        if (!isPublishable(alertBuilder, System.currentTimeMillis() / 1000L)) {
+            return;
+        }
+        feed.addEntityBuilder().setId(entityId).setAlert(alertBuilder);
+    }
+
+    /**
+     * An alert is only worth publishing if it targets something (the spec requires at least one
+     * {@code informed_entity}) and is not already over: IDFM keeps recently ended disruptions in its payload.
+     */
+    static boolean isPublishable(GtfsRealtime.Alert.Builder alert, long nowEpochSeconds) {
+        if (alert.getInformedEntityCount() == 0) {
+            return false;
+        }
+        boolean allEnded = alert.getActivePeriodCount() > 0 && alert.getActivePeriodList().stream()
+                .allMatch(period -> period.hasEnd() && period.getEnd() < nowEpochSeconds);
+        return !allEnded;
     }
 
     /**
