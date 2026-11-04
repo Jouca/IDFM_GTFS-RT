@@ -2731,4 +2731,12 @@ class TripUpdateGeneratorTest {
         assertEquals(1, entities.size());
         assertEquals("b", entities.get(0).path("DatedVehicleJourneyRef").path("value").asText());
     }
+
+    @Test
+    void earlyMorningTripSeenLateInTheEveningBelongsToTomorrow() {
+        assertEquals("20261003", TripUpdateGenerator.serviceDateFor(parisAt("2026-10-02T23:37:00"), 1020, 2700));
+        assertEquals("20261002", TripUpdateGenerator.serviceDateFor(parisAt("2026-10-02T23:37:00"), 84600, 86000));
+        assertEquals("20261002", TripUpdateGenerator.serviceDateFor(parisAt("2026-10-02T23:37:00"), 67680, 70200));
+        assertEquals("20261002", TripUpdateGenerator.serviceDateFor(parisAt("2026-10-02T12:00:00"), 1020, 2700));
+    }
 }

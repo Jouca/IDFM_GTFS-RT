@@ -1,3 +1,7 @@
+# IDFM GTFS-RT. Le nom de projet DOIT rester « gtfs-rt » : le volume gtfs-rt_gtfs_data est lu par le moniteur
+# (/var/lib/docker/volumes/gtfs-rt_gtfs_data/_data/gtfs.db). Labels Traefik fusionnés ici (ex-overrides/gtfs-rt.yml).
+name: gtfs-rt
+
 services:
   app:
     build: .
@@ -7,13 +11,17 @@ services:
     cpus: 8
     env_file:
       - .env
-    ports:
-      - "8507:8507"
     volumes:
       - .env:/app/.env
       - gtfs_data:/app/gtfs-data
     networks:
       - gtfs_net
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.gtfs.rule=Host(`gtfsidfm.clarifygdps.com`)
+      - traefik.http.services.gtfs.loadbalancer.server.port=8507
 
 volumes:
   gtfs_data:
@@ -21,3 +29,5 @@ volumes:
 networks:
   gtfs_net:
     driver: bridge
+  proxy:
+    external: true

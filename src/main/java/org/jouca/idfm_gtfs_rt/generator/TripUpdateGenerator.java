@@ -1843,6 +1843,8 @@ public class TripUpdateGenerator {
     /** Slack around the scheduled span of a trip during which it can still be running (delays, early starts). */
     private static final int SERVICE_DAY_EARLY_SLACK_SECONDS = 3600;
     private static final int SERVICE_DAY_LATE_SLACK_SECONDS = 7200;
+    /** How far ahead of its departure SIRI can already announce tomorrow's first trips. */
+    private static final int NEXT_DAY_HORIZON_SECONDS = 6 * 3600;
 
     /**
      * Picks the service day of a trip that is running now: today, or yesterday when the trip belongs
@@ -1871,6 +1873,16 @@ public class TripUpdateGenerator {
                         && sinceYesterdayMidnight <= last + SERVICE_DAY_LATE_SLACK_SECONDS;
                 if (runningYesterday && !runningToday) {
                     serviceDay = today.minusDays(1);
+                }
+            } else {
+                // SIRI announces trips some hours ahead: a 00:17 trip seen at 23:37 is tomorrow's,
+                // today's copy of it is long over.
+                long sinceMidnight = now.toLocalTime().toSecondOfDay();
+                long last = lastStopSeconds != null ? lastStopSeconds : firstStopSeconds;
+                boolean todayIsOver = sinceMidnight > last + SERVICE_DAY_LATE_SLACK_SECONDS;
+                boolean tomorrowIsImminent = 86400L + firstStopSeconds - sinceMidnight <= NEXT_DAY_HORIZON_SECONDS;
+                if (todayIsOver && tomorrowIsImminent) {
+                    serviceDay = today.plusDays(1);
                 }
             }
         }
