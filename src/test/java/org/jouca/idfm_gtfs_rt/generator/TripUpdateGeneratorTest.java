@@ -2785,4 +2785,47 @@ class TripUpdateGeneratorTest {
             .addEntity(tripEntity("T1", "20261104")).addEntity(tripEntity("T2", "20261104")).build();
         assertEquals(feed, TripUpdateGenerator.withUniqueEntityIds(feed));
     }
+
+    private static com.fasterxml.jackson.databind.JsonNode call(String json) throws Exception {
+        return new ObjectMapper().readTree(json);
+    }
+
+    @Test
+    void anchorDelayIsExpectedMinusAimedOfTheFirstCallThatHasBoth() throws Exception {
+        var calls = java.util.List.of(
+            call("{\"StopPointRef\":{\"value\":\"a\"}}"),
+            call("{\"AimedArrivalTime\":\"2026-11-03T22:52:00Z\",\"ExpectedArrivalTime\":\"2026-11-04T02:16:02Z\"}"),
+            call("{\"AimedArrivalTime\":\"2026-11-03T23:00:00Z\",\"ExpectedArrivalTime\":\"2026-11-03T23:01:00Z\"}"));
+        assertEquals(3 * 3600 + 24 * 60 + 2, generator.anchorDelayOf(calls));
+        assertEquals(Long.MIN_VALUE, generator.anchorDelayOf(java.util.List.of(call("{}"))));
+    }
+
+    @Test
+    void anchorDelayFallsBackOnDepartureTimes() throws Exception {
+        var calls = java.util.List.of(call(
+            "{\"AimedDepartureTime\":\"2026-11-03T10:00:00Z\",\"ExpectedDepartureTime\":\"2026-11-03T10:05:00Z\"}"));
+        assertEquals(300, generator.anchorDelayOf(calls));
+    }
+
+    @Test
+    void delaysBeyondThreeHoursAreImplausibleEarlyOrLateButAThreeHourLateRailJourneyIsKept() {
+        assertTrue(generator.isImplausibleDelay(3 * 3600 + 1));
+        assertTrue(generator.isImplausibleDelay(-(3 * 3600 + 1)));
+        assertFalse(generator.isImplausibleDelay(3 * 3600), "exactly at the limit is kept");
+        assertFalse(generator.isImplausibleDelay(0));
+        assertFalse(generator.isImplausibleDelay(Long.MIN_VALUE), "no delay information is not an implausible delay");
+    }
+
+    @Test
+    void thresholdIsConfigurable() {
+        org.springframework.test.util.ReflectionTestUtils.setField(generator, "maxPlausibleDelayMinutes", 30);
+        assertTrue(generator.isImplausibleDelay(31 * 60));
+        assertFalse(generator.isImplausibleDelay(29 * 60));
+    }
+
+    @Test
+    void tripDelayedBetweenTwoAndThreeHoursStillBelongsToYesterdaysServiceDay() {
+        // 23:34 trip running at 02:25 the next morning, 2h51 late (real T9 case, one hour beyond the old window)
+        assertEquals("20261103", TripUpdateGenerator.serviceDateFor(parisAt("2026-11-04T02:25:00"), 84870, 86100));
+    }
 }

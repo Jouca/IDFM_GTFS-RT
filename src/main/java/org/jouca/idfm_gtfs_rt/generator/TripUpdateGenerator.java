@@ -142,6 +142,18 @@ public class TripUpdateGenerator {
     @Value("${gtfsrt.debug.dump:false}")
     private boolean dumpDebugFiles;
 
+    /**
+     * Largest delay (minutes, early or late) a SIRI-Lite journey may report and still be published. Beyond it the
+     * prediction is not credible (a bus announced eight hours late is a stale or ghost journey, not a delay), so
+     * nothing is published for it and consumers fall back on the timetable.
+     */
+    @Value("${gtfsrt.plausibility.max-delay-minutes:180}")
+    private int maxPlausibleDelayMinutes = 180;
+
+    /** Journeys not published because their reported delay was implausible (reset and logged every cycle). */
+    private final java.util.concurrent.atomic.AtomicInteger implausibleDelayDrops =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     /** Cache for parsed ISO 8601 timestamps to avoid repeated parsing operations */
     private final Map<String, Long> parsedTimeCache = new ConcurrentHashMap<>();
 
@@ -1115,6 +1127,11 @@ public class TripUpdateGenerator {
         cleanupStaleTripStates();
 
         System.out.println("Total trips in GTFS-RT feed: " + feedMessage.getEntityCount());
+        int implausible = implausibleDelayDrops.getAndSet(0);
+        if (implausible > 0) {
+            System.out.println("Not published: " + implausible + " journeys reporting a delay beyond "
+                    + maxPlausibleDelayMinutes + " min.");
+        }
         exportDebugData(entitiesTrips);
     }
 
@@ -1654,6 +1671,15 @@ public class TripUpdateGenerator {
             return extraEntity == null ? null : new IndexedEntity(p.index(), extraEntity);
         }
 
+        // A journey SIRI announces hours late (or early) is stale or a ghost: publish nothing for it, and forget it
+        // so that the cache does not re-emit its last prediction either.
+        long reportedDelay = anchorDelayOf(p.estimatedCalls());
+        if (isImplausibleDelay(reportedDelay)) {
+            tripStates.remove(tripId);
+            implausibleDelayDrops.incrementAndGet();
+            return null;
+        }
+
         // Determine service date based on the trip's theoretical GTFS schedule
         String serviceDate = determineServiceDateFromTrip(tripId);
         TripFinder.TripMeta tripMeta = TripFinder.getTripMeta(tripId, serviceDate);
@@ -1843,7 +1869,7 @@ public class TripUpdateGenerator {
 
     /** Slack around the scheduled span of a trip during which it can still be running (delays, early starts). */
     private static final int SERVICE_DAY_EARLY_SLACK_SECONDS = 3600;
-    private static final int SERVICE_DAY_LATE_SLACK_SECONDS = 7200;
+    private static final int SERVICE_DAY_LATE_SLACK_SECONDS = 10800;
     /** How far ahead of its departure SIRI can already announce tomorrow's first trips. */
     private static final int NEXT_DAY_HORIZON_SECONDS = 6 * 3600;
 
@@ -2233,28 +2259,9 @@ public class TripUpdateGenerator {
             tripUpdate.getTripBuilder()
                     .setScheduleRelationship(GtfsRealtime.TripDescriptor.ScheduleRelationship.CANCELED);
         } else {
-            // Compute a constant anchor delay from the first call that has both Expected
-            // and Aimed times.
-            // This prevents growing delays when SIRI future-stop predictions accumulate
-            // additional offset.
-            long anchorDelay = Long.MIN_VALUE;
-            for (JsonNode call : estimatedCalls) {
-                if (call.has(FIELD_EXPECTED_ARRIVAL_TIME) && call.has(FIELD_AIMED_ARRIVAL_TIME)) {
-                    long expected = parseTime(call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
-                    long aimed = parseTime(call.get(FIELD_AIMED_ARRIVAL_TIME).asText());
-                    if (expected != Long.MIN_VALUE && aimed != Long.MIN_VALUE) {
-                        anchorDelay = expected - aimed;
-                        break;
-                    }
-                } else if (call.has(FIELD_EXPECTED_DEPARTURE_TIME) && call.has(FIELD_AIMED_DEPARTURE_TIME)) {
-                    long expected = parseTime(call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
-                    long aimed = parseTime(call.get(FIELD_AIMED_DEPARTURE_TIME).asText());
-                    if (expected != Long.MIN_VALUE && aimed != Long.MIN_VALUE) {
-                        anchorDelay = expected - aimed;
-                        break;
-                    }
-                }
-            }
+            // Constant anchor delay, from the first call that has both Expected and Aimed times: it keeps the
+            // delay from growing when SIRI's future-stop predictions accumulate additional offset.
+            long anchorDelay = anchorDelayOf(estimatedCalls);
 
             // Persist anchor delay into state for cache-only re-emission cycles
             if (anchorDelay != Long.MIN_VALUE && state != null) {
@@ -2273,6 +2280,35 @@ public class TripUpdateGenerator {
             // Clear invalid stop times where time goes backward
             clearInvalidStopTimes(tripUpdate);
         }
+    }
+
+    /**
+     * The delay SIRI reports for the journey: expected minus aimed time of the first call that has both, or
+     * {@code Long.MIN_VALUE} when no call has them.
+     */
+    long anchorDelayOf(List<JsonNode> estimatedCalls) {
+        for (JsonNode call : estimatedCalls) {
+            if (call.has(FIELD_EXPECTED_ARRIVAL_TIME) && call.has(FIELD_AIMED_ARRIVAL_TIME)) {
+                long expected = parseTime(call.get(FIELD_EXPECTED_ARRIVAL_TIME).asText());
+                long aimed = parseTime(call.get(FIELD_AIMED_ARRIVAL_TIME).asText());
+                if (expected != Long.MIN_VALUE && aimed != Long.MIN_VALUE) {
+                    return expected - aimed;
+                }
+            } else if (call.has(FIELD_EXPECTED_DEPARTURE_TIME) && call.has(FIELD_AIMED_DEPARTURE_TIME)) {
+                long expected = parseTime(call.get(FIELD_EXPECTED_DEPARTURE_TIME).asText());
+                long aimed = parseTime(call.get(FIELD_AIMED_DEPARTURE_TIME).asText());
+                if (expected != Long.MIN_VALUE && aimed != Long.MIN_VALUE) {
+                    return expected - aimed;
+                }
+            }
+        }
+        return Long.MIN_VALUE;
+    }
+
+    /** Whether a reported delay is too large (late or early) to be a credible prediction. */
+    boolean isImplausibleDelay(long anchorDelaySeconds) {
+        return anchorDelaySeconds != Long.MIN_VALUE
+                && Math.abs(anchorDelaySeconds) > maxPlausibleDelayMinutes * 60L;
     }
 
     /**
