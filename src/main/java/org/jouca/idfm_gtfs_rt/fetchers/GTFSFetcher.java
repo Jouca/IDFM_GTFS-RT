@@ -707,20 +707,10 @@ public class GTFSFetcher {
         createIndex(outputFilePath, "idx_object_codes_extension_object_code", 
             "CREATE INDEX idx_object_codes_extension_object_code ON object_codes_extension (object_code);");
 
-        // Index 11: Composite index for ordered retrieval of stops for a trip
-        createIndex(outputFilePath, "idx_stop_times_trip_id_stop_sequence", 
-            "CREATE INDEX idx_stop_times_trip_id_stop_sequence ON stop_times (trip_id, stop_sequence);");
-
-        // Index 12: Composite index for finding all trips passing through a stop
-        createIndex(outputFilePath, "idx_stop_times_stop_id_trip_id_sequence", 
-            "CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id_trip_id_sequence ON stop_times (stop_id, trip_id, stop_sequence);");
-
-        // Index 13: Composite index for trip-stop lookups
-        createIndex(outputFilePath, "idx_stop_times_trip_id_stop_id", 
-            "CREATE INDEX IF NOT EXISTS idx_stop_times_trip_id_stop_id ON stop_times (trip_id, stop_id);");
-
-        // Index 14: Simple index on trip_id
-        createIndex(outputFilePath, "idx_stop_times_trip_id", 
-            "CREATE INDEX IF NOT EXISTS idx_stop_times_trip_id ON stop_times (trip_id);");
+        // stop_times: the import already provides PRIMARY KEY (trip_id, stop_sequence) and
+        // (stop_id, trip_id, stop_sequence, arrival_timestamp), and idx_stop_times_trip_stop_arrival_departure_seq
+        // above covers (trip_id, stop_id). Separate indexes on (trip_id), (trip_id, stop_sequence),
+        // (trip_id, stop_id) and (stop_id, trip_id, stop_sequence) are prefixes of those: they returned the
+        // same rows with the same timings but weighed ~1.9 GB (4.9 GB -> 3.0 GB database).
     }
 }
