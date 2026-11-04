@@ -3,9 +3,12 @@ package org.jouca.idfm_gtfs_rt.services;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.jouca.idfm_gtfs_rt.fetchers.GTFSFetcher;
+import org.jouca.idfm_gtfs_rt.fetchers.SourceFingerprint;
 import org.jouca.idfm_gtfs_rt.finders.TripFinder;
 import org.jouca.idfm_gtfs_rt.generator.AlertGenerator;
 import org.jouca.idfm_gtfs_rt.generator.TripUpdateGenerator;
@@ -88,6 +91,15 @@ public class ScheduledTasks {
      * Temporary file path used while building a new GTFS database before hot-swapping it in.
      */
     private static final String GTFS_TEMP_FILE_PATH = "./gtfs-data/gtfs.db.new";
+
+    /** Records the fingerprint of the source zip of the last successful database build (see SourceFingerprint). */
+    private static final Path GTFS_SOURCE_RECORD = Path.of("./gtfs-data/gtfs-source.fingerprint");
+
+    /**
+     * An unchanged source zip is not rebuilt, but at least once a day anyway: the enriched GTFS also depends on
+     * other sources (platform codes, elevators...) that change independently of the zip.
+     */
+    private static final Duration GTFS_MAX_SKIP_AGE = Duration.ofHours(20);
     
     /**
      * Environment variable key for the GTFS URL configuration.
@@ -228,6 +240,13 @@ public class ScheduledTasks {
             return;
         }
         try {
+            String fingerprint = GTFSFetcher.probeSourceFingerprint(GTFS_URL);
+            if (SourceFingerprint.canSkipRebuild(GTFS_SOURCE_RECORD, fingerprint, Path.of(GTFS_FILE_PATH),
+                    GTFS_MAX_SKIP_AGE, Instant.now())) {
+                logger.info("[GTFS] Source unchanged since the last build (under {} h old), skipping the rebuild.",
+                        GTFS_MAX_SKIP_AGE.toHours());
+                return;
+            }
             logger.info("[GTFS] Starting scheduled GTFS refresh (building into {})...", GTFS_TEMP_FILE_PATH);
             GTFSFetcher.fetchGTFS(GTFS_URL, GTFS_TEMP_FILE_PATH);
 
@@ -241,6 +260,9 @@ public class ScheduledTasks {
                 logger.info("[GTFS] Database hot-swapped successfully.");
             } finally {
                 lockTripUpdate.unlock();
+            }
+            if (fingerprint != null) {
+                SourceFingerprint.record(GTFS_SOURCE_RECORD, fingerprint);
             }
         } catch (Exception e) {
             logger.error("[GTFS] Refresh failed: {}", e.getMessage(), e);

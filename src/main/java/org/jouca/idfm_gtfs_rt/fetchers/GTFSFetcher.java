@@ -713,4 +713,19 @@ public class GTFSFetcher {
         // (trip_id, stop_id) and (stop_id, trip_id, stop_sequence) are prefixes of those: they returned the
         // same rows with the same timings but weighed ~1.9 GB (4.9 GB -> 3.0 GB database).
     }
+
+    /**
+     * Downloads the GTFS zip only to fingerprint it (streamed, nothing is written to disk), so that the caller can
+     * tell whether the source changed before running the expensive rebuild. See {@link SourceFingerprint}.
+     *
+     * @return the fingerprint, or {@code null} when the download failed (the caller should then rebuild)
+     */
+    public static String probeSourceFingerprint(String urlString) {
+        try (java.io.InputStream in = java.net.URI.create(urlString).toURL().openStream()) {
+            return SourceFingerprint.of(in);
+        } catch (Exception e) {
+            logger.warn("Could not fingerprint the GTFS source ({}), assuming it changed.", e.getMessage());
+            return null;
+        }
+    }
 }
