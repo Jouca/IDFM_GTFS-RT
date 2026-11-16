@@ -8,6 +8,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -39,6 +41,9 @@ import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 @RestController
 public class GTFSRTController {
     
+    /** The enriched static GTFS archive produced by the refresh cycle (package-private so tests can point elsewhere). */
+    Path enrichedGtfsPath = Paths.get("gtfs-data/IDFM-gtfs-enriched.zip");
+
     /** GTFS-Realtime feeds are Protocol Buffers; clients that revalidate with {@code ETag} get an empty 304. */
     private static final MediaType PROTOBUF = MediaType.parseMediaType("application/x-protobuf");
 
@@ -200,19 +205,29 @@ public class GTFSRTController {
      * <p>The file is generated during the GTFS refresh cycle by {@code GTFSEnricher}.
      * platform_code values are sourced from the IDFM arrets-transporteur open-data JSON.</p>
      *
-     * @return the GTFS ZIP bytes, or 404 if the enriched file has not been generated yet
+     * <p>The response carries {@code Last-Modified} (when the archive was generated) and an {@code ETag}, so a
+     * client can poll with a cheap {@code HEAD}, or a conditional {@code GET} ({@code If-None-Match} /
+     * {@code If-Modified-Since}) that answers {@code 304 Not Modified}, and only download the ~110 MB archive when it
+     * changed. The file is streamed rather than loaded in memory, which also makes {@code HEAD} free and enables
+     * {@code Range} requests.</p>
+     *
+     * @return the GTFS ZIP, or 404 if the enriched file has not been generated yet
      */
     @GetMapping("/gtfs")
-    public ResponseEntity<byte[]> getEnrichedGtfs() throws Exception {
-        Path filePath = Paths.get("gtfs-data/IDFM-gtfs-enriched.zip");
+    public ResponseEntity<Resource> getEnrichedGtfs() throws Exception {
+        Path filePath = enrichedGtfsPath;
         if (!Files.exists(filePath)) {
             return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         }
-        byte[] fileContent = Files.readAllBytes(filePath);
-        HttpHeaders headers = new HttpHeaders();
-        headers.add(HttpHeaders.CONTENT_TYPE, "application/zip");
-        headers.add(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=IDFM-gtfs-enriched.zip");
-        return new ResponseEntity<>(fileContent, headers, HttpStatus.OK);
+        FileTime modified = Files.getLastModifiedTime(filePath);
+        String etag = "\"" + Long.toHexString(modified.toMillis()) + "-" + Long.toHexString(Files.size(filePath)) + "\"";
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType("application/zip"))
+                .eTag(etag)
+                .lastModified(modified.toInstant())
+                .cacheControl(CacheControl.noCache())
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=IDFM-gtfs-enriched.zip")
+                .body(new FileSystemResource(filePath));
     }
 
     @org.springframework.context.annotation.Profile("debug")
